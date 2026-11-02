@@ -25,7 +25,7 @@ import { addressFromPublicKey, heightLimit, keyId, parseFang, txId, type Tx } fr
 import { actingFor, checkCode, createWalletFile, newWalletFile, readWalletFile, secretOf, writeWalletFile } from "../src/accounts.js";
 import { aboutBlocks, allowanceOf, amountArg, capsFrom, configError, preflight, spendableNow, type Preflight } from "../src/budget.js";
 import { AccountLocks, NonceTracker } from "../src/locks.js";
-import { KNOWN_CLOCKS, KNOWN_GENESIS, TESTNET_RPC } from "../src/network.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS } from "../src/network.js";
 import { SpendLedger, chainKey } from "../src/spend.js";
 
 const FANG = 1_000_000_000n;
@@ -435,7 +435,7 @@ const spentOn = (home: string) => {
   let s = await server(home, { BLOCKULA_MAX_DAILY: "4" });
   let r = await s.call("wallet_info");
   let w = r.json();
-  assert.ok(!r.error && w.address !== TBOO_USER && w.address.startsWith("boo1") && new RegExp(`used to act for ${TBOO_USER}, the public testnet's account`).test(w.previous_account_ignored), r.text);
+  assert.ok(!r.error && w.address !== TBOO_USER && w.address.startsWith("boo1") && new RegExp(`used to act for ${TBOO_USER}, a testnet's account`).test(w.previous_account_ignored), r.text);
   assert.match(w.spent_today, /^3 FANG of 4 FANG/, "0.5.1's spend counts here");
   r = await s.call("send", { to: BOB, amount: "1" });
   assert.ok(r.error && /daily limit/.test(r.text) && /Nothing was signed/.test(r.text), `3 + 1 + the fee doesn't fit 4: ${r.text}`);
@@ -661,25 +661,25 @@ assert.deepEqual([me.stored_at, statSync(me.stored_at).mode & 0o777, me.existed,
   r = await s.call("submit_contribution", { repo: "a/b", pr: 3 });
   assert.ok(r.error && /has no GitHub link/.test(r.text), r.text);
   await s.close();
-  // Your own node of the testnet: the public RPC is a witness by default, and names are proven
-  // against it. (status reads only this node; nothing here reaches the public testnet.)
+  // Your own node of the testnet: the public testnet was retired, so no public RPC is a witness by
+  // default and names are the node's word until BLOCKULA_WITNESSES lists other nodes.
   const testnet = KNOWN_CLOCKS["blockula-testnet-2"];
   fake.status = { chain_id: "blockula-testnet-2", genesis_hash: KNOWN_GENESIS["blockula-testnet-2"], address_prefix: "tboo", height: Math.min(10, heightLimit(testnet.createdAtMs, testnet.blockTimeMs, Date.now())) };
   s = await server(join(dir, "own-node"), {}, ["--network", "testnet"]);
   r = await s.call("status");
-  assert.deepEqual([r.json().network, r.json().witnesses, r.json().names], ["your node on the public testnet", [TESTNET_RPC], `proven against 1 node (${TESTNET_RPC})`], r.text);
+  assert.deepEqual([r.json().network, r.json().witnesses, r.json().names.startsWith("UNPROVEN: one node's word")], ["your node on blockula-testnet-2", [], true], r.text);
   await s.close();
   s = await server(join(dir, "own-node"), { BLOCKULA_WITNESSES: "none" }, ["--network", "testnet"]);
   r = await s.call("status");
   assert.deepEqual([r.json().witnesses, r.json().names.startsWith("UNPROVEN: one node's word")], [[], true], r.text);
   await s.close();
-  // A local node configured without --network is your node on the testnet once it reports that chain, with the same witness.
+  // A local node configured without --network is your node on the testnet once it reports that chain.
   s = await server(join(dir, "own-node"));
   r = await s.call("status");
-  assert.deepEqual([r.json().network, r.json().witnesses], ["your node on the public testnet", [TESTNET_RPC]], r.text);
+  assert.deepEqual([r.json().network, r.json().witnesses], ["your node on blockula-testnet-2", []], r.text);
   await s.close();
   fake.status = {};
-  console.log("✓ your own node: the network's public RPC is its witness by default (BLOCKULA_WITNESSES=none opts out); a chain without a faucet says so; copy: treasury, public memos, Hunt awards and expiry, bonds, GitHub links; no self-sends or other networks' addresses; tool titles and annotations");
+  console.log("✓ your own node of the testnet: no default witness (the public testnet was retired); a chain without a faucet says so; copy: treasury, public memos, Hunt awards and expiry, bonds, GitHub links; no self-sends or other networks' addresses; tool titles and annotations");
 }
 
 node.close();

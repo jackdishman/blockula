@@ -2061,7 +2061,7 @@ mod tests {
         assert_eq!(http_peers(&g, &[], Some(&me)), vec!["https://rpc.example.com".to_string()]);
         let over = vec!["http://blockula-v0.internal:7070".to_string(), "10.0.0.2:7070".to_string()];
         assert_eq!(http_peers(&g, &over, Some(&me)), vec!["http://blockula-v0.internal:7070".to_string(), "http://10.0.0.2:7070".to_string()]);
-        crate::chain::check_http_addr("https://blockula-testnet.fly.dev").unwrap();
+        crate::chain::check_http_addr("https://node.example.org").unwrap();
         assert!(crate::chain::check_http_addr("https://bad host").is_err());
         std::fs::remove_dir_all(root).ok();
     }

@@ -1,7 +1,7 @@
 // The MCP's network handling (WAL-4) and install_node's release checks, offline:
 //   npm test -w @blockula/mcp      (builds first: the last part runs the real server over stdio)
 // 1. resolveNetwork: the network comes from --network / BLOCKULA_NETWORK / BLOCKULA_RPC only;
-//    with nothing set it's the public testnet, never whatever answers on localhost.
+//    with nothing set it's a `blockula dev` node on this machine (the public testnet was retired).
 // 2. Pins: chain id, genesis hash, prefix, known genesis per chain id, trust on first use.
 // 3. fetchVerifiedRelease: version binding, checksum, provenance and signature outcomes.
 // 4. The built server against a fake node: refuses a wrong chain before signing anything,
@@ -19,7 +19,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { MAINNET_CHAIN_ID, RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
-import { BLOCKULA_1, KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, TESTNET_RPC, canonicalUrl, completePin, defaultWitnesses, effectivePin, mismatch, networkArg, networkLabel, resolveNetwork, unpinnedBlockula1, unusableChain } from "../src/network.js";
+import { BLOCKULA_1, KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, canonicalUrl, completePin, defaultWitnesses, effectivePin, mismatch, networkArg, networkLabel, resolveNetwork, unpinnedBlockula1, unusableChain } from "../src/network.js";
 import { RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
 
 const G1 = "11".repeat(32);
@@ -29,16 +29,20 @@ const G2 = "22".repeat(32);
 
 assert.deepEqual(
   [resolveNetwork({}).key, resolveNetwork({}).rpc, resolveNetwork({}).pin.chainId],
-  ["testnet", TESTNET_RPC, "blockula-testnet-2"],
-  "nothing configured: the public testnet, never a local node",
+  ["local", LOCAL_RPC, undefined],
+  "nothing configured: a dev node on this machine (the public testnet was retired)",
 );
+// The retired public testnet has no public node: naming it takes your node's URL.
+const RETIRED_TESTNET = "https://blockula-testnet.fly.dev";
+assert.throws(() => resolveNetwork({}, ["--network", "testnet"]), /public testnet \(blockula-testnet-2\) was retired in November 2026 and has no public node/);
+assert.throws(() => resolveNetwork({ BLOCKULA_NETWORK: "testnet" }), /BLOCKULA_RPC/);
 assert.equal(resolveNetwork({}, ["--network", "local"]).rpc, LOCAL_RPC);
 assert.equal(resolveNetwork({}, ["--network=local"]).key, "local");
 assert.equal(resolveNetwork({ BLOCKULA_NETWORK: "local" }).key, "local");
 assert.equal(networkArg(["--foo", "--network", "local"]), "local");
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7391/" }).key, "local", "a localhost RPC is the local network");
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7391/" }).rpc, "http://127.0.0.1:7391");
-assert.equal(resolveNetwork({ BLOCKULA_RPC: TESTNET_RPC }).key, "testnet", "the testnet's own URL keeps its pins");
+assert.equal(resolveNetwork({ BLOCKULA_RPC: RETIRED_TESTNET }).key, "custom", "the retired public node's URL is no longer the testnet");
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }).key, "custom");
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "http://10.0.0.5:7070" }).key, "custom", "plain http on a private network");
 // There's no mainnet network: a node on blockula-1 is reached with BLOCKULA_CHAIN_ID, like any chain.
@@ -50,13 +54,14 @@ const refusals: [Record<string, string>, string[], RegExp][] = [
   [{ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "mainnet"], /unknown network "mainnet" \(testnet, local or custom\)/],
   [{ BLOCKULA_NETWORK: "Mainnet" }, [], /unknown network "mainnet"/],
   [{}, ["--network", "custom"], /needs BLOCKULA_RPC/],
+  [{}, ["--network", "testnet"], /retired/],
   [{ BLOCKULA_NETWORK: "moon" }, [], /unknown network/],
   [{ BLOCKULA_RPC: "http://rpc.example" }, [], /must use https/],
   [{ BLOCKULA_RPC: "https://user:pw@rpc.example" }, [], /without credentials/],
   [{ BLOCKULA_RPC: "ftp://rpc.example" }, [], /http\(s\)/],
   [{ BLOCKULA_RPC: "not a url" }, [], /isn't a URL/],
   [{ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "local"], /on this machine/],
-  [{ BLOCKULA_CHAIN_ID: "blockula-1" }, ["--network", "testnet"], /contradicts/],
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "blockula-1" }, ["--network", "testnet"], /contradicts/],
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_GENESIS_HASH: "abc" }, [], /64 hex/],
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "http://w.example" }, [], /BLOCKULA_WITNESSES must use https/],
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://rpc.example/" }, [], /other nodes than BLOCKULA_RPC/],
@@ -64,7 +69,6 @@ const refusals: [Record<string, string>, string[], RegExp][] = [
   // Audit MCK-1: a node spelled two ways is one node, for the guards as for the defaults.
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://RPC.example:443/." }, [], /other nodes than BLOCKULA_RPC/],
   [{ BLOCKULA_RPC: "https://Rpc.Example:443/.", BLOCKULA_WITNESSES: "https://rpc.example" }, [], /other nodes than BLOCKULA_RPC/],
-  [{ BLOCKULA_RPC: "https://Blockula-Testnet.fly.dev", BLOCKULA_WITNESSES: TESTNET_RPC }, [], /other nodes than BLOCKULA_RPC/],
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://w.example,https://W.example:443/" }, [], /twice/],
   // What the client appends /api/… to is a node's URL: a query or a fragment would be dropped or misread.
   [{ BLOCKULA_RPC: "https://rpc.example/?key=1" }, [], /without a query or a fragment/],
@@ -77,25 +81,17 @@ const refusals: [Record<string, string>, string[], RegExp][] = [
 // gap-7-1: witnesses names are proven against.
 assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: " https://a.example/ , https://b.example ," }).witnesses, ["https://a.example", "https://b.example"]);
 assert.deepEqual(resolveNetwork({}).witnesses, []);
-// OPERATOR-6: your own node of the public testnet gets its public RPC as a witness unless
-// BLOCKULA_WITNESSES says otherwise (`none` opts out); the public RPC itself gets none, and so do
-// chains without built-in public RPCs.
+// OPERATOR-6: no chain has public RPCs built in any more (the public testnet was retired), so no
+// node gets a default witness; BLOCKULA_WITNESSES lists them (`none` says so explicitly).
 const own = resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }, ["--network", "testnet"]);
-assert.deepEqual([own.key, own.rpc, own.witnesses, own.witnessesSet], ["testnet", "http://127.0.0.1:7171", [TESTNET_RPC], false]);
+assert.deepEqual([own.key, own.rpc, own.witnesses, own.witnessesSet, own.pin.chainId], ["testnet", "http://127.0.0.1:7171", [], false, "blockula-testnet-2"]);
 assert.deepEqual([resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171", BLOCKULA_WITNESSES: "none" }, ["--network", "testnet"]).witnesses, resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171", BLOCKULA_WITNESSES: "None" }, ["--network", "testnet"]).witnessesSet], [[], true]);
-assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171", BLOCKULA_WITNESSES: "https://w.example" }, ["--network", "testnet"]).witnesses, ["https://w.example"], "listed witnesses replace the default");
-assert.deepEqual(resolveNetwork({}, ["--network", "testnet"]).witnesses, [], "the public RPC isn't its own witness");
-assert.deepEqual([defaultWitnesses("blockula-testnet-2", "http://127.0.0.1:7171"), defaultWitnesses("blockula-testnet-2", TESTNET_RPC), defaultWitnesses("blockula-dev", "http://127.0.0.1:7070"), defaultWitnesses("blockula-1", "http://127.0.0.1:7171"), defaultWitnesses(undefined, "x")], [[TESTNET_RPC], [], [], [], []]);
-// Audit MCK-1: the public RPC under any spelling is the public RPC, and never its own witness (a
-// proof checked against the state root the same node reports proves nothing, yet would be called
-// "proven against 1 independent node").
+assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171", BLOCKULA_WITNESSES: "https://w.example" }, ["--network", "testnet"]).witnesses, ["https://w.example"], "listed witnesses");
+assert.deepEqual([defaultWitnesses("blockula-testnet-2", "http://127.0.0.1:7171"), defaultWitnesses("blockula-testnet-2", RETIRED_TESTNET), defaultWitnesses("blockula-dev", "http://127.0.0.1:7070"), defaultWitnesses("blockula-1", "http://127.0.0.1:7171"), defaultWitnesses(undefined, "x")], [[], [], [], [], []]);
+// Audit MCK-1: a node under any spelling is one node.
 for (const spelled of ["https://Blockula-Testnet.fly.dev", "https://BLOCKULA-TESTNET.FLY.DEV/", "https://blockula-testnet.fly.dev:443", "https://blockula-testnet.fly.dev/.", "https://blockula-testnet.fly.dev./", "https://blockula-testnet.fly.dev:443/./"]) {
-  assert.deepEqual(defaultWitnesses("blockula-testnet-2", spelled), [], spelled);
-  const n = resolveNetwork({ BLOCKULA_RPC: spelled });
-  assert.deepEqual([n.key, n.rpc, n.witnesses, n.pin.chainId], ["testnet", TESTNET_RPC, [], "blockula-testnet-2"], `${spelled} is the public testnet`);
+  assert.equal(canonicalUrl(spelled), RETIRED_TESTNET, spelled);
 }
-assert.deepEqual(defaultWitnesses("blockula-testnet-2", "http://127.0.0.1:7171/."), [TESTNET_RPC], "your own node, however spelled, still gets the public RPC");
-assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "http://LOCALHOST:7171//" }, ["--network", "testnet"]).witnesses, [TESTNET_RPC]);
 // A URL has one spelling: the node's own, as the URL parser normalizes it, without the trailing slash.
 for (const [typed, canonical] of [
   ["https://rpc.example/", "https://rpc.example"],
@@ -109,14 +105,14 @@ for (const [typed, canonical] of [
   ["ftp://rpc.example/", "ftp://rpc.example/"], // not a node URL: as it is
   ["not a url", "not a url"],
 ]) assert.equal(canonicalUrl(typed), canonical, typed);
-for (const u of [TESTNET_RPC, LOCAL_RPC]) assert.equal(canonicalUrl(u), u, `${u}: the built-in RPCs are in canonical spelling`);
+for (const u of [LOCAL_RPC]) assert.equal(canonicalUrl(u), u, `${u}: the built-in RPCs are in canonical spelling`);
 assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "https://Rpc.Example:443/.", BLOCKULA_WITNESSES: "https://W.example/ , https://x.example:8443/" }).witnesses, ["https://w.example", "https://x.example:8443"]);
-// A node on this machine is "your node on" the public testnet once its chain is known.
-assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }), "blockula-testnet-2"), "your node on the public testnet");
+// A node on this machine is "your node on" blockula-testnet-2 once its chain is known.
+assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }), "blockula-testnet-2"), "your node on blockula-testnet-2");
 assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }), "blockula-dev"), "local dev node");
-assert.equal(networkLabel(resolveNetwork({}), "blockula-testnet-2"), "public testnet");
+assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "testnet"]), "blockula-testnet-2"), "testnet");
 for (const [env, argv, re] of refusals) assert.throws(() => resolveNetwork(env, argv), re, JSON.stringify([env, argv]));
-console.log("✓ the network comes from the configuration only (default: the public testnet); a node is one node however its URL is spelled, so the public RPC is never its own witness");
+console.log("✓ the network comes from the configuration only (default: a local dev node; the retired testnet takes BLOCKULA_RPC); a node is one node however its URL is spelled");
 
 // ---- 2. pins ----
 
@@ -165,7 +161,7 @@ assert.deepEqual(effectivePin(pinned, { chainId: "other", genesisHash: G2 }), { 
 // isn't held against the new one, which is pinned on first use.
 // Its genesis is built in once a release pins it (scripts/pin-network.sh); until then it's pinned
 // on first use. Either way these hold.
-const testnet = resolveNetwork({});
+const testnet = resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "testnet"]);
 const builtIn: string | undefined = KNOWN_GENESIS["blockula-testnet-2"];
 assert.deepEqual([testnet.pin.chainId, testnet.pin.prefix, testnet.pin.genesisHash], ["blockula-testnet-2", "tboo", builtIn], "its genesis is built in only once a release pins it");
 assert.deepEqual(effectivePin(testnet, { chainId: "blockula-testnet", genesisHash: G2, prefix: "boo" }), { chainId: "blockula-testnet-2", genesisHash: builtIn, prefix: "tboo" });

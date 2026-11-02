@@ -1059,7 +1059,7 @@ mod tests {
         ] {
             assert_eq!(private_host(addr), Some(why), "{addr}");
         }
-        for addr in ["45.77.26.148:30300", "https://blockula-testnet.fly.dev", "https://rpc.example.org:8443/api", "[2001:db8::1]:30300", "v1.example.org:30300", "100.128.0.1:30300", "172.32.0.1:7070"] {
+        for addr in ["45.77.26.148:30300", "https://node.example.org", "https://rpc.example.org:8443/api", "[2001:db8::1]:30300", "v1.example.org:30300", "100.128.0.1:30300", "172.32.0.1:7070"] {
             assert_eq!(private_host(addr), None, "{addr}");
         }
     }

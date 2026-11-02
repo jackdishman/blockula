@@ -7,7 +7,7 @@ export const RPC = "https://rpc.blockula.test";
 /**
  * The mock testnet's chain id and address prefix. The e2e build sets them explicitly
  * (NEXT_PUBLIC_TESTNET_CHAIN_ID, NEXT_PUBLIC_TESTNET_PREFIX), so the specs don't depend on the
- * public testnet's defaults in lib/config.ts.
+ * testnet's defaults in lib/config.ts.
  */
 export const CHAIN_ID = "blockula-testnet";
 export const PREFIX = "boo";

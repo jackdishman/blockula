@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // 🧛 Blockula MCP server. Add to Claude Code with:
-//   claude mcp add blockula -- npx -y @blockula/mcp                      (the public testnet)
-//   claude mcp add blockula -- npx -y @blockula/mcp --network local      (a `blockula dev` chain)
+//   claude mcp add blockula -- npx -y @blockula/mcp                      (a `blockula dev` chain)
+//   claude mcp add blockula -e BLOCKULA_RPC=https://<node> -- npx -y @blockula/mcp   (a chain you launched)
 //
 // Env:
-//   BLOCKULA_NETWORK    testnet (default), local or custom (same as --network)
-//   BLOCKULA_RPC        node URL (default: the network's public RPC; required for custom)
+//   BLOCKULA_NETWORK    local (default), testnet or custom (same as --network)
+//   BLOCKULA_RPC        node URL (default: http://localhost:7070 for local; required for testnet,
+//                       whose public node was retired, and for custom)
 //   BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH   pin the chain the node must be on (a node that says
 //                       it's on blockula-1 is refused unless BLOCKULA_CHAIN_ID=blockula-1)
 //   BLOCKULA_WITNESSES  other nodes of the same chain (comma-separated URLs): .boo names that get
@@ -15,9 +16,8 @@
 //                       them a send signs the name itself (the chain resolves it when it runs), and
 //                       where an address is needed (stake, unstake, use_account) a name is the
 //                       node's word: on blockula-1 (BLOCKULA_CHAIN_ID=blockula-1) the address must be
-//                       confirmed first. Unset, your own node of the public
-//                       testnet (any node but its public RPC) gets the public RPC as a witness;
-//                       `none` opts out.
+//                       confirmed first. Unset, no node is a witness (no chain has public RPCs
+//                       built in); `none` says so explicitly.
 //   BLOCKULA_HOME       where the agent wallet lives (default ~/.blockula)
 //   BLOCKULA_MAX_SEND   max FANG one call moves (sent, staked, escrowed, paid for a name, bonded; default 100)
 //   BLOCKULA_MAX_DAILY  max FANG leaving the account per UTC day through this MCP on each chain, fees
@@ -585,7 +585,7 @@ tool("status", "Blockula network status: which network and node you're connected
     witnesses: activeWitnesses,
     names: activeWitnesses.length ? `proven against ${activeWitnesses.length} node${activeWitnesses.length === 1 ? "" : "s"} (${activeWitnesses.join(", ")})` : `UNPROVEN: one node's word (${net.rpc}). BLOCKULA_WITNESSES lists other nodes to prove them against.`,
     pinned: chainData({ chain_id: s.chain_id, genesis_hash: s.genesis_hash, address_prefix: s.address_prefix }),
-    how_to_change: "The network is fixed while this MCP runs. The user changes it in the MCP's configuration (--network testnet|local|custom, or BLOCKULA_RPC).",
+    how_to_change: "The network is fixed while this MCP runs. The user changes it in the MCP's configuration (--network local|testnet|custom, or BLOCKULA_RPC).",
     explorer: net.rpc,
     mcp_version: VERSION,
     node_reports: chainData(Object.fromEntries(pick.filter((k) => k in s).map((k) => [k, s[k]]))),
@@ -1122,7 +1122,7 @@ tool("wallet_info", "This agent's address and the account it acts for, its balan
 });
 
 /** What `faucet` answers when the node says its chain has none. */
-const NO_FAUCET = "This chain has no faucet, so nothing was sent. Its FANG comes from accounts that already hold some: ask whoever runs the chain. The public testnet and dev chains (start_dev_node) have faucets.";
+const NO_FAUCET = "This chain has no faucet, so nothing was sent. Its FANG comes from accounts that already hold some: ask whoever runs the chain. Dev chains (start_dev_node) have faucets.";
 
 tool("faucet", "Get 100 test FANG from the chain's faucet (to this agent's wallet, or any name/address). On a chain without one, it answers status no_faucet.", { to: z.string().optional().describe("a name or address; default: the account this agent acts for") }, async ({ to }) => {
   const client = await chain();

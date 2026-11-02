@@ -11,8 +11,8 @@ npm install @blockula/sdk
 ```ts
 import { Client, Wallet, encodeKeyGrant } from "@blockula/sdk";
 
-const wallet = Wallet.generate(Client.testnet());  // the public testnet, every pin set: tboo1… addresses
-await wallet.faucet();                        // test chains: 100 test FANG
+const wallet = Wallet.generate(Client.local());   // `blockula dev` on this machine
+await wallet.faucet();                        // dev chains: 100 FANG
 await wallet.registerName("vlad");            // vlad.boo
 await wallet.send("alice.boo", "1.5", { memo: "trick or treat" });
 
@@ -22,19 +22,17 @@ const agentGrantCode = encodeKeyGrant(await agent.keyGrant(wallet.account));
 await wallet.addSessionKey(agentGrantCode, "claude", { limit: "10", periodBlocks: 86_400, expiresInBlocks: 30 * 86_400 });
 ```
 
-On a `blockula dev` chain, use `Client.local()` (or `new Client("http://localhost:7070")`).
+For a chain you launched (`blockula summon`), pass its node: `new Client("https://<your node>", { chainId, genesisHash })`.
 
 ## Which network?
 
 ```ts
-Client.testnet();                                   // the public testnet
-new Client({ network: "testnet" });                 // the same
-new Client("http://localhost:7171", { network: "testnet" });  // your own node, held to the testnet's pins
 Client.local();                                     // blockula dev on this machine
+new Client("http://localhost:7171", { network: "testnet" });  // a blockula-testnet-2 node you run, held to its pins
 new Client("http://<your node>:7070", { chainId: "mychain", genesisHash: "…" });  // a chain of your own
 ```
 
-`NETWORKS` lists what each preset pins: the chain id, the genesis hash, the address prefix and the genesis clock. A client made for a network checks them on every status it reads, including the one each signature is made against, and refuses a node on another chain (`ChainMismatchError`). The prefix is known up front, so `wallet.address` is `tboo1…` on the testnet before the first request. Pins you pass as well must agree with the network's.
+The public testnet (`blockula-testnet-2`) was retired in November 2026 and has no public node, so the `testnet` preset has no RPC: `Client.testnet()` and `new Client({ network: "testnet" })` throw unless you pass a node's URL (`Client.testnet({ rpc })`). `NETWORKS` lists what each preset pins: the chain id, the genesis hash, the address prefix and the genesis clock. A client made for a network checks them on every status it reads, including the one each signature is made against, and refuses a node on another chain (`ChainMismatchError`). The prefix is known up front, so `wallet.address` is `tboo1…` on the testnet before the first request. Pins you pass as well must agree with the network's.
 
 A wallet signs nothing for a node that says it's on `blockula-1` unless its client pins that chain (`chainId: "blockula-1"`): it throws `MainnetNotAllowedError` instead.
 
@@ -98,16 +96,17 @@ await watchPayments(client, shopAddress, {
 
 ## Your own RPC node
 
-Any node serves the same API, and one on your machine isn't rate limited. To run one against the testnet:
+Any node serves the same API, and one on your machine isn't rate limited. To run one of a chain you know a node of:
 
 ```bash
-blockula join --genesis https://blockula-testnet.fly.dev --home ~/blockula-node --port 7171
+blockula join --genesis https://<a node of the chain> --home ~/blockula-node --port 7171
 ```
 
 ```ts
+const pins = { chainId: "mychain", genesisHash: "…" };              // a node on another chain is refused
 const client = new Client("http://localhost:7171", {
-  network: "testnet",                                         // its pins: a node on another chain is refused
-  witnesses: [new Client("https://blockula-testnet.fly.dev")], // names proven against a second node
+  ...pins,
+  witnesses: [new Client("https://<another node>", pins)],          // names proven against a second node
 });
 ```
 
@@ -160,7 +159,7 @@ wallet.validForBlocks = 600;
 Addresses are bech32m with the chain's prefix: `boo1…` by default, `tboo1…` on public testnets. `isAddress(s)` accepts any known prefix and `isAddress(s, "tboo")` exactly one; `addressFromPublicKey(pk, prefix)` renders one. A `Client` learns its chain's prefix from `/api/status` (`await client.addressPrefix()`), and wallets using that client sign with it (`wallet.address`, `wallet.account`). Pin it with `new Client(rpc, { prefix: "boo" })` to refuse a node on another network (see "Which chain?" below). Nodes reject addresses of another network's prefix.
 
 - Names in a signature (audit gap-7-1). Where the chain resolves a name itself (`send`, `awardHunt`, `vouch`/`unvouch`, `grantSoul`, `flagSybil`, `clawback`, `transferName`, proposal targets), a client with `witnesses` (below) signs the name's proven owner, and one without signs the **name itself** (`alice.boo`): the chain pays whoever owns it when the tx runs, so a lying node can't point it at another account now. It could still hold the signed tx and release it later in its validity window, which counts from the height that node reported, by when the name may have lapsed and been registered again: pay a name that's about to expire by address. `Wallet.build` refuses a height more than `maxHeadLeadBlocks` (30) ahead of the lowest head the witnesses report (every witness must answer, so one honest witness is enough), or past what a `genesisClock: { createdAtMs, blockTimeMs }` pin allows by this machine's clock (`HeightAheadError`, nothing signed); without either the height is the node's word. `client.recipient(name)` says which (`signed`, `byChain`, and `how` to show before signing); the address it reports for an unproven name is the node's word, for display. Where an address is needed (`delegate`, `undelegate`, `redelegate`, `unjail`, `actAs`, `keyGrant`), a name is resolved (`client.resolution`: `proven` and `how`), and on `blockula-1` nothing is signed with one only a single node vouched for: it throws `UnprovenNameError` (checked against the very status each tx is signed for). Pass the address once its owner has confirmed it, or give the client witnesses.
-- `wallet.address` uses the chain's prefix once the client knows it. A client made for a network (`Client.testnet()`) or pinned with `prefix` knows it up front. Otherwise it shows the `boo` form until the first request, so `await client.addressPrefix()` first if you display it.
+- `wallet.address` uses the chain's prefix once the client knows it. A client made for a network (`Client.testnet({ rpc })`) or pinned with `prefix` knows it up front. Otherwise it shows the `boo` form until the first request, so `await client.addressPrefix()` first if you display it.
 - Node errors throw `ApiError` (`.status`: 429 means rate limited, and `.retryAfterMs` says how long the node asked you to wait). A transaction the node reports as failed throws `TxFailedError` from `waitForTx` (`dropped` says whether it ran: see "Timeouts and pending transactions").
 - Pass `rpId` to `createPasskeyWallet`/`unlockPasskeyWallet` to pin wallets to your production domain. Passkeys are bound to that hostname for good.
 
@@ -249,8 +248,6 @@ Every request has a timeout (`new Client(rpc, { timeoutMs })`, default 15 s, at 
 `signingBytes` and `txBytes` encode a tx exactly as the node does (`node/src/types.rs`, checked offline against the node's vectors in `test/tx-vectors.json`). They take integers as the node's JSON parser does, as JSON numbers or strings of digits within the field's width, and refuse anything else (a negative or oversized amount, `"0x10"`, `" 1"`, a fraction) instead of wrapping it into a different tx.
 
 `verifyReleaseSignature(sig, checksumsFile, trustedKeyId)` checks a release's offline ML-DSA-65 signature (docs/OPERATIONS.md "Releases").
-
-The public testnet is `https://blockula-testnet.fly.dev`, and the wallet is https://testnet.blockula.app.
 
 Tests: `npm run test:vectors` (offline: passkey derivation, state-proof and tx-encoding vectors from the node, every protocol v1 helper against a fake node, pinning, proof freshness, timeouts, release signatures, and `test/integrators.ts`: network presets, the `blockula-1` pin, balances, the nonce queue, `sendMany`, `quote`, history, `watchPayments` and `onSigned`; `test/programs.ts` (programs: every answer check, the fuel and deposit arithmetic, receipts and balance reconciliation, `provenProgram`'s refusals one by one, and the Wallet's helpers against a fake node serving answers recorded from a dev chain), and `test/examples.ts`, which runs `examples/pay-from-a-script.mjs` against a fake node, so build first), `npm run test:kat` (ML-DSA known answers), `npm test` (end to end against `blockula dev`: `test/e2e.ts` and `test/e2e-integrators.ts`, on a chain with programs or without), `npm run test:programs` (`test/e2e-programs.ts`, which needs `blockula dev --programs`: on a chain without programs it says so and passes, and `BLOCKULA_E2E_PROGRAMS=1` makes that a failure, as CI sets it). The `examples/` directory at the repository's root has two runnable scripts: receiving payments, and paying from a script.
 

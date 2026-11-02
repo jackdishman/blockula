@@ -120,14 +120,15 @@ export function setActingFor(f: WalletFile, chain: string, account: string | und
 
 /** What wallet_info says about an ignored 0.5.1 account. */
 export function ignoredNote(account: string, prefix: string): string {
-  const other = account.startsWith("tboo1") ? "the public testnet's" : account.startsWith("boo1") ? "a boo1… chain's" : "another chain's";
+  const other = account.startsWith("tboo1") ? "a testnet's" : account.startsWith("boo1") ? "a boo1… chain's" : "another chain's";
   return `This agent used to act for ${account}, ${other} account, which isn't an address on this chain (its addresses start with ${prefix}1). Here it acts for its own key until use_account is called with this chain's account.`;
 }
 
-/** The web wallet's "Give an agent a budget", by chain id (where the user pastes a grant code). */
-export const WALLET_URLS: Record<string, string> = {
-  "blockula-testnet-2": "https://testnet.blockula.app/devices#agent",
-};
+/**
+ * The web wallet's "Give an agent a budget", by chain id (where the user pastes a grant code), for
+ * chains with a public wallet: none since the public testnet was retired.
+ */
+export const WALLET_URLS: Record<string, string> = {};
 
 /** The short code the web wallet shows for a key (web/lib/format.ts `keyCode`), for the user to compare. */
 export const checkCode = (keyId: string) => {

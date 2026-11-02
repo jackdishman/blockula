@@ -6,7 +6,7 @@ import { DEFAULT_TIP_CAP_MULTIPLE, KEY_POP_CONTEXT, PUBLIC_KEY_LEN, SIGNATURE_LE
 import { NAMESPACES, checkProofResponse, decodeAccount, decodeName, decodeProgram, type ProofResponse, type ProvenRecord } from "./proof.js";
 import { ANY_PROGRAM_VERSION, MAX_PROGRAM_BINDINGS, MAX_PROGRAM_CALLS, MAX_PROGRAM_CODE_BYTES, MAX_PROGRAM_INTERFACE_BYTES, ProgramAnswerError, ProgramsOffError, defaultFuelLimit, depositWithMargin, plainText, positiveFuel, programAddressArg, programBytesArg, programHashArg, programInputArg, programMethodArg, checkCode, checkFuel, checkInterface, checkParams, checkProgram, checkProgramsStatus, checkReceipt, checkView, outcomeWords, priceFuel, programCost, programRecordDeposit, programUploadDeposit, reserveFuel, uploadFuel, type FuelReservation, type ProgramCodeInfo, type ProgramCost, type ProgramFuel, type ProgramInfo, type ProgramInterfaceInfo, type ProgramParams, type ProgramReceipt, type ProgramViewResult } from "./programs.js";
 import { describeKind, reviewAction } from "./describe.js";
-import { NETWORKS, isNetworkName, type NetworkClock, type NetworkName, type NetworkPreset } from "./networks.js";
+import { NETWORKS, TESTNET_RETIRED, isNetworkName, type NetworkClock, type NetworkName, type NetworkPreset } from "./networks.js";
 
 export * from "./tx.js";
 export * from "./proof.js";
@@ -2353,7 +2353,7 @@ export class Client {
   /** See `ClientOptions.wireTxs`. */
   readonly wireTxs: boolean;
 
-  /** The public testnet (`NETWORKS.testnet`), every pin set: `Client.testnet({ witnesses })`, or pass your own node's URL as `rpc`. */
+  /** A node of blockula-testnet-2 (`NETWORKS.testnet`), every pin set: `Client.testnet({ rpc })`. The public testnet was retired and has no public node, so `rpc` is required. */
   static testnet(opts: Omit<ClientOptions, "network"> & { rpc?: string } = {}): Client {
     const { rpc, ...rest } = opts;
     return new Client(rpc, { ...rest, network: "testnet" });
@@ -2366,7 +2366,7 @@ export class Client {
   }
 
   /**
-   * `new Client(rpc, opts)`, `new Client({ network: "testnet" })` (the network's public RPC), or
+   * `new Client(rpc, opts)`, `new Client({ network: "local" })` (the network's built-in RPC), or
    * `new Client(rpc, { network })` (your own node, held to that network's pins). The pins
    * (`opts`, and the network's) are checked on every status: a node reporting another prefix,
    * chain id or genesis hash is refused with `ChainMismatchError`.
@@ -2382,7 +2382,7 @@ export class Client {
     const preset: NetworkPreset | undefined = opts.network === undefined ? undefined : NETWORKS[opts.network];
     if (preset) {
       url ??= preset.rpc;
-      if (url === undefined) throw new Error(`no public ${preset.name} RPC is built into this SDK yet: pass the URL of a ${preset.name} node you trust, new Client(url, { network: "${preset.name}" })`);
+      if (url === undefined) throw new Error(preset.name === "testnet" ? TESTNET_RETIRED : `no public ${preset.name} RPC is built into this SDK: pass the URL of a ${preset.name} node you trust, new Client(url, { network: "${preset.name}" })`);
       opts = withPreset(opts, preset);
     }
     this.rpc = url ?? DEFAULT_RPC;

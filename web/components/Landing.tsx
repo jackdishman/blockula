@@ -35,7 +35,7 @@ function Command({ text }: { text: string }) {
   );
 }
 
-/** What a first visit to `/` shows: Blockula 1.0, the kit, with the testnet wallet a click away. */
+/** What a first visit to `/` shows: Blockula 1.0, the kit, with the wallet a click away. */
 export function Landing() {
   return (
     <main className="narrow stack-lg landing">
@@ -78,9 +78,9 @@ export function Landing() {
       </section>
       <section className="card stack center">
         <h2>Try it first</h2>
-        <p className="dim">The public testnet runs the same software: make a wallet with a passkey, get free test FANG and claim a <code>.boo</code> name.</p>
-        <Link className="btn primary big" href="/welcome">Open the testnet wallet</Link>
-        <Link className="link small" href="/explore">Or explore the testnet</Link>
+        <p className="dim"><code>blockula dev</code> starts a one-node chain with a faucet on your machine. This wallet talks to it: make a wallet with a passkey, get FANG from the faucet and claim a <code>.boo</code> name.</p>
+        <Link className="btn primary big" href="/welcome">Open the wallet</Link>
+        <Link className="link small" href="/explore">Or explore your chain</Link>
       </section>
       <p className="dim small center">
         Each chain&apos;s unit, FANG, has no value by design: its faucet hands it out and it only prices spam. Nobody sells it, buys it or gets paid in it. Blockula isn&apos;t externally audited.

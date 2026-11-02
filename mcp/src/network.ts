@@ -46,7 +46,9 @@ export interface Network {
 }
 
 export const LOCAL_RPC = "http://localhost:7070";
-export const TESTNET_RPC = "https://blockula-testnet.fly.dev";
+/** Why `--network testnet` needs BLOCKULA_RPC: the public testnet has no public node any more. */
+export const TESTNET_RETIRED =
+  "the public testnet (blockula-testnet-2) was retired in November 2026 and has no public node: run your own chain (`blockula dev`, then --network local; or `blockula summon`, then BLOCKULA_RPC=<its node>), or set BLOCKULA_RPC to a blockula-testnet-2 node you run";
 /**
  * Nothing reads this: the MCP has no mainnet network. It stays because
  * `scripts/pin-network.sh --mainnet --rpc` writes it and `scripts/test-pin-network.sh` checks
@@ -89,15 +91,15 @@ export function clockFrom(genesis: unknown, chainId: string): GenesisClock | und
 
 /** The networks the MCP knows by name. */
 export const KNOWN_NETWORKS: Record<Exclude<NetworkKey, "custom">, Omit<Network, "rpc" | "witnesses" | "witnessesSet"> & { rpc?: string }> = {
-  // The protocol v1 public testnet (deploy/launch.sh): its own chain id (never reused) and the
-  // testnet prefix (DEC-7). Its genesis hash exists only once it launches: until a release adds it
-  // to KNOWN_GENESIS, the first status the node reports pins it (trust on first use, remembered).
-  testnet: { key: "testnet", label: "public testnet", rpc: TESTNET_RPC, pin: { chainId: "blockula-testnet-2", prefix: "tboo" }, remember: true },
+  // The protocol v1 testnet (deploy/launch.sh): its own chain id (never reused), the testnet
+  // prefix (DEC-7) and, in KNOWN_GENESIS, its genesis. The public testnet was retired in November
+  // 2026: no public RPC is built in, so it takes BLOCKULA_RPC (TESTNET_RETIRED).
+  testnet: { key: "testnet", label: "testnet", pin: { chainId: "blockula-testnet-2", prefix: "tboo" }, remember: true },
   local: { key: "local", label: "local dev node", rpc: LOCAL_RPC, pin: {}, remember: false },
 };
 
-/** The public RPCs of the chains whose public RPCs are built in, by chain id. */
-const PUBLIC_RPCS: Record<string, string[]> = { "blockula-testnet-2": [TESTNET_RPC] };
+/** The public RPCs of the chains whose public RPCs are built in, by chain id: none since the public testnet was retired. */
+const PUBLIC_RPCS: Record<string, string[]> = {};
 
 /**
  * The witnesses a node of `chainId` gets when BLOCKULA_WITNESSES is unset: the chain's public RPCs,
@@ -111,12 +113,12 @@ export function defaultWitnesses(chainId: string | undefined, rpc: string): stri
   return rpcs.includes(canonicalUrl(rpc)) ? [] : rpcs;
 }
 
-/** The public network a chain id is, when it's one (for labels). */
-const PUBLIC_LABEL: Record<string, string> = { "blockula-testnet-2": "the public testnet" };
+/** The known network a chain id is, when it's one (for labels). */
+const PUBLIC_LABEL: Record<string, string> = { "blockula-testnet-2": "blockula-testnet-2" };
 
 /**
  * What `status` calls the network: once the node's chain is known, a node on this machine that
- * is on a public network is "your node on <it>", never a "local dev node".
+ * is on a known network is "your node on <it>", never a "local dev node".
  */
 export function networkLabel(net: Network, chainId?: string): string {
   const pub = chainId ? PUBLIC_LABEL[chainId] : undefined;
@@ -141,8 +143,8 @@ const isPrivateUrl = (u: string) => {
 /**
  * A node URL in one spelling: the scheme and host lowercased, a default port and dot segments
  * dropped (the URL parser's own normalization), no trailing dot on the host and no trailing
- * slash. So a node compares equal however it's written: `https://Blockula-Testnet.fly.dev:443/.`
- * is the public RPC, and is never its own witness (audit MCK-1). What isn't an http(s) URL comes
+ * slash. So a node compares equal however it's written: `https://Node.Example:443/.` is
+ * `https://node.example`, and is never its own witness (audit MCK-1). What isn't an http(s) URL comes
  * back as it is.
  */
 export function canonicalUrl(u: string): string {
@@ -209,8 +211,8 @@ export function networkArg(argv: string[]): string | undefined {
 
 /**
  * The network from the configuration: `--network` (or BLOCKULA_NETWORK) names one, BLOCKULA_RPC
- * gives the node, BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH add pins. With none of them, the
- * public testnet. Contradictions are errors, never guesses.
+ * gives the node, BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH add pins. With none of them, a
+ * `blockula dev` node on this machine (local). Contradictions are errors, never guesses.
  */
 export function resolveNetwork(env: Record<string, string | undefined>, argv: string[] = []): Network {
   const named = (networkArg(argv) ?? env.BLOCKULA_NETWORK)?.trim().toLowerCase() || undefined;
@@ -222,11 +224,11 @@ export function resolveNetwork(env: Record<string, string | undefined>, argv: st
   let key: NetworkKey;
   if (named) key = named as NetworkKey;
   else if (rpc) key = (Object.values(KNOWN_NETWORKS).find((n) => n.rpc && canonicalUrl(n.rpc) === rpc)?.key as NetworkKey | undefined) ?? (isLocalUrl(rpc) ? "local" : "custom");
-  else key = "testnet";
+  else key = "local";
 
   const base = key === "custom" ? { key, label: "custom node", pin: {}, remember: true } : KNOWN_NETWORKS[key];
   const url = rpc ?? (base.rpc ? canonicalUrl(base.rpc) : undefined);
-  if (!url) throw new Error("the custom network needs BLOCKULA_RPC");
+  if (!url) throw new Error(key === "testnet" ? TESTNET_RETIRED : "the custom network needs BLOCKULA_RPC");
   if (key === "local" && !isLocalUrl(url)) throw new Error(`the local network is a node on this machine, not ${url}`);
   const pin: Pin = { ...base.pin };
   const chainId = env.BLOCKULA_CHAIN_ID?.trim() || undefined;

@@ -17,7 +17,7 @@ async function walletClient(overrideHash = genesis) {
     define: {
       "process.env.NEXT_PUBLIC_NETWORK": '""',
       "process.env.NEXT_PUBLIC_MAINNET_RPC": '""',
-      "process.env.NEXT_PUBLIC_BLOCKULA_RPC": '""',
+      "process.env.NEXT_PUBLIC_BLOCKULA_RPC": '"https://rpc.blockula.test"',
       "process.env.NEXT_PUBLIC_TESTNET_CHAIN_ID": '""',
       "process.env.NEXT_PUBLIC_TESTNET_GENESIS_HASH": JSON.stringify(overrideHash),
     },

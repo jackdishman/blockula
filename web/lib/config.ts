@@ -24,10 +24,13 @@ export const MAINNET_GENESIS_CLOCK: GenesisClock | undefined = undefined;
 /** NEXT_PUBLIC_MAINNET_GENESIS_HASH, as this deployment sets it. */
 export const MAINNET_GENESIS_HASH_ENV = clean(process.env.NEXT_PUBLIC_MAINNET_GENESIS_HASH)?.toLowerCase();
 
-/** The public testnet (deploy/launch.sh): its own chain id, never reused (DEC-7), and the testnet prefix. */
+/**
+ * The testnet (deploy/launch.sh): its own chain id, never reused (DEC-7), and the testnet prefix.
+ * The public testnet was retired in November 2026 and has no public node, so no RPC is built in:
+ * a deployment lists the testnet only when NEXT_PUBLIC_BLOCKULA_RPC names a node of it.
+ */
 export const TESTNET_CHAIN_ID = "blockula-testnet-2";
 export const TESTNET_PREFIX = "tboo";
-export const TESTNET_RPC = "https://blockula-testnet.fly.dev";
 /**
  * The testnet's genesis hash, once it has launched: the release after the launch pins it here
  * (scripts/pin-network.sh). Until then, and when it's set, NEXT_PUBLIC_TESTNET_GENESIS_HASH
@@ -113,23 +116,22 @@ const mainnet: Network | undefined = mainnetRpc
 
 const testnetGenesis = clean(process.env.NEXT_PUBLIC_TESTNET_GENESIS_HASH)?.toLowerCase() || TESTNET_GENESIS_HASH;
 
-// A mainnet deployment lists the testnet only when it's configured explicitly.
-const testnet: Network | undefined =
-  !IS_MAINNET_BUILD || testnetRpc
-    ? {
-        key: "testnet",
-        label: "Testnet",
-        rpc: testnetRpc || TESTNET_RPC,
-        chainId: clean(process.env.NEXT_PUBLIC_TESTNET_CHAIN_ID) || TESTNET_CHAIN_ID,
-        genesisHash: testnetGenesis,
-        // The built-in clock is that of the built-in genesis: never another one's.
-        genesisClock: testnetGenesis && testnetGenesis === TESTNET_GENESIS_HASH ? TESTNET_GENESIS_CLOCK : undefined,
-        prefix: clean(process.env.NEXT_PUBLIC_TESTNET_PREFIX) || TESTNET_PREFIX,
-        witnesses: witnessList(process.env.NEXT_PUBLIC_TESTNET_WITNESSES, testnetRpc || TESTNET_RPC),
-      }
-    : undefined;
+// The testnet is listed only when a deployment names a node of it: it has no public RPC.
+const testnet: Network | undefined = testnetRpc
+  ? {
+      key: "testnet",
+      label: "Testnet",
+      rpc: testnetRpc,
+      chainId: clean(process.env.NEXT_PUBLIC_TESTNET_CHAIN_ID) || TESTNET_CHAIN_ID,
+      genesisHash: testnetGenesis,
+      // The built-in clock is that of the built-in genesis: never another one's.
+      genesisClock: testnetGenesis && testnetGenesis === TESTNET_GENESIS_HASH ? TESTNET_GENESIS_CLOCK : undefined,
+      prefix: clean(process.env.NEXT_PUBLIC_TESTNET_PREFIX) || TESTNET_PREFIX,
+      witnesses: witnessList(process.env.NEXT_PUBLIC_TESTNET_WITNESSES, testnetRpc),
+    }
+  : undefined;
 
-/** Known networks, in menu order. Mainnet appears only once its RPC is configured. */
+/** Known networks, in menu order. Mainnet and the testnet appear only once their RPC is configured. */
 export const NETWORKS: Partial<Record<KnownKey, Network>> = {
   ...(mainnet ? { mainnet } : {}),
   ...(testnet ? { testnet } : {}),
@@ -187,8 +189,11 @@ export function isNodeUrl(s: string) {
   }
 }
 
-/** Where a fresh browser starts: mainnet on a mainnet deployment, else the testnet. */
-export const DEFAULT_NETWORK = ((IS_MAINNET_BUILD && NETWORKS.mainnet) || NETWORKS.testnet || NETWORKS.mainnet || NETWORKS.local) as Network;
+/**
+ * Where a fresh browser starts: mainnet on a mainnet deployment, else the testnet when this
+ * deployment configures one (NEXT_PUBLIC_BLOCKULA_RPC), else a `blockula dev` node on this machine.
+ */
+export const DEFAULT_NETWORK = ((IS_MAINNET_BUILD && NETWORKS.mainnet) || NETWORKS.testnet || NETWORKS.local) as Network;
 
 function resolve(): Network {
   const fallback = DEFAULT_NETWORK;

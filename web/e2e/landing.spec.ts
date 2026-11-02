@@ -1,5 +1,5 @@
 // The landing page: a first visit to / (no wallet on this device) gets Blockula 1.0's page, with the
-// testnet wallet a click away; a device that has a wallet still opens it at /.
+// wallet a click away; a device that has a wallet still opens it at /.
 import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
 
 test("a first visit to / gets the landing page, and its button opens the wallet's welcome", async ({ page }) => {
@@ -13,7 +13,7 @@ test("a first visit to / gets the landing page, and its button opens the wallet'
   await expect(page.locator("main")).toContainText("has no value by design");
   await expect(page.locator("main")).not.toContainText(/mainnet/i);
   await expect(page).toHaveURL(/\/$/);
-  await page.getByRole("link", { name: "Open the testnet wallet" }).click();
+  await page.getByRole("link", { name: "Open the wallet" }).click();
   await expect(page).toHaveURL(/\/welcome$/);
   await expect(page.locator(".chapter-body")).toBeVisible();
   expect(await cspViolations(page)).toEqual([]);

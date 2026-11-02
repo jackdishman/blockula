@@ -10,7 +10,7 @@ import {
   ApiError, ChainMismatchError, Client, HistoryPrunedError, MAINNET_CHAIN_ID, MIN_NEW_ACCOUNT, MainnetNotAllowedError, NETWORKS, Wallet,
   addressFromPublicKey, baseFee, formatFang, parseFang, paymentsIn, signingBytes, txBytes, txId, watchPayments, type Payment, type Tx,
 } from "../src/index.js";
-import { KNOWN_CLOCKS, KNOWN_GENESIS, KNOWN_NETWORKS, TESTNET_RPC } from "../../mcp/src/network.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS, KNOWN_NETWORKS } from "../../mcp/src/network.js";
 
 const FANG = 1_000_000_000n;
 const GENESIS = "6e".repeat(32);
@@ -197,23 +197,25 @@ function funded(n: Node, rpc: string, byte: number, balance = 1_000n * FANG, opt
 {
   // The prefix is known before any request: a testnet wallet renders tboo1… at once.
   const calls = fetchCalls;
-  const w = Wallet.generate(Client.testnet());
+  const w = Wallet.generate(Client.testnet({ rpc: "http://own.node" }));
   assert.ok(w.address.startsWith("tboo1"), w.address);
-  assert.ok(Wallet.generate(new Client({ network: "testnet" })).address.startsWith("tboo1"));
+  assert.ok(Wallet.generate(new Client("http://own.node", { network: "testnet" })).address.startsWith("tboo1"));
   assert.equal(fetchCalls, calls, "no request needed to render the address");
-  const t = new Client({ network: "testnet" });
-  assert.deepEqual([t.rpc, t.network, t.prefix, t.genesisClock], [NETWORKS.testnet.rpc, "testnet", "tboo", NETWORKS.testnet.genesisClock]);
+  // The public testnet was retired: no RPC is built in for it, so it takes your node's URL.
+  assert.equal(NETWORKS.testnet.rpc, undefined);
+  assert.throws(() => new Client({ network: "testnet" }), /retired in November 2026 and has no public node/);
+  assert.throws(() => Client.testnet(), /retired/);
   // Your own node, held to the testnet's pins.
   const own = new Client("http://own.node", { network: "testnet" });
-  assert.equal(own.rpc, "http://own.node");
+  assert.deepEqual([own.rpc, own.network, own.prefix, own.genesisClock], ["http://own.node", "testnet", "tboo", NETWORKS.testnet.genesisClock]);
   fakeNode("http://own.node", { chain_id: "blockula-testnet-2", genesis_hash: "00".repeat(32), address_prefix: "tboo" });
   await assert.rejects(own.status(), (e: unknown) => e instanceof ChainMismatchError && e.field === "genesis_hash");
   // Pins that contradict the network are errors, not guesses.
-  assert.throws(() => new Client({ network: "testnet", chainId: "blockula-testnet-1" }), /contradicts the testnet network's/);
-  assert.throws(() => new Client({ network: "testnet", prefix: "boo" }), /contradicts/);
+  assert.throws(() => new Client("http://own.node", { network: "testnet", chainId: "blockula-testnet-1" }), /contradicts the testnet network's/);
+  assert.throws(() => new Client("http://own.node", { network: "testnet", prefix: "boo" }), /contradicts/);
   assert.throws(() => new Client({ network: "moon" as never }), /unknown network/);
-  assert.doesNotThrow(() => new Client({ network: "testnet", genesisHash: NETWORKS.testnet.genesisHash!.toUpperCase() }));
-  // No mainnet preset: the SDK knows the public testnet and a local dev chain.
+  assert.doesNotThrow(() => new Client("http://own.node", { network: "testnet", genesisHash: NETWORKS.testnet.genesisHash!.toUpperCase() }));
+  // No mainnet preset: the SDK knows blockula-testnet-2 (by its pins) and a local dev chain.
   assert.deepEqual(Object.keys(NETWORKS), ["testnet", "local"]);
   assert.throws(() => new Client("https://rpc.example", { network: "mainnet" as never }), /unknown network "mainnet" \(testnet or local\)/);
   assert.equal((Client as unknown as Record<string, unknown>).mainnet, undefined, "no Client.mainnet()");
@@ -223,7 +225,7 @@ function funded(n: Node, rpc: string, byte: number, balance = 1_000n * FANG, opt
 }
 {
   // The SDK's presets match the MCP's built-in networks (mcp/src/network.ts), which scripts/pin-network.sh writes: the pin PR copies them into networks.ts.
-  assert.equal(NETWORKS.testnet.rpc, TESTNET_RPC);
+  assert.equal(NETWORKS.testnet.rpc, KNOWN_NETWORKS.testnet.rpc);
   assert.equal(NETWORKS.testnet.chainId, KNOWN_NETWORKS.testnet.pin.chainId);
   assert.equal(NETWORKS.testnet.prefix, KNOWN_NETWORKS.testnet.pin.prefix);
   assert.equal(NETWORKS.testnet.genesisHash, KNOWN_GENESIS[NETWORKS.testnet.chainId!]);

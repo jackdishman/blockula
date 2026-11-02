@@ -3,8 +3,9 @@
 //! `known-chains.json`:
 //!
 //! * `--network mainnet|testnet|local|custom` (or `BLOCKULA_NETWORK`) says which network you mean.
-//!   Without it, it's read from `--rpc`: the public testnet's URL is `testnet`, this machine is
-//!   `local`, anything else `custom`. `mainnet` and `testnet` pin their chain id and prefix.
+//!   Without it, it's read from `--rpc`: this machine is `local`, anything else `custom`. `mainnet`
+//!   and `testnet` pin their chain id and prefix. Neither has a public node built in (the public
+//!   testnet was retired in November 2026): `--rpc` names one.
 //! * `--chain-id` and `--genesis-hash` (or `BLOCKULA_CHAIN_ID`, `BLOCKULA_GENESIS_HASH`) pin them
 //!   for any node. A chain id this release knows (`node/checkpoints/`) must come with its genesis.
 //! * What isn't pinned is pinned by the first status the node reports (trust on first use) and,
@@ -35,9 +36,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// The public testnet's node (as in the MCP).
-pub const TESTNET_RPC: &str = "https://blockula-testnet.fly.dev";
-/// The public testnet's chain id (deploy/launch.sh; never reused, DEC-7).
+/// The testnet's chain id (deploy/launch.sh; never reused, DEC-7). Its public node was retired in
+/// November 2026, so no URL is built in: `--network testnet` pins the chain of the node `--rpc` names.
 pub const TESTNET_CHAIN_ID: &str = "blockula-testnet-2";
 /// Where pins are remembered, in the blockula directory (shared with the MCP).
 pub const KNOWN_CHAINS_FILE: &str = "known-chains.json";
@@ -150,7 +150,6 @@ pub fn resolve(rpc: &str, args: &ChainPin) -> Result<Network> {
             "custom" => NetKey::Custom,
             _ => bail!("unknown network {n:?} (mainnet, testnet, local or custom)"),
         },
-        None if rpc == TESTNET_RPC => NetKey::Testnet,
         None if is_local(&url) => NetKey::Local,
         None => NetKey::Custom,
     };
@@ -509,8 +508,10 @@ mod tests {
     #[test]
     fn the_network_comes_from_the_flags_or_the_url_and_contradictions_are_errors() {
         let none = ChainPin::default();
-        let net = resolve("https://blockula-testnet.fly.dev/", &none).unwrap();
-        assert_eq!((net.key, net.rpc.as_str(), net.pin.chain_id.as_deref(), net.pin.prefix.as_deref()), (NetKey::Testnet, TESTNET_RPC, Some(TESTNET_CHAIN_ID), Some("tboo")));
+        // The retired public testnet's URL is no longer read as the testnet: --network says so.
+        assert_eq!(resolve("https://blockula-testnet.fly.dev/", &none).unwrap().key, NetKey::Custom);
+        let net = resolve("https://rpc.example/", &pin(Some("testnet"), None, None)).unwrap();
+        assert_eq!((net.key, net.rpc.as_str(), net.pin.chain_id.as_deref(), net.pin.prefix.as_deref()), (NetKey::Testnet, "https://rpc.example", Some(TESTNET_CHAIN_ID), Some("tboo")));
         let local = resolve("http://localhost:7070", &none).unwrap();
         assert_eq!((local.key, local.remember, local.pin.clone()), (NetKey::Local, false, Pin::default()));
         assert_eq!(resolve("https://rpc.example", &none).unwrap().key, NetKey::Custom);
@@ -539,7 +540,7 @@ mod tests {
             let why = mismatch(&effective_pin(&net, None), &mainnet).expect("refused");
             assert!(why.contains("--network mainnet"), "{why}");
         }
-        assert!(mismatch(&resolve(TESTNET_RPC, &ChainPin::default()).unwrap().pin, &mainnet).unwrap().contains("not `blockula-testnet-2`"));
+        assert!(mismatch(&resolve("https://rpc.example", &pin(Some("testnet"), None, None)).unwrap().pin, &mainnet).unwrap().contains("not `blockula-testnet-2`"));
         // Asked for: fine (its genesis pinned on first use until a release builds it in).
         let asked = resolve("https://rpc.example", &pin(Some("mainnet"), None, None)).unwrap();
         assert_eq!(mismatch(&asked.pin, &mainnet), None);
@@ -559,7 +560,7 @@ mod tests {
         // First use fills what wasn't pinned; remembered pins fill a network's gaps, but never
         // override it, and a relaunched network's old chain is ignored.
         // (The testnet's genesis is built in once a release pins it, scripts/pin-network.sh.)
-        let net = resolve(TESTNET_RPC, &ChainPin::default()).unwrap();
+        let net = resolve("http://127.0.0.1:7171", &pin(Some("testnet"), None, None)).unwrap();
         let g = known_genesis(TESTNET_CHAIN_ID).unwrap_or(g);
         assert_eq!(net.pin.genesis_hash, known_genesis(TESTNET_CHAIN_ID));
         let first = complete_pin(&net.pin, &status(TESTNET_CHAIN_ID, &g, "tboo"));
@@ -574,9 +575,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blockula-known-{}-{}", crate::chain::now_ms(), std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // An entry the MCP wrote (its format), which the CLI reads and keeps.
-        std::fs::write(dir.join(KNOWN_CHAINS_FILE), r#"{"testnet https://blockula-testnet.fly.dev":{"chainId":"blockula-testnet-2","genesisHash":"aa","prefix":"tboo"}}"#).unwrap();
+        std::fs::write(dir.join(KNOWN_CHAINS_FILE), r#"{"testnet https://testnet-node.example":{"chainId":"blockula-testnet-2","genesisHash":"aa","prefix":"tboo"}}"#).unwrap();
         let known = KnownChains::in_dir(&dir);
-        let testnet = resolve(TESTNET_RPC, &ChainPin::default()).unwrap();
+        let testnet = resolve("https://testnet-node.example", &pin(Some("testnet"), None, None)).unwrap();
         assert_eq!(known.get(&testnet).unwrap().unwrap().genesis_hash.as_deref(), Some("aa"));
         let custom = resolve("https://rpc.example", &ChainPin::default()).unwrap();
         let p = Pin { chain_id: Some("c".into()), genesis_hash: Some("bb".into()), prefix: Some("boo".into()) };

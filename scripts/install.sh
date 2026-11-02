@@ -226,5 +226,5 @@ case ":$PATH:" in
   *) echo "  Add it to your PATH:  echo 'export PATH=\"$DIR:\$PATH\"' >> ~/.zshrc  (or ~/.bashrc)" ;;
 esac
 echo "  Try:  blockula dev        (local chain + explorer at http://localhost:7070)"
-echo "        blockula wallet new && blockula wallet faucet --rpc https://blockula-testnet.fly.dev"
+echo "        blockula wallet new && blockula wallet faucet   (100 FANG from that chain's faucet)"
 echo "  Blockula is experimental, MIT-licensed software, provided as is, without warranty. Launch your own chain: https://github.com/jackdishman/blockula/blob/main/docs/LAUNCH.md"

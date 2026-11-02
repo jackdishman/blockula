@@ -13,7 +13,7 @@
 #
 # e.g. after `RESET=1 deploy/launch.sh`:
 #   scripts/pin-network.sh blockula-testnet-2 <hash> --genesis ~/.config/blockula/blockula-testnet-2/genesis.json \
-#     --checkpoint "$(blockula checkpoint --peer https://blockula-testnet.fly.dev --genesis-hash <hash>)"
+#     --checkpoint "$(blockula checkpoint --peer https://<a node of the chain> --genesis-hash <hash>)"
 # Embedded checkpoints carry their block's time (the fourth field, which `blockula checkpoint`
 # prints), so joiners measure a checkpoint's age from its own block (review-r3-sync-1).
 #
