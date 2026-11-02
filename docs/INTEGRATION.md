@@ -18,9 +18,9 @@ Read and submit through a node you run, not only a public one. A node on your ma
 blockula join --genesis https://<a node of the chain> --home /var/lib/blockula/full --port 7171
 ```
 
-- **Pins.** `join` refuses a genesis nobody pinned: a release knows its chains' genesis hashes, or you pass `--genesis-hash`. In code, pin the chain too: `new Client("http://localhost:7171", { network: "testnet" })` checks the testnet's chain id, genesis hash and address prefix on every status. For a chain of your own, pass them yourself: `{ chainId, genesisHash, prefix }`.
+- **Pins.** `join` refuses a genesis nobody pinned: a release knows its chains' genesis hashes, or you pass `--genesis-hash`. In code, pin the chain too: `new Client("http://localhost:7171", { chainId, genesisHash, prefix })` checks the chain id, genesis hash and address prefix on every status.
 - **Weak subjectivity.** A node that joins from scratch trusts a recent checkpoint, not just the genesis. It refuses to sync from a root older than the weak-subjectivity period (`weak_subjectivity_blocks` in `/api/status`: about 10.5 days with the default parameters, never less than a week). Take checkpoints from several independent sources: [OPERATIONS.md, Weak subjectivity](OPERATIONS.md#weak-subjectivity).
-- **History.** `join` fast-syncs from a certified snapshot and holds history only from there (`history_from` in `/api/status`). For a full record from genesis, pass `--full` to replay everything (a full node keeps every block it has). Validators keep about two days of blocks or less, and public nodes keep a limited window (14 days on the public testnet).
+- **History.** `join` fast-syncs from a certified snapshot and holds history only from there (`history_from` in `/api/status`). For a full record from genesis, pass `--full` to replay everything (a full node keeps every block it has). Validators keep about two days of blocks or less, and public nodes may keep a limited window (`deploy/launch.sh`'s keeps 14 days).
 - **Pruned data.** `/api/block/{height}` and `/api/sync` answer `410` with `"pruned": true` below `history_from`, and `/api/tx/{id}` answers `404` for a pruned tx. A 410 means "ask a node that keeps it", never "it didn't happen".
 - **Readiness.** `/api/health` is the probe: 200 when the head is fresh and synced, 503 with a `reason` otherwise (and `halted` when the node stopped on purpose, for an upgrade or a coordinated halt). When it says halted, stop crediting and sending, and say "network upgrading".
 - **Witnesses.** Give your client a second, independent node as a witness (`witnesses: [new Client(…)]`). Names it resolves for a signature are then proven against both, and a status height ahead of the witness is refused.
@@ -78,7 +78,7 @@ Without it, scan blocks yourself: page headers with `/api/blocks?limit=100&befor
 
 ## Addresses and names
 
-- **Format:** bech32m, lowercase. `boo1…` by default, `tboo1…` on public testnets, 32 bytes (the BLAKE3 hash of the account's first public key). `isAddress(s, "boo")` checks one in the SDK. Nodes refuse another network's prefix.
+- **Format:** bech32m, lowercase. `boo1…` by default, `tboo1…` on testnets that choose it, 32 bytes (the BLAKE3 hash of the account's first public key). `isAddress(s, "boo")` checks one in the SDK. Nodes refuse another network's prefix.
 - **Names expire.** A `.boo` name is registered for a year at a time, then has a grace period, then anyone can register it. A payment to a name goes to whoever owns it when the payment runs. **Pay addresses**, and show users the address a name resolves to before they confirm.
 
 ## Custody

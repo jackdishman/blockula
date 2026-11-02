@@ -138,7 +138,7 @@ blockula summon mychain --host <your address> --programs
 
 ## Good to know
 
-- **Try it first** on Blockula's public testnet, which runs the same software: [testnet.blockula.app](https://testnet.blockula.app).
+- **Try it first** on your own machine: `blockula dev` runs a one-node chain with the same software (Blockula's public testnet was retired in November 2026).
 - **Programs** (small programs in WebAssembly that run on the chain) are optional and off unless you ask for them: [see above](#programs-experimental-off-by-default).
 - **Making blocks only when there are transactions** would cut an idle chain's cost further. That's a protocol change, for later.
 - **The software comes as is,** with no warranty ([LICENSE](../LICENSE)). If you ever want your chain's FANG to have value, by selling it or paying people in it, that's your project, and a question for your own lawyer.

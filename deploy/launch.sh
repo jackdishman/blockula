@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 🧛 Launches (or upgrades) a protocol v1 public testnet on Fly.io. Safe to re-run.
+# 🧛 Launches (or upgrades) a protocol v1 testnet on Fly.io. Safe to re-run. It launched
+# blockula-testnet-2, the public testnet until November 2026; a new launch takes a new CHAIN_ID.
 #   N validator apps: own dedicated IPv4 (p2p only) + volume each (scheduled snapshots off: a
 #     restored validator volume can double-sign), spread across regions
 #   1 public full node app with HTTPS at https://$RPC_APP.fly.dev: the API, the explorer, and the
@@ -49,8 +50,10 @@ POOL_REPOS=${POOL_REPOS:-"jackdishman/blockula:10"}   # owner/name:weight …
 JURORS=${JURORS:-3}                     # stand-in founding jurors made on this laptop …
 JUROR_SOUL=${JUROR_SOUL:-25}            # … with this much Soul each (5 sits on a jury, 10 vouches)
 # JURORS_FILE: the founding jurors instead of stand-ins, one per line: `tboo1… <soul> <reason>`.
-VALIDATOR_VM=${VALIDATOR_VM:-shared-cpu-2x}
-VALIDATOR_MEMORY=${VALIDATOR_MEMORY:-2048mb}
+# Machine sizes: testnet-2's validators peaked at ~360 MB resident and ~2% of a core at 1 s blocks
+# in a set of five (measured 2026-11-02), so one shared CPU and 1 GB leave room.
+VALIDATOR_VM=${VALIDATOR_VM:-shared-cpu-1x}
+VALIDATOR_MEMORY=${VALIDATOR_MEMORY:-1024mb}
 RPC_VM=${RPC_VM:-shared-cpu-1x}
 RPC_MEMORY=${RPC_MEMORY:-1024mb}
 VOLUME_GB=${VOLUME_GB:-10}

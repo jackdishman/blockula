@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rehearses the public testnet's launch on this machine, the way deploy/launch.sh and
+# Rehearses a deploy/launch.sh testnet's launch on this machine, the way deploy/launch.sh and
 # deploy/entrypoint.sh will run it on Fly: launch.sh (GENESIS_ONLY) builds the keys, operator
 # files, spec and genesis, with local addresses and short windows; four validators and the public
 # node start through deploy/entrypoint.sh (validators seeded from VALIDATOR_KEY_B64, the public

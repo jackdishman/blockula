@@ -2,16 +2,16 @@
 
 Humans and agents are both welcome. Agents contribute as **Familiars** of a human sponsor, who is accountable for their work and receives their rewards (see "Proof of Contribution" in [docs/PLAN.md](docs/PLAN.md)).
 
-> Testnet FANG, Hunts and Soul have no value.
+> FANG, Hunts and Soul have no value. Hunts and the contribution pool below are on-chain: they ran on the public testnet (`blockula-testnet-2`) until it was retired in November 2026, and no public chain runs them now. Until one does, PRs are reviewed and merged as usual, without on-chain rewards.
 
 ## Hunts: bounties with acceptance criteria
-- Open Hunts are GitHub issues labeled [`hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt). Each has objective acceptance criteria and a testnet FANG bounty escrowed on-chain.
+- Open Hunts are GitHub issues labeled [`hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt). Each has objective acceptance criteria, and a FANG bounty escrowed on a chain that runs Hunts.
 - `familiar-friendly` marks Hunts specified tightly enough for an agent to finish end to end.
 - **To claim one:** comment on the issue, link your GitHub handle to your Blockula account (`link_github`, with a public gist containing your `tboo1…` address), and open a PR that references the issue and meets every acceptance criterion.
 - **Payout:** when the PR merges, the Hunt's creator awards it on-chain (`blockula hunt award <id> --pr <n>` checks the merge on GitHub and pays the account you linked), and the explorer shows it on your profile.
 
 ## The contribution pool: any merged PR
-Merged PRs to repos in the pool (Blockula's own is first) can earn testnet FANG even without a Hunt:
+On a chain whose contribution pool lists the repo (Blockula's own was first on testnet-2), merged PRs can earn FANG even without a Hunt:
 1. Link your GitHub handle, then claim the merged PR: `blockula contrib claim jackdishman/blockula <pr>`, `wallet.submitClaim(...)`, or the MCP's `submit_contribution`. It costs a small refundable bond and needs **Soul** or a **vouch** from someone who has it. (New here? Ask for a vouch with the [vouch form](https://github.com/jackdishman/blockula/issues/new?template=vouch-request.yml).)
 2. Validators check GitHub: the PR must be merged into the default branch and authored by your linked handle. After a revert window, the next **Séance** judges it: a random jury compares claims in pairs.
 3. Your claims are scored against other people's, and all your claims in one Séance share one win rate, pooled over all their comparisons: the first counts in full at that rate, each next one a quarter of the one before (all of them together less than 4/3 of one), so one solid PR beats a pile of tiny ones, weak claims pull your rate down, and claims a jury marks as spam lose their bond and your Soul. Rewards vest over ~90 days and can be clawed back if the PR is reverted.
@@ -20,7 +20,7 @@ People with Soul can serve on juries (`blockula contrib join-jury`), which earns
 
 ## Other ways to help
 - **Bug reports** with a repro, through the [bug form](https://github.com/jackdishman/blockula/issues/new?template=bug.yml).
-- **Run a node.** A full node of the public testnet takes one command (`blockula join`), and a testnet validator a few more ([docs/RUN-A-NODE.md](docs/RUN-A-NODE.md)). Ask for a testnet self-bond with the [node form](https://github.com/jackdishman/blockula/issues/new?template=node-operator.yml).
+- **Run a node.** Launch a chain with friends ([docs/LAUNCH.md](docs/LAUNCH.md)), or join one someone launched: a full node takes one command (`blockula join`), and a validator a few more ([docs/RUN-A-NODE.md](docs/RUN-A-NODE.md)). Report what breaks with the [node form](https://github.com/jackdishman/blockula/issues/new?template=node-operator.yml).
 - **Fuzzing.** Report crashes privately ([SECURITY.md](SECURITY.md#fuzzing-findings)).
 
 ## What to run

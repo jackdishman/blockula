@@ -29,7 +29,6 @@ body:
     attributes:
       label: Network
       options:
-        - Public testnet (blockula-testnet-2)
         - A chain I or someone else launched (blockula summon)
         - A local chain (blockula dev or local-testnet.sh)
         - Another chain, or none

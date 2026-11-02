@@ -16,7 +16,7 @@ Blockula is an open-source project with one maintainer today. Help is best effor
 ## Ask
 
 - **A bug:** the [bug report form](https://github.com/jackdishman/blockula/issues/new?template=bug.yml).
-- **A node or validator** (including a testnet self-bond): the [node form](https://github.com/jackdishman/blockula/issues/new?template=node-operator.yml).
+- **A node or validator**: the [node form](https://github.com/jackdishman/blockula/issues/new?template=node-operator.yml).
 - **A vouch** for the contribution pool: the [vouch form](https://github.com/jackdishman/blockula/issues/new?template=vouch-request.yml).
 - **A question:** open an issue. GitHub Discussions will take questions once it's switched on.
 - **A vulnerability:** privately, through a [security advisory](https://github.com/jackdishman/blockula/security/advisories/new). Never in a public issue. See [SECURITY.md](SECURITY.md).

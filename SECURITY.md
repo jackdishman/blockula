@@ -1,6 +1,6 @@
 # Security policy
 
-Blockula is software for running your own ledger, and a public testnet that runs it. It has had an internal review but no third-party audit (see the README). FANG has no value on any chain, but the chains people launch with Blockula should still be safe to run, so we want to hear about every vulnerability.
+Blockula is software for running your own ledger. It has had an internal review but no third-party audit (see the README). FANG has no value on any chain, but the chains people launch with Blockula should still be safe to run, so we want to hear about every vulnerability.
 
 ## Reporting
 
@@ -44,9 +44,9 @@ The internal review of protocol v1 and its fix rounds (October 2026) is [docs/AU
 
 Release archives carry SLSA build provenance, the Linux builds are reproducible, and `checksums.txt` is signed offline with the Blockula release key (ML-DSA-65). How to check all three: [docs/OPERATIONS.md "Releases"](docs/OPERATIONS.md#releases). `blockula release install vX.Y.Z` installs a release only if its signature checks against the release key id you pinned at your first install (`~/.blockula/release-key-id`), and a new key id is accepted only with a rotation statement signed by the pinned key. Once the key exists, a `blockula` binary also knows it, and won't pin any other key id you give it. The MCP's `install_node` checks against the same pin. This file is in a repository a compromised GitHub account could edit, so take the key id from here and from a channel GitHub doesn't control (the website, the operators' channel), check they agree, and pin it once. Release key id: *not generated yet*; it will be published here, in OPERATIONS.md, in `scripts/install.sh`, in `node/src/release_cli.rs` and in `mcp/src/release.ts`.
 
-## Testing on the public testnet
+## Testing
 
 Good-faith research is welcome. Please:
-- Prefer a local chain (`blockula dev`, or `scripts/local-testnet.sh` for 4 validators) for anything disruptive.
-- Don't degrade the public testnet for others (no flooding, sustained load or deliberate halts), and don't touch other people's accounts or data.
+- Test on a chain of your own (`blockula dev`, or `scripts/local-testnet.sh` for 4 validators). The public testnet was retired in November 2026.
+- Don't degrade chains other people run (no flooding, sustained load or deliberate halts) without their operators' consent, and don't touch other people's accounts or data.
 - Give us a reasonable chance to fix an issue before disclosing it.

@@ -9,10 +9,10 @@
 - [Plan](docs/PLAN.md): architecture, privacy (Ghost Mode), tokenomics, roadmap
 - [Security](SECURITY.md): how to report vulnerabilities
 
-Public testnet: https://blockula-testnet.fly.dev · Wallet: https://testnet.blockula.app · One-pager: docs/ONE_PAGER.md
+One-pager: docs/ONE_PAGER.md · No public chain: run `blockula dev` locally or launch your own (the public testnet was retired in November 2026)
 
 ## Fastest path
-1. `claude mcp add blockula -- npx -y @blockula/mcp` (the public testnet; `--network local` for a `blockula dev` chain, `BLOCKULA_RPC=<a node>` for a chain you launched). The network is pinned (chain id + genesis hash) and never switches on its own.
+1. `claude mcp add blockula -- npx -y @blockula/mcp` (a local `blockula dev` chain at http://localhost:7070; `BLOCKULA_RPC=<a node>` for a chain you launched). The network is pinned (chain id + genesis hash) and never switches on its own.
 2. MCP: create_wallet → faucet → register_name / send; stake / unstake / my_stake; list_proposals / vote; renew_name (start_dev_node for a local chain, needs the node binary from install_node)
 3. App code: `import { Wallet, Client } from "@blockula/sdk"`; browser users: `import { createPasskeyWallet } from "@blockula/sdk/passkey"`. Helpers for every protocol v1 action (staking, governance, multisig, names); `client.provenAccount` / `provenName` check Merkle proofs against independent nodes.
-4. Contribute: MCP list_hunts → implement → PR merges → submit_contribution (contribution pool, judged by Séance juries; see AGENTS.md). Testnet FANG, Hunts and Soul have no value.
+4. Contribute: MCP list_hunts → implement → PR merges → submit_contribution (on a chain that runs a contribution pool, judged by Séance juries; see AGENTS.md). FANG, Hunts and Soul have no value.

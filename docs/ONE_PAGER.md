@@ -13,24 +13,25 @@
 | Signatures | **ML-DSA-65** (NIST FIPS 204) for every account, validator vote and block certificate. No elliptic curves on-chain |
 | Hashing | BLAKE3-256. Grover's algorithm only halves its strength, and 256-bit hashes keep a ~128-bit margin |
 | Network | Validators authenticate each other with ML-DSA-65 and key their connections with hybrid X25519 + ML-KEM-768, so recorded traffic stays private even against a future quantum computer |
-| Consensus | BFT proof-of-stake (Commonware *simplex*). A block is final once it's made, with no waiting for confirmations: every 5 seconds on chains you launch (lighter on home connections), every second on the public testnet |
+| Consensus | BFT proof-of-stake (Commonware *simplex*). A block is final once it's made, with no waiting for confirmations: every 5 seconds on chains you launch (lighter on home connections), every second with `blockula dev` |
 | Wallet | A **passkey** unlocks the wallet. Its PRF output derives the ML-DSA key, so the passkey's own non-quantum-safe signature is never used on-chain |
 | Accounts | Multiple keys per account: **owner** keys (each device, plus recovery) and **session** keys for agents and apps, with a spend limit per period and an expiry, all enforced on-chain |
 | Names | Native `.boo` names. Shorter names cost more, and the fees fund the treasury |
 | Fees | Priced per byte (post-quantum signatures are ~3.3 KB). The base fee is **burned** |
 
 ## What's live today
-- **Testnet** at `https://blockula-testnet.fly.dev`: 4 validators across the US and Europe, plus a public node with a built-in explorer that reads like plain English ("vlad.boo sent 5 FANG to alice.boo").
-- **Web wallet** at `https://testnet.blockula.app`: passkey sign-up, a `.boo` name, send and receive, a tutorial checklist, linking devices, and giving an agent a daily budget.
-- **`@blockula/sdk`** (TypeScript) and **`@blockula/mcp`** (for Claude Code or any MCP agent): `claude mcp add blockula -- npx -y @blockula/mcp` works with zero setup against the public testnet.
+- **A node with a built-in explorer** that reads like plain English ("vlad.boo sent 5 FANG to alice.boo").
+- **A web wallet** (`web/`): passkey sign-up, a `.boo` name, send and receive, a tutorial checklist, linking devices, and giving an agent a daily budget.
+- **`@blockula/sdk`** (TypeScript) and **`@blockula/mcp`** (for Claude Code or any MCP agent): `claude mcp add blockula -- npx -y @blockula/mcp` works against a local `blockula dev` chain, or any node you name.
+- **A public testnet ran** from October to November 2026 (`blockula-testnet-2`: 4 validators across the US and Europe, then a fifth run by an outside operator). It was retired once Blockula became a kit for running your own ledger; its history is archived, and CI replays it nightly.
 - **Run your own:**
   - `blockula dev` gives you a local chain in one command.
   - `blockula summon mychain --host <your address>` creates your own network, and friends' machines reach it (a Tailscale address works).
   - `blockula join` syncs a full node, with the explorer browsable while it syncs.
   - `blockula validator register` registers a validator with a bond, and the chain's admin approves it.
   - The whole flow, step by step: [docs/LAUNCH.md](LAUNCH.md).
-- **Proof of Contribution**, live on the testnet: bounties (**Hunts**) on GitHub issues, and a contribution pool for any merged PR. Validators check claims against GitHub; random commit-reveal juries (**Séances**) score them; a person's claims share one pooled win rate (each after the first counting a quarter of the one before) and rewards vest with clawback; reputation (**Souls**) can't be bought. Agents take part as **Familiars** of a human sponsor.
-- **Validators are permissionless.** Anyone can register one with a self-bond, and at each epoch boundary the top validators by stake make the set (newcomers at most a third of it). The testnet has no admin key: nobody approves a validator, and every registration is visible in the explorer.
+- **Proof of Contribution**, built into every chain and run on the public testnet while it lasted: bounties (**Hunts**) on GitHub issues, and a contribution pool for any merged PR. Validators check claims against GitHub; random commit-reveal juries (**Séances**) score them; a person's claims share one pooled win rate (each after the first counting a quarter of the one before) and rewards vest with clawback; reputation (**Souls**) can't be bought. Agents take part as **Familiars** of a human sponsor.
+- **Validators are permissionless.** Anyone can register one with a self-bond, and at each epoch boundary the top validators by stake make the set (newcomers at most a third of it). A chain built from a genesis spec (as the public testnet was) has no admin key: nobody approves a validator, and every registration is visible in the explorer.
 - **Reviewed before launch.** An internal four-track security and product review covered consensus, network/ops, client and product. Its findings were fixed and turned into regression tests. There's no third-party audit.
 
 ## Where it's going
@@ -43,4 +44,4 @@
 
 **Unit:** FANG (1 FANG = 10⁹ drops), each chain's own. It pays fees (the base fee is burned), bonds and names, and a chain's faucet hands it out. It has no value: nobody sells it, buys it or gets paid in it.
 
-**Status:** software and a public testnet, unaudited by a third party, no value anywhere. Built in the open: start with `AGENTS.md` and `docs/PLAN.md`.
+**Status:** software, unaudited by a third party, no value anywhere. Built in the open: start with `AGENTS.md` and `docs/PLAN.md`.

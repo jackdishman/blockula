@@ -8,7 +8,8 @@ history, whatever executes programs later.
 
 - **Every PR:** the PR's binary replays a recorded v1 history that uses every tx tag a block can
   carry, block by block. CI's Node job runs it, so it's part of a required check.
-- **Every night:** main's binary replays the public testnet from genesis (`replay.yml`).
+- **Every night:** main's binary replays `blockula-testnet-2`, the retired public testnet, from
+  genesis, from its archive (`replay.yml`).
 
 A red gate means the PR changed what a v1 block does. Fix the PR, or gate the change behind a
 protocol version. Never re-record the corpus to make the gate pass.
@@ -45,7 +46,8 @@ own:
 
    This is all an archive without a recording gets (the testnet's), and it's enough: validators
    finalized every block only after checking the root it cites, so a divergence shows at the
-   first block citing a diverged root (for the archive's last few blocks, the next night).
+   first block citing a diverged root (except in the archive's last few blocks, which no later
+   block cites).
 2. **The recording, block by block**, where the archive has one. Each executed block must match
    the recorded one:
    - which txs applied, which failed and which were skipped;
@@ -160,23 +162,22 @@ gated pre-v2 behavior. To change it:
    (`for a in node/testdata/replay/v1-*; do blockula replay "$a"; done`, from the first release
    that ships the command). A difference there means the recording isn't v1.
 
-## Every night: the testnet from genesis
+## Every night: testnet-2 from genesis
 
-`.github/workflows/replay.yml` runs daily (and on demand):
+`blockula-testnet-2` was the public testnet from 2026-10-18 until it was retired in November 2026.
+Its whole history, from genesis to its last block, is archived and staged on GitHub's container
+registry (below). `.github/workflows/replay.yml` runs daily (and on demand):
 1. Pulls the staged archive. Any error fails the run, "not found" included: registries word a
-   missing package, no access and an outage alike, and going on would start the archive over
-   from height 1. Only the first run starts fresh (below).
-2. Copies what's new from the public node's `/api/sync` with `scripts/archive-chain.mjs`.
-3. Replays it all from genesis with `--prune-blocks 20000`. Its output goes to a file, not the
+   missing package, no access and an outage alike.
+2. Replays it all from genesis with `--prune-blocks 20000`. Its output goes to a file, not the
    run's public log (below).
-4. Stages the files that closed.
+
+Nothing reads a live node, and nothing is staged by the run: the archive is fixed.
 
 If it fails, it opens an issue labeled `replay-alert` that @-mentions the maintainer, or comments
 on the one already open. The next good run closes it. Its long steps have their own time limits
 (the replay's is three hours) inside the job's, so a step that runs out of time fails and alerts
-too. A red replay stages nothing, so a divergence on main stops the staged copy growing: after
-12 days of red runs, the node no longer holds the missing heights, and the fix needs a re-seed
-(below).
+too.
 
 ### A red night
 
@@ -200,61 +201,39 @@ it, or gate it behind a protocol version.
 
 ### The archive CI reads
 
-P0's archive lives on the maintainer's Mac (a daily launchd job writes
-`~/.blockula/archive/blockula-testnet-2`), and the public node prunes at 14 days. There were two
-ways to give CI the whole history:
+The staged copy is a public OCI artifact, `ghcr.io/jackdishman/blockula-history:<chain id>`,
+pushed with `oras` by `scripts/stage-archive.sh`. It holds what `scripts/archive-chain.mjs`
+writes: `meta.json`, `genesis.json` and the closed `sync-*.jsonl.gz` files. Only closed files are
+staged, so the archive is closed with `--close` once the chain has stopped (below). The
+maintainer's Mac keeps the archive the staged copy came from (`~/.blockula/archive/<chain id>`,
+written by a daily launchd job while the chain ran), as an independent backup.
 
-| | The public node keeps everything (`--archive`) | Stage the closed files on GitHub's container registry |
-|---|---|---|
-| Storage | The node's Fly volume grows about 30 GB a year, forever, and someone grows the volume | Public packages are free. About 13 MB per 100,000 heights, about 4 GB a year |
-| Each night | Download the whole history again over `/api/sync`: about 14 GB, and hours of rate-limited requests, after a year | Pull from GHCR, which is free and fast from Actions. Only under 100,000 heights come from the node |
-| Testnet change | A config change and a redeploy | None |
+While testnet-2 ran, the nightly copied each day's new blocks from its public node, replayed them
+and staged the files that closed; its public node pruned at 14 days, so staging was the only
+copy CI could read.
 
-**Staging is cheaper, and it's what the nightly does.**
-- The staged copy is a public OCI artifact, `ghcr.io/jackdishman/blockula-history:<chain id>`,
-  pushed with `oras` by `scripts/stage-archive.sh`.
-- It holds `meta.json`, `genesis.json` and the closed `sync-*.jsonl.gz` files: the same files
-  and format as P0's archive.
-- CI builds its own copy from the public node rather than uploading the Mac's, so the launchd
-  job doesn't change. Every file it stages has already replayed: checkpoints, certificates and
-  roots checked.
-- The Mac's archive stays an independent backup, and the source to re-seed from.
+### A retired chain
 
-### The first run
-
-Nothing is staged until the first run, and scheduled runs never start over, so run the workflow
-once by hand with **`fresh`** (Actions → Replay testnet history → Run workflow → fresh). It
-skips the pull, archives from height 1, replays and stages the closed files, which creates the
-package. That works while the public node still holds block 1 (until about 2026-11-01); after
-that, seed it (below).
-
-**Then check the package is public:** github.com → Your profile → Packages → `blockula-history`
-→ Package settings → Change visibility. A package first pushed by a workflow can start out
-private. CI can read it either way, but only public packages' storage is free.
-
-### Seeding the staged archive
-
-A run that needs heights the node no longer holds fails at its `archive` step: a fresh run after
-about 2026-11-01, or one after more than 12 days without a good run. Then stage the Mac's copy
-once, from a machine that has it:
+When a chain the nightly replays stops for good, stage its whole history once, before its last
+node goes:
 
 ```
+node scripts/archive-chain.mjs https://<its node> ~/.blockula/archive --close
 gh auth refresh -s write:packages
 gh auth token | oras login ghcr.io -u jackdishman --password-stdin
-scripts/stage-archive.sh push ~/.blockula/archive/blockula-testnet-2
+scripts/stage-archive.sh push ~/.blockula/archive/<chain id>
 ```
 
-This stages only the closed files (each checked against `meta.json`, read once, so the launchd
-job can keep writing). The next nightly continues from the last one. A package first pushed by
+`--close` closes the open file however few heights it holds (it would never fill), so every block
+through the last is in a closed file and `stage-archive.sh` stages it. Run it after the chain
+has stopped making blocks, or blocks finalized after it go unarchived. A package first pushed by
 hand doesn't let the workflow in: in its Package settings, under Manage Actions access, add
-`jackdishman/blockula` with the Write role (and make it public, as above).
+`jackdishman/blockula` with the Read role, and keep the package public (github.com → Your profile
+→ Packages → `blockula-history` → Package settings), so its storage stays free.
 
-### Time and relaunches
+### Time
 
-- **Replay time** grows with the chain: about 86,000 blocks a day. testnet-2 at its programs
-  activation (about 20M blocks) replays in about 40 minutes at the rate measured on an M4 Max. A
-  GitHub runner is slower, so expect a few times that: inside the replay step's three-hour limit.
-  Past that, replay from certified snapshots in shards.
-- **A relaunched testnet** has a new chain id. The workflow refuses a node serving another chain
-  until `CHAIN_ID` in `replay.yml` is updated. The old chain's archive stays staged under its own
-  tag.
+**Replay time** grows with the chain's length: testnet-2's ~1.3 million blocks replay in a few
+minutes at the rate measured on an M4 Max (about 8,000 blocks a second), and a GitHub runner is
+a few times slower: well inside the replay step's three-hour limit. A longer chain replayed this
+way can split into shards replayed from certified snapshots.

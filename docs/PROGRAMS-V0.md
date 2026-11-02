@@ -2543,7 +2543,7 @@ aside: what P2's `replay::compare` checks (from `9bb65dc`), so a stray `programs
 block fails the gate. A v1 block's JSON line is also byte-identical to v0.5.2's, which a value
 comparison doesn't establish (key order, number form), so a unit test checks the bytes
 (§10.1). What isn't consensus but changes code every v1 node runs (proposal order, the replay
-cache's off switch, the quarantine) has its own v1 tests (§10.1). P2's CI job (and `replay.yml`'s nightly replay of the public testnet) is a required
+cache's off switch, the quarantine) has its own v1 tests (§10.1). P2's CI job (and `replay.yml`'s nightly replay of testnet-2's archive) is a required
 check of this work: nothing here is mergeable while it fails.
 
 ### 10.6 Release gates

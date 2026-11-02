@@ -25,7 +25,7 @@ A good report has: the affected component and commit or release; the impact you 
 **Out of scope**
 
 - Attacks that need ⅓ or more of the active validator set's votes, or control of the release key, or of a maintainer's GitHub or npm account (report weaknesses in how we protect those, though).
-- Volumetric DoS (flooding with bandwidth or requests) against the public testnet or anyone's infrastructure. A cheap, asymmetric DoS (one small tx or message that halts or slows nodes) is in scope.
+- Volumetric DoS (flooding with bandwidth or requests) against anyone's chain or infrastructure. A cheap, asymmetric DoS (one small tx or message that halts or slows nodes) is in scope.
 - Third-party services and their configuration: Fly.io, Vercel, GitHub, npm, DNS providers. Bugs in dependencies (Commonware, `ml-dsa`, `@noble/post-quantum`, …) go to their maintainers; they're in scope here only with a working exploit against Blockula.
 - Known issues listed in [PLAN.md "Known limits"](PLAN.md#known-limits), unless you show a concrete exploit that's worse than described.
 - The p2p transport using X25519 key exchange (CRY-1, documented). A practical classical break of the handshake is in scope.
@@ -46,7 +46,7 @@ Same root cause, one report: a duplicate of a report we already have counts as t
 
 ## Rules
 
-- **Testnet first.** Do your testing on a local chain (`blockula dev`, `scripts/local-testnet.sh`) or a private testnet of your own. On the public testnet, use only your own accounts, keep load low, and stop as soon as you've shown the problem: no deliberate halts, no flooding, no touching other people's accounts or data.
+- **Testnet first.** Do your testing on a local chain (`blockula dev`, `scripts/local-testnet.sh`) or a private testnet of your own. On a chain other people run, use only your own accounts, keep load low, and stop as soon as you've shown the problem: no deliberate halts, no flooding, no touching other people's accounts or data.
 - **Never test against a chain someone else runs** without their consent. Reproduce on a local chain instead.
 - Don't keep or use anything you got through a bug beyond what's needed to show it; return funds and delete data. Don't disclose before the timeline below.
 - If a reward is ever paid, it can't go to a current or recent (last 6 months) Blockula maintainer, contractor or auditor of the affected code, to whoever introduced the bug, or where the law forbids payment (sanctions). We may need identity and tax information before paying, as the law requires.

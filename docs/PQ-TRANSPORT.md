@@ -114,7 +114,7 @@ Cost, from `cargo test --manifest-path node/Cargo.toml --release -p commonware-s
 
 ### Public RPC (inbound HTTPS)
 
-The node serves plain HTTP; TLS is terminated in front of it, so whether a user's connection is post-quantum depends on that edge. Measured on 2026-10-14 with a client offering `X25519MLKEM768`: the Fly.io edge in front of `blockula-testnet.fly.dev` negotiated **X25519**, while the wallet's Vercel origin negotiated `X25519MLKEM768`. Operators running a public RPC can:
+The node serves plain HTTP; TLS is terminated in front of it, so whether a user's connection is post-quantum depends on that edge. Measured on 2026-10-14 with a client offering `X25519MLKEM768`: the Fly.io edge in front of the public testnet's node (`*.fly.dev`) negotiated **X25519**, while the wallet's Vercel origin negotiated `X25519MLKEM768`. Operators running a public RPC can:
 
 1. **Use an edge that negotiates `X25519MLKEM768`.** Cloudflare's proxy and Vercel do by default for clients that offer it.
 2. **Terminate TLS in a proxy they run.** Caddy (Go 1.24+ enables `X25519MLKEM768` by default), or nginx/HAProxy on OpenSSL 3.5+ (e.g. nginx `ssl_ecdh_curve X25519MLKEM768:X25519;`). On Fly this means a raw TCP service on 443 (no `tls` handler), so Fly's proxy passes the connection through instead of terminating it.
@@ -127,7 +127,7 @@ Check an endpoint with OpenSSL 3.5+: `openssl s_client -connect host:443 -groups
 - **Hybrid and classical nodes can't peer.** A validator running a binary without this patch (for example a v0.4.x build) can't connect to the network: the other side drops its handshake (`unable to decode` on a hybrid listener, `recv too large` on a classical one), and it counts as offline. There is deliberately no fallback.
 - **Genesis ceremony:** every operator builds or downloads the release binary and compares its hash with the published one (and `git_sha` in `/api/status`), and checks `crypto.p2p_transport` on their node before the chain starts.
 - **Changing the transport later** (for example to an upstream hybrid KEM) changes the wire format, so it's a coordinated upgrade: schedule it, and restart every validator at the same halt height.
-- The public testnet on v0.4.x keeps its classical transport until it's replaced by a protocol-v1 testnet, which starts hybrid from genesis.
+- The v0.4.x public testnet kept its classical transport; the protocol-v1 testnet that replaced it (`blockula-testnet-2`, retired in November 2026) was hybrid from genesis.
 
 ## Upstream
 

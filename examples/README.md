@@ -40,6 +40,4 @@ Then try the rest:
 
 ## Other networks
 
-`--network testnet` uses the public testnet's RPC and pins its chain; add `--rpc http://localhost:7171` to go through your own node (`blockula join`). The testnet's faucet gives 100 test FANG an hour per address.
-
 On a chain of your own ([docs/LAUNCH.md](../docs/LAUNCH.md)), pass one of its nodes with `--rpc`.

@@ -3,9 +3,9 @@
 # on GitHub's container registry, one tag per chain (docs/REPLAY.md "The archive CI reads"). An
 # archive is what scripts/archive-chain.mjs writes: meta.json, genesis.json, closed files of about
 # 100,000 heights (gzipped, their SHA-256 in meta.json) and the open file it still appends to.
-# Only closed files are staged, with meta.json saying none is open: the open one's heights are
-# always under 100,000 blocks old, so the next run copies them from the node again (the public
-# node keeps 14 days).
+# Only closed files are staged, with meta.json saying none is open: a live chain's open file is
+# copied from a node again, and a stopped chain's archive is closed first (archive-chain.mjs
+# --close, docs/REPLAY.md "A retired chain").
 #
 #   scripts/stage-archive.sh pull <archive dir>   # the staged copy into <archive dir>; any error
 #                                                 # fails, "not found" too (a first run starts

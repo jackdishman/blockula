@@ -1,15 +1,13 @@
-# The v1 replay gate's nightly half (docs/REPLAY.md): main's binary replays the public testnet's
+# The v1 replay gate's nightly half (docs/REPLAY.md): main's binary replays blockula-testnet-2's
 # whole history from genesis, as a node joining it would (every certificate, every state root its
 # blocks cite), so a v2 rule that wakes before its version can't diverge from v1 unnoticed. Every
-# PR replays the recorded corpus in ci.yml's Node job; this replays the real chain.
+# PR replays the recorded corpus in ci.yml's Node job; this replays a real chain.
 #
-# The history: the public node keeps 14 days of blocks, so the closed files of a copy are staged
-# on GitHub's container registry (scripts/stage-archive.sh), and each run copies what's new from
-# the node's /api/sync (scripts/archive-chain.mjs), replays it all, then stages the files that
-# closed. The first run starts fresh (the `fresh` input: nothing to pull, the archive from height
-# 1); every other run must pull the staged copy, or fails. A run more than 12 days after the last
-# good one finds heights the node no longer holds and fails: then stage the maintainer's copy
-# (docs/REPLAY.md "Seeding the staged archive").
+# The history: testnet-2 was the public testnet until November 2026, and its nodes are gone. Its
+# archive (scripts/archive-chain.mjs, closed with --close once the chain stopped) is staged on
+# GitHub's container registry (scripts/stage-archive.sh), and each run pulls it and replays it.
+# Nothing reads a live node and nothing is staged here: the staged copy changes only by hand
+# (docs/REPLAY.md "A retired chain").
 #
 # This repository is public, and so are its run logs. A divergence or a crash on the chain's real
 # history may be an undisclosed vulnerability (SECURITY.md), so the replay's output goes to a
@@ -20,20 +18,14 @@
 # A failed run opens an issue labeled replay-alert that @-mentions the maintainer, or comments on
 # the one already open; the next good run closes it. The long steps have their own time limits,
 # inside the job's: a step that runs out fails, and alerts, where the job running out would cancel
-# the run without a word. A red replay stages nothing that night (only replayed files are staged).
-# It never runs on pull requests, so it isn't a required check.
+# the run without a word. It never runs on pull requests, so it isn't a required check.
 name: Replay testnet history
 on:
   schedule:
     - cron: "41 5 * * *"
   workflow_dispatch:
-    inputs:
-      fresh:
-        description: "Start fresh: archive from height 1 instead of pulling the staged copy (the first run, while the node still holds block 1)"
-        type: boolean
-        default: false
 
-# No permissions by default; the job's token reads the repo and writes the staged archive and the
+# No permissions by default; the job's token reads the repo and the staged archive, and writes the
 # alert issue.
 permissions: {}
 
@@ -41,23 +33,20 @@ concurrency: { group: replay-testnet, cancel-in-progress: false }
 
 env:
   CARGO_TERM_COLOR: always
-  RPC: https://blockula-testnet.fly.dev
-  # The chain this replays. A relaunched testnet has another id: update it here (the old chain's
-  # archive stays staged under its own tag).
+  # The chain this replays: its staged archive's tag.
   CHAIN_ID: blockula-testnet-2
   STAGE: ghcr.io/jackdishman/blockula-history
 
 jobs:
   replay:
     name: Replay the testnet from genesis
-    # Forks don't replay (they can't write the staged archive, and their alerts would mention the
-    # maintainer).
+    # Forks don't replay (their alerts would mention the maintainer).
     if: github.repository == 'jackdishman/blockula'
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     permissions:
       contents: read
-      packages: write
+      packages: read
       issues: write
     # bash -eo pipefail: a failing command in a pipeline fails its step.
     defaults:
@@ -66,18 +55,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
-      - id: status
-        name: The node serves the chain this replays
-        run: |
-          status=$(curl -fsS -m 30 --retry 3 "$RPC/api/status") || { echo "::error::$RPC/api/status didn't answer"; exit 1; }
-          got=$(jq -r .chain_id <<< "$status")
-          [ "$got" = "$CHAIN_ID" ] || { echo "::error::$RPC serves $got, not $CHAIN_ID: update CHAIN_ID in replay.yml"; exit 1; }
       - name: Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with: { workspaces: node }
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with: { node-version: 22 }
       - name: Build blockula
         timeout-minutes: 45
         run: cargo build --release --locked --manifest-path node/Cargo.toml
@@ -94,13 +75,11 @@ jobs:
         run: printf '%s' "$GH_TOKEN" | oras login ghcr.io -u "$ACTOR" --password-stdin
       - id: pull
         name: Pull the staged archive
-        if: ${{ !inputs.fresh }}
         timeout-minutes: 15
-        run: bash scripts/stage-archive.sh pull "archive/$CHAIN_ID"
-      - id: archive
-        name: Copy what's new from the node (scripts/archive-chain.mjs)
-        timeout-minutes: 60
-        run: node scripts/archive-chain.mjs "$RPC" archive
+        run: |
+          bash scripts/stage-archive.sh pull "archive/$CHAIN_ID"
+          got=$(jq -r .chain_id "archive/$CHAIN_ID/meta.json")
+          [ "$got" = "$CHAIN_ID" ] || { echo "::error::the archive staged as $CHAIN_ID holds $got"; exit 1; }
       - id: replay
         name: Replay from genesis
         timeout-minutes: 180
@@ -129,32 +108,25 @@ jobs:
           path: ${{ runner.temp }}/sealed/fuzz-crash-replay.tar.age
           if-no-files-found: error
           retention-days: 14
-      - id: stage
-        name: Stage the closed files
-        timeout-minutes: 15
-        run: bash scripts/stage-archive.sh push "archive/$CHAIN_ID"
       - name: Alert (or recover)
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           STATUS: ${{ job.status }}
-          FAILED: ${{ steps.status.outcome == 'failure' && 'status' || steps.pull.outcome == 'failure' && 'pull' || steps.archive.outcome == 'failure' && 'archive' || steps.replay.outcome == 'failure' && 'replay' || steps.stage.outcome == 'failure' && 'stage' || 'setup' }}
+          FAILED: ${{ steps.pull.outcome == 'failure' && 'pull' || steps.replay.outcome == 'failure' && 'replay' || 'setup' }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           label=replay-alert
-          # The oldest open alert, as scripts/testnet-watch.sh picks its own.
+          # The oldest open alert.
           open=$(gh issue list --label "$label" --state open --json number --limit 100 --jq 'map(.number) | min // empty')
           if [ "$STATUS" = success ]; then
             [ -z "$open" ] || { gh issue comment "$open" --body "Recovered: $RUN replayed $CHAIN_ID from genesis."; gh issue close "$open"; }
             exit 0
           fi
           case $FAILED in
-            replay) why="main's binary didn't reproduce $CHAIN_ID's history (a divergence from v1, or a broken archive), or the replay ran out of time. Its log is sealed for the maintainers, not in the run's: docs/REPLAY.md \"A red night\". Nothing is staged while it's red: past 12 days, docs/REPLAY.md \"Seeding the staged archive\"." ;;
-            pull) why="the staged archive on $STAGE couldn't be pulled. If nothing is staged yet, run the workflow with \`fresh\` (docs/REPLAY.md \"The first run\"). Past 12 days without a good run, the node no longer holds the missing heights: docs/REPLAY.md \"Seeding the staged archive\"." ;;
-            archive) why="the history couldn't be copied from $RPC. Past 12 days without a good run (or on a fresh run, once the node no longer holds block 1), the node no longer holds the missing heights: docs/REPLAY.md \"Seeding the staged archive\"." ;;
-            stage) why="the replay passed, but the closed files couldn't be staged on $STAGE." ;;
-            status) why="$RPC didn't answer, or serves another chain than $CHAIN_ID (a relaunched testnet: update CHAIN_ID in replay.yml)." ;;
+            replay) why="main's binary didn't reproduce $CHAIN_ID's history (a divergence from v1, or a broken archive), or the replay ran out of time. Its log is sealed for the maintainers, not in the run's: docs/REPLAY.md \"A red night\"." ;;
+            pull) why="the staged archive on $STAGE couldn't be pulled, or isn't $CHAIN_ID's. It's staged by hand: docs/REPLAY.md \"A retired chain\"." ;;
             *) why="the run failed before it fetched anything (the build or the tools)." ;;
           esac
           body="@jackdishman the nightly replay of $CHAIN_ID failed at step \`$FAILED\`: $why

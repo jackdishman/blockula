@@ -3,9 +3,6 @@ contact_links:
   - name: 🔒 Report a vulnerability
     url: https://github.com/jackdishman/blockula/security/advisories/new
     about: Privately, please. Don't open a public issue for security bugs, including fuzzer crashes.
-  - name: 🏹 Open Hunts (testnet)
-    url: https://blockula-testnet.fly.dev/#/hunts
-    about: Bounties on the public testnet, each with acceptance criteria and test FANG escrowed on-chain. Test FANG has no value.
   - name: 🆘 Getting help
     url: https://github.com/jackdishman/blockula/blob/main/SUPPORT.md
     about: Where to start, what to ask where, and what nobody can do for you.

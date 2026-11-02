@@ -1,6 +1,6 @@
 # Governance, treasury and multisig accounts
 
-Protocol v1 runs without admin keys (DEC-10). On a chain that has none, the public testnet among them, everything an admin used to decide is a proposal that FANG holders vote on, with a timelock before it runs; during the first year the validators can also pass proposals as a bootstrap council. This page specifies proposals and votes (GOV-1), the treasury and community distributions (TOK-3), multisig accounts (SF-11), and what replaced the Season 0 admin levers (GOV-2, GOV-3). The code is `node/src/governance.rs`; MAINNET-DESIGN 3.5 is the summary.
+Protocol v1 runs without admin keys (DEC-10). On a chain that has none (any chain built from a genesis spec, as the public testnet was), everything an admin used to decide is a proposal that FANG holders vote on, with a timelock before it runs; during the first year the validators can also pass proposals as a bootstrap council. This page specifies proposals and votes (GOV-1), the treasury and community distributions (TOK-3), multisig accounts (SF-11), and what replaced the Season 0 admin levers (GOV-2, GOV-3). The code is `node/src/governance.rs`; MAINNET-DESIGN 3.5 is the summary.
 
 Every number below is a governance parameter (`node/src/params.rs`), shown with its default.
 

@@ -2453,7 +2453,9 @@ on a v1 binary. `/api/params` gains a `programs` section.
 
 ### 14.3 On at genesis, or after?
 
-- **Testnet-2 first.** `blockula-testnet-2` has been live since 2026-10-18 at
+- **Testnet-2 first.** (Superseded: testnet-2 was retired in November 2026 without programs,
+  which stay off by default on the chains people launch; its archive still runs in the replay
+  gate.) `blockula-testnet-2` has been live since 2026-10-18 at
   protocol v1, without programs. It runs four validators on Fly `shared-cpu-2x` machines with
   2 GB of RAM each (`deploy/README.md`) and a public node that keeps 14 days of blocks; a daily
   job archives its history from genesis for the replay checks (`scripts/archive-chain.mjs`,

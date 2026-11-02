@@ -1,7 +1,7 @@
 // Keep a chain's history after its nodes prune it: copy every finalized block, with the
-// finalization certificates that prove them, from a node's `/api/sync` to local files. The
-// public testnet node keeps 14 days of blocks and validators about 2, so without a copy a
-// chain's early history is gone for good, and with it any replay of that chain from genesis
+// finalization certificates that prove them, from a node's `/api/sync` to local files.
+// Validators keep about 2 days of blocks (a full node everything, unless it prunes), so without a
+// copy a chain's early history is gone for good, and with it any replay of that chain from genesis
 // (the programs replay gate needs blockula-testnet-2's v1 history; docs/PROGRAMS-PLAN.md, P0).
 //
 // Each run resumes where the last one stopped and returns once it has caught up, so it's safe
@@ -15,16 +15,24 @@
 //
 // It checks shape and continuity (each block's height), not signatures: a node checks those
 // when it replays the blocks. It refuses a node that serves another chain than the one in <out>.
+// `--close` closes the open file once it has caught up, however few heights it holds: for a chain
+// that has stopped for good, whose last file never fills (docs/REPLAY.md "A retired chain").
 //
-//   node scripts/archive-chain.mjs [rpc=https://blockula-testnet.fly.dev] [out=~/.blockula/archive]
+//   node scripts/archive-chain.mjs <rpc> [out=~/.blockula/archive] [--close]
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 
-const rpc = (process.argv[2] || "https://blockula-testnet.fly.dev").replace(/\/+$/, "");
-const root = process.argv[3] || path.join(os.homedir(), ".blockula", "archive");
+const args = process.argv.slice(2).filter((a) => a !== "--close");
+const close = args.length < process.argv.length - 2;
+if (!args[0] || args.length > 2 || args.some((a) => a.startsWith("--"))) {
+  console.error("usage: node scripts/archive-chain.mjs <rpc> [out=~/.blockula/archive] [--close]");
+  process.exit(2);
+}
+const rpc = args[0].replace(/\/+$/, "");
+const root = args[1] || path.join(os.homedir(), ".blockula", "archive");
 const SEGMENT_HEIGHTS = 100_000;
 const LIMIT = 500; // the most blocks `/api/sync` serves at once
 const HEX = /^(?:[0-9a-f]{2})+$/;
@@ -150,3 +158,7 @@ for (;;) {
 }
 if (fd !== null) fs.closeSync(fd);
 log(`${chain_id}: ${next - start} blocks in ${batches} batches; archived through ${next - 1}`);
+if (close && meta.open) {
+  closeOpen(next - 1);
+  log(`${chain_id}: closed the last file; every height through ${next - 1} is in a closed file`);
+}

@@ -13,17 +13,18 @@ Quantum entanglement is literally "spooky action at a distance". We took that pe
 | Addresses | `boo1…` = bech32m(BLAKE3(public key)), or just `yourname.boo` |
 | Privacy (Phase 2) | 👻 **Ghost Mode** shielded transfers + 🪦 **The Crypt** encrypted storage, built on hash-based STARKs + ML-KEM |
 
-## Try it now (no install)
+## Try it now
 
 | | |
 |---|---|
-| 👛 Wallet | **https://testnet.blockula.app**: passkey sign-up, free test FANG, claim a `.boo` name |
-| 🔎 Explorer + API | **https://blockula-testnet.fly.dev**: the public testnet. 4 validators across the US and Europe, ~1s finality |
-| 🤖 Agents | `claude mcp add blockula -- npx -y @blockula/mcp` uses the public testnet automatically |
+| ⛓️ A chain | `blockula dev` ([install](#install-the-node-no-rust-needed)): a local chain with a faucet, ~1s finality |
+| 🔎 Explorer + API | **http://localhost:7070**, served by that node |
+| 👛 Wallet | `npm run dev -w @blockula/web` ([web/](web/README.md)): passkey sign-up, faucet FANG, claim a `.boo` name, against your local node |
+| 🤖 Agents | `claude mcp add blockula -- npx -y @blockula/mcp` uses your local node |
 
-What it is, on one page: [docs/ONE_PAGER.md](docs/ONE_PAGER.md).
+What it is, on one page: [docs/ONE_PAGER.md](docs/ONE_PAGER.md). There's no public chain to try: the public testnet (`blockula-testnet-2`) ran from October to November 2026 and was retired, and its history is archived ([docs/REPLAY.md](docs/REPLAY.md)). To share a chain with others, [launch one](docs/LAUNCH.md).
 
-**It's a testnet.** Testnet FANG, Hunts and Soul have no monetary value. Blockula isn't launching a mainnet or selling a token: it's software for running your own ledger.
+FANG, Hunts and Soul have no monetary value on any chain. Blockula isn't launching a mainnet or selling a token: it's software for running your own ledger.
 
 ## npm packages
 
@@ -37,7 +38,7 @@ claude mcp add blockula -- npx -y @blockula/mcp   # MCP server for coding agents
 | [`@blockula/sdk`](https://www.npmjs.com/package/@blockula/sdk) | `npm install @blockula/sdk` | TypeScript SDK: `Wallet` (ML-DSA-65 signing), `Client` (reads), `.boo` names, session keys, Hunts. Passkey wallets for the browser live at `@blockula/sdk/passkey`. |
 | [`@blockula/mcp`](https://www.npmjs.com/package/@blockula/mcp) | `npx -y @blockula/mcp`, or `npm install -g @blockula/mcp` for a `blockula-mcp` binary | MCP server so any coding agent can hold a wallet, send FANG, claim names and list Hunts. |
 
-Both need Node 20 or newer. The MCP server uses the public testnet unless its configuration names another network (`--network local` for `blockula dev`; see the [MCP README](mcp/README.md)), and it never switches networks on its own. The SDK's `Client` defaults to `http://localhost:7070`, so pass the testnet explicitly: `new Client("https://blockula-testnet.fly.dev")`.
+Both need Node 20 or newer. The MCP server and the SDK's `Client` use a local node (`http://localhost:7070`, `blockula dev`) unless told otherwise: `BLOCKULA_RPC=<a node>` for the MCP, `new Client("https://<a node>")` for the SDK (see the [MCP README](mcp/README.md)). The MCP never switches networks on its own.
 
 ## Install the node (no Rust needed)
 
@@ -52,11 +53,11 @@ Prebuilt for macOS (Apple Silicon and Intel) and Linux (x64 and arm64). The scri
 
 ## Contribute
 
-> Testnet FANG, Hunts and Soul have no monetary value.
+> FANG, Hunts and Soul have no monetary value.
 
-Open **Hunts** are [issues labeled `hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt), each with acceptance criteria and a testnet FANG bounty. Agents are welcome as Familiars. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Contributions are welcome, from people and from agents (as Familiars): see [CONTRIBUTING.md](CONTRIBUTING.md). Hunts and the contribution pool below are chain features: they ran on the public testnet while it lasted, and any chain can run them for its own repos.
 
-Bounties live on-chain: the FANG is escrowed in a Hunt, anyone can add to it, and only its creator awards it for the merged PR (nobody else can move the escrow; governance can only refund the funders). Browse them in the explorer's Hunts page or `GET /api/hunts`.
+**Hunts** are bounties on GitHub issues. They live on-chain: the FANG is escrowed in a Hunt, anyone can add to it, and only its creator awards it for the merged PR (nobody else can move the escrow; governance can only refund the funders). Browse them in the explorer's Hunts page or `GET /api/hunts`.
 
 ```ts
 await wallet.linkGithub("vlad", "<gist id>");  // a public gist by @vlad containing your boo1 address verifies it
@@ -68,12 +69,12 @@ await wallet.awardHunt(huntId, "vlad.boo", 34, familiarKeyId);  // optional: cre
 Awarding from the CLI checks GitHub first: the PR must be merged into the hunt's repo's default branch, and it pays the account the PR's author linked.
 
 ```bash
-blockula hunt award 3 --pr 34 --rpc https://blockula-testnet.fly.dev            # signs with ~/.blockula/wallet.json
+blockula hunt award 3 --pr 34 --rpc https://<node>                              # signs with ~/.blockula/wallet.json
 blockula hunt award 3 --pr 34 --key creator.key --rpc …                         # or the creator's key file
 blockula hunt list | show | create | fund | cancel
 ```
 
-**Beyond Hunts, the contribution pool pays testnet FANG for any merged PR to a pool repo** (Proof of Contribution, [docs/PLAN.md](docs/PLAN.md#-proof-of-contribution-rewarding-useful-work)):
+**Beyond Hunts, a chain's contribution pool pays FANG for any merged PR to a pool repo** (Proof of Contribution, [docs/PLAN.md](docs/PLAN.md#-proof-of-contribution-rewarding-useful-work)):
 - Claim a merged PR you authored. Validators check it on GitHub.
 - A **Séance** judges it: a random jury of people with **Soul** (reputation you can't buy) compares claims in pairs, sealing their votes before revealing them.
 - Payouts rate a person's claims in a Séance together (one win rate over all their comparisons) and count each after the first a quarter of the one before (so in expectation volume adds at most a third), and vest over ~90 days with clawback.
@@ -96,15 +97,15 @@ npm install && npm run build
 npm run dev
 ```
 
-That builds the Rust node, SDK and MCP server, then starts a local chain with a faucet. Open http://localhost:7070 for the explorer. No Rust? Use the public testnet: `new Client("https://blockula-testnet.fly.dev")`.
+That builds the Rust node, SDK and MCP server, then starts a local chain with a faucet. Open http://localhost:7070 for the explorer. No Rust? [Install the node](#install-the-node-no-rust-needed) and run `blockula dev`.
 
-The node binary also includes a CLI wallet: `blockula wallet new`, then `blockula wallet faucet --rpc https://blockula-testnet.fly.dev`, then `blockula wallet send alice.boo 1 --rpc https://blockula-testnet.fly.dev`.
+The node binary also includes a CLI wallet: `blockula wallet new`, then `blockula wallet faucet`, then `blockula wallet send alice.boo 1` (against `http://localhost:7070`; `--rpc` names another node).
 
 ```ts
 import { Client, Wallet } from "@blockula/sdk";
 
-const wallet = Wallet.generate(new Client("https://blockula-testnet.fly.dev"));
-await wallet.faucet();                       // 100 test FANG
+const wallet = Wallet.generate(new Client("http://localhost:7070"));
+await wallet.faucet();                       // 100 FANG
 await wallet.registerName("vlad");           // vlad.boo
 await wallet.send("alice.boo", "1.5", { memo: "trick or treat" });
 ```
@@ -122,7 +123,7 @@ const wallet = await createPasskeyWallet({ username: "vlad" });
 claude mcp add blockula -- npx -y @blockula/mcp
 ```
 
-Then paste the prompt from [AGENTS.md](AGENTS.md). With no local node running, it connects to the public testnet, so there's nothing else to install. MCP tools: `status`, `tx_status`, `create_wallet`, `use_account`, `wallet_info`, `faucet`, `send`, `check_name`, `register_name`, `lookup`, `latest_blocks`, `list_hunts`, `fund_hunt`, `link_github`, `contribution_pool`, `submit_contribution`, `my_contributions`, plus `install_node`, `start_dev_node` and `summon_chain` (the last two need the `blockula` binary).
+Then paste the prompt from [AGENTS.md](AGENTS.md). It uses your local node (`blockula dev`; the MCP's `install_node` and `start_dev_node` set one up), or the node `BLOCKULA_RPC` names. MCP tools: `status`, `tx_status`, `create_wallet`, `use_account`, `wallet_info`, `faucet`, `send`, `check_name`, `register_name`, `lookup`, `latest_blocks`, `list_hunts`, `fund_hunt`, `link_github`, `contribution_pool`, `submit_contribution`, `my_contributions`, plus `install_node`, `start_dev_node` and `summon_chain` (the last two need the `blockula` binary).
 
 ## Run your own chain
 
@@ -156,12 +157,12 @@ blockula join --genesis http://127.0.0.1:<v0 http port> --genesis-hash <hash> --
 
 **On public servers**, build the genesis from a spec, with no admin keys (the validators pass proposals as the bootstrap council):
 1. Each operator writes its public entry offline: `blockula genesis operator --chain-id pubnet --key validator.key --owner <owner account> --p2p-addr 203.0.113.10:30300 --http-addr https://… --out v0.toml` (the addresses peers will dial).
-2. `blockula genesis build --spec spec.toml --out genesis.json` turns a reviewed spec (allocations by bucket with their vesting, the operator files, parameters, reserved names, the contribution pool) into the same `genesis.json` and hash on every machine. `deploy/launch.sh` does both for the public testnet ([deploy/README.md](deploy/README.md)); [`node/testdata/genesis-example/spec.toml`](node/testdata/genesis-example/spec.toml) is a complete example.
+2. `blockula genesis build --spec spec.toml --out genesis.json` turns a reviewed spec (allocations by bucket with their vesting, the operator files, parameters, reserved names, the contribution pool) into the same `genesis.json` and hash on every machine. `deploy/launch.sh` does both for a testnet on Fly.io ([deploy/README.md](deploy/README.md)); [`node/testdata/genesis-example/spec.toml`](node/testdata/genesis-example/spec.toml) is a complete example.
 3. Each server runs `blockula run --home <its home, holding genesis.json and its validator.key> --bind 0.0.0.0` (or `--bind ::`).
    - The node listens on the bind address and advertises its genesis addresses.
    - Public addresses use the `recommended` p2p preset; private ones use `local` (override with `--p2p-preset`).
 
-Full nodes: `blockula join --genesis genesis.json --genesis-hash <hash> --home full --bind 0.0.0.0 --port 7171` (`blockula checkpoint --genesis genesis.json` prints the hash). On a chain older than its weak-subjectivity period (half the evidence window: ~10.5 days on mainnet, 3.5 days on the public testnet), also pass a recent `--checkpoint` ([OPERATIONS.md, Weak subjectivity](docs/OPERATIONS.md#weak-subjectivity)).
+Full nodes: `blockula join --genesis genesis.json --genesis-hash <hash> --home full --bind 0.0.0.0 --port 7171` (`blockula checkpoint --genesis genesis.json` prints the hash). On a chain older than its weak-subjectivity period (half the evidence window: ~10.5 days at the default parameters, 3.5 days on a `deploy/launch.sh` testnet), also pass a recent `--checkpoint` ([OPERATIONS.md, Weak subjectivity](docs/OPERATIONS.md#weak-subjectivity)).
 
 A public network's genesis can be built the same way, by independent operators in a ceremony: [docs/GENESIS_CEREMONY.md](docs/GENESIS_CEREMONY.md).
 
@@ -198,7 +199,7 @@ blockula wallet name vlad --rpc https://<node>
 blockula wallet balance --rpc https://<node>
 ```
 
-Every command that signs (`wallet send|name`, `stake`, `gov`, `multisig`, `name`, `hunt`, `contrib`, `validator`) first checks which chain the node at `--rpc` is on, as the MCP does: `--network testnet` (or the public testnet's URL) and `--network mainnet` pin their chain id and prefix, `--chain-id` and `--genesis-hash` (or `BLOCKULA_NETWORK`, `BLOCKULA_CHAIN_ID`, `BLOCKULA_GENESIS_HASH`) pin any node, and whatever isn't pinned is pinned on first use and remembered in `~/.blockula/known-chains.json` (not for a node on this machine). A node on another chain is refused before anything is signed, and mainnet is never assumed: a node that reports `blockula-1` is refused unless you passed `--network mainnet`. Plain `http://` only works for this machine or a private network. Names you send to are resolved by the node, and the CLI prints the address it got.
+Every command that signs (`wallet send|name`, `stake`, `gov`, `multisig`, `name`, `hunt`, `contrib`, `validator`) first checks which chain the node at `--rpc` is on, as the MCP does: `--network testnet` (`blockula-testnet-2`, which has no public node since it was retired) and `--network mainnet` pin their chain id and prefix, `--chain-id` and `--genesis-hash` (or `BLOCKULA_NETWORK`, `BLOCKULA_CHAIN_ID`, `BLOCKULA_GENESIS_HASH`) pin any node, and whatever isn't pinned is pinned on first use and remembered in `~/.blockula/known-chains.json` (not for a node on this machine). A node on another chain is refused before anything is signed, and mainnet is never assumed: a node that reports `blockula-1` is refused unless you passed `--network mainnet`. Plain `http://` only works for this machine or a private network. Names you send to are resolved by the node, and the CLI prints the address it got.
 
 ## Become a validator
 
@@ -230,7 +231,7 @@ blockula validator unjail boo1… --key ~/val/validator.key --rpc https://<any n
 blockula validator list --rpc https://<any node>
 ```
 
-Chains made with `blockula summon` also have validator admins, who can pin a validator ahead of stake (`blockula validator approve`) or remove one (`blockula validator remove`). The public testnet has none, and neither does a genesis built from a spec (above): there, stake alone decides the set.
+Chains made with `blockula summon` also have validator admins, who can pin a validator ahead of stake (`blockula validator approve`) or remove one (`blockula validator remove`). `blockula-testnet-2` had none, and neither does a genesis built from a spec (above): there, stake alone decides the set.
 
 The p2p transport authenticates peers with ML-DSA-65 and derives its ChaCha20-Poly1305 keys from a
 hybrid X25519 + ML-KEM-768 exchange, so recorded traffic stays private unless both are broken
@@ -244,8 +245,8 @@ node/     Rust node: consensus (Commonware simplex + marshal), chain execution, 
 scripts/  local-testnet.sh: 4 validators + full node smoke test
 sdk-ts/   @blockula/sdk: wallets, tx signing, client, passkey (WebAuthn PRF) helpers
 mcp/      @blockula/mcp: MCP server for coding agents
-web/      Passkey web wallet (Next.js), deployed at testnet.blockula.app
-deploy/   Fly.io testnet: Dockerfile, entrypoint, launch.sh
+web/      Passkey web wallet (Next.js), also the explorer
+deploy/   Launching a testnet on Fly.io: Dockerfile, entrypoint, launch.sh
 docs/     LAUNCH.md (launch your own ledger), ONE_PAGER.md (what this is), PLAN.md (architecture, roadmap),
           PROGRAMS-V0.md (the specification of programs, optional and off by default),
           MAINNET-DESIGN.md, TOKENOMICS.md (the protocol's design, written for the value-bearing mainnet that was planned, then dropped)

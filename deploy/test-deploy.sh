@@ -122,7 +122,7 @@ code=$(entry "$T/x")
 # ---- the machine configurations launch.sh deploys ----
 
 PREFIX=blockula RPC_APP=blockula-testnet N=4 REGIONS=(iad sjc fra ams) RPC_REGION=iad NET=/home/op/net P2P_PORT=30300 HTTP_PORT=7070 RPC_PORT=7171
-VALIDATOR_VM=shared-cpu-2x VALIDATOR_MEMORY=2048mb RPC_VM=shared-cpu-1x RPC_MEMORY=1024mb GENESIS_HASH=$H
+VALIDATOR_VM=shared-cpu-1x VALIDATOR_MEMORY=1024mb RPC_VM=shared-cpu-1x RPC_MEMORY=1024mb GENESIS_HASH=$H
 VALIDATOR_PRUNE_BLOCKS="" RPC_PRUNE_BLOCKS=1209600 RPC_ARCHIVE="" HALT_HEIGHT="" NETWORK_HALTED_AT=""
 # shellcheck source=deploy/fly-config.sh
 source deploy/fly-config.sh
