@@ -6,6 +6,8 @@ export type { Label };
 
 export interface ChainStatus {
   chain_id: string;
+  /** The chain's name (`blockula launch`, `summon --name`), when it has one. */
+  name?: string | null;
   token: string;
   decimals: number;
   height: number;

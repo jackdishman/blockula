@@ -8,7 +8,11 @@ export interface Label {
 
 export interface Status {
   chain_id: string;
+  /** The chain's ticker: FANG unless it was summoned with `--token`. */
   token: string;
+  /** The chain's display name and description (`summon --name`, `--description`), if it has them. */
+  name?: string | null;
+  description?: string | null;
   decimals: number;
   height: number;
   block_time_ms: number;

@@ -288,9 +288,18 @@ impl Block for CBlock {
 /// Height-0 block every node derives from genesis.json.
 pub fn genesis_block(g: &Genesis) -> CBlock {
     let (id, prefix) = (g.chain_id.as_bytes(), g.address_prefix.as_bytes());
-    let seed = Blake3::hash(&[b"BLOCKULA_GENESIS_V2", &(id.len() as u32).to_be_bytes(), id, &(prefix.len() as u32).to_be_bytes(), prefix, &g.created_at_ms.to_be_bytes(), serde_json::to_string(&g.validators).unwrap().as_bytes()]);
+    let (id_len, prefix_len, created, validators) = ((id.len() as u32).to_be_bytes(), (prefix.len() as u32).to_be_bytes(), g.created_at_ms.to_be_bytes(), serde_json::to_string(&g.validators).unwrap());
+    let mut parts: Vec<&[u8]> = vec![b"BLOCKULA_GENESIS_V2", &id_len, id, &prefix_len, prefix, &created, validators.as_bytes()];
+    // A chain's name and ticker (`summon --name`, `--token`), bound when set: a chain made
+    // without them hashes as it always has.
+    let brand = (g.token != crate::chain::DEFAULT_TOKEN || g.brand.is_some()).then(|| serde_json::to_string(&(&g.token, &g.brand)).unwrap());
+    let brand_len = brand.as_ref().map(|b| (b.len() as u32).to_be_bytes());
+    if let (Some(b), Some(len)) = (&brand, &brand_len) {
+        parts.extend([b"BLOCKULA_BRAND_V1".as_slice(), len.as_slice(), b.as_bytes()]);
+    }
+    let genesis_seed = Blake3::hash(&parts);
     let root = g.initial_state().root();
-    CBlock::new(seed, 0, 0, 0, g.created_at_ms, String::new(), 0, hex_32(&root), vec![]).with_versions(GENESIS_PROTOCOL_VERSION, GENESIS_PROTOCOL_VERSION)
+    CBlock::new(genesis_seed, 0, 0, 0, g.created_at_ms, String::new(), 0, hex_32(&root), vec![]).with_versions(GENESIS_PROTOCOL_VERSION, GENESIS_PROTOCOL_VERSION)
 }
 
 pub fn hex_32(s: &str) -> [u8; 32] {

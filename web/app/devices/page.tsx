@@ -17,6 +17,7 @@ import { deviceLink } from "@/lib/paylink";
 import { KIT_LABEL } from "@/lib/recovery";
 import type { KeyView, TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
+import { Unit } from "@/components/Unit";
 
 export default function DevicesPage() {
   return (
@@ -371,7 +372,7 @@ SDK:  await wallet.actAs("${me}");
           <span>{daily ? "Daily limit" : `Limit per ${per}`}</span>
           <div className="suffix-input">
             <input value={limit} onChange={(e) => setLimit(e.target.value)} inputMode="decimal" />
-            <span className="suffix">FANG</span>
+            <span className="suffix"><Unit /></span>
           </div>
         </label>
         <label className="field">

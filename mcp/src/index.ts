@@ -937,11 +937,23 @@ tool(
   },
 );
 
-tool("summon_chain", "Create a brand-new Blockula chain (fresh genesis + validator key) that you can run as your own network.", { chain_id: z.string().regex(/^[a-z0-9-]{3,40}$/), faucet: z.boolean().default(true) }, async ({ chain_id, faucet }) => {
-  const bin = nodeBinary();
-  const out = execFileSync(bin.path, ["summon", chain_id, ...(faucet ? [] : ["--no-faucet"])], { encoding: "utf8" });
-  return `${out.trim()}\n${ranWith(bin)}`;
-});
+tool(
+  "summon_chain",
+  "Create a brand-new Blockula chain (fresh genesis + validator key) that you can run as your own network. `name`, `description` and `token` (its ticker) are what wallets and explorers show; the genesis hash binds them. A person launching one by hand runs `blockula launch`.",
+  {
+    chain_id: z.string().regex(/^[a-z0-9-]{3,40}$/),
+    faucet: z.boolean().default(true),
+    name: z.string().min(1).max(48).optional(),
+    description: z.string().max(280).optional(),
+    token: z.string().regex(/^[A-Z][A-Z0-9]{1,7}$/).optional(),
+  },
+  async ({ chain_id, faucet, name, description, token }) => {
+    const bin = nodeBinary();
+    const brand = [...(name ? ["--name", name] : []), ...(name && description ? ["--description", description] : []), ...(token ? ["--token", token] : [])];
+    const out = execFileSync(bin.path, ["summon", chain_id, ...(faucet ? [] : ["--no-faucet"]), ...brand], { encoding: "utf8" });
+    return `${out.trim()}\n${ranWith(bin)}`;
+  },
+);
 
 /**
  * What the agent can spend for an account now (AGENT-7), from its `/api/account` answer: what it

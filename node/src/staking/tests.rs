@@ -116,6 +116,7 @@ impl Setup {
                 e
             },
             pool_repos: Default::default(),
+            brand: None,
         }
     }
 

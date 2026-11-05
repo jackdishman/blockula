@@ -498,7 +498,7 @@ fn explorer_csp() -> &'static str {
         use commonware_cryptography::Hasher as _;
         let digest = commonware_cryptography::Sha256::hash(&[explorer_script().as_bytes()]);
         format!(
-            "default-src 'none'; script-src 'sha256-{}' 'strict-dynamic'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            "default-src 'none'; script-src 'sha256-{}' 'strict-dynamic'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src data: 'self'; manifest-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
             base64(digest.as_ref())
         )
     })
@@ -523,9 +523,43 @@ async fn haunt_js() -> Response {
     ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=3600"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], HAUNT_JS).into_response()
 }
 
-async fn explorer() -> Response {
+/// The explorer under this chain's name (`webapp::explorer_page`).
+fn explorer(page: Arc<str>) -> Response {
     use axum::http::header;
-    ([(header::CONTENT_SECURITY_POLICY, explorer_csp()), (header::X_CONTENT_TYPE_OPTIONS, "nosniff"), (header::REFERRER_POLICY, "no-referrer")], Html(EXPLORER)).into_response()
+    ([(header::CONTENT_SECURITY_POLICY, explorer_csp()), (header::X_CONTENT_TYPE_OPTIONS, "nosniff"), (header::REFERRER_POLICY, "no-referrer")], Html(page.to_string())).into_response()
+}
+
+/// A home-screen icon, drawn once per size.
+fn icon(size: u32) -> Response {
+    use axum::http::header;
+    static ICONS: std::sync::OnceLock<[Vec<u8>; 3]> = std::sync::OnceLock::new();
+    let icons = ICONS.get_or_init(|| [180, 192, 512].map(crate::webapp::icon_png));
+    let png = match size {
+        180 => &icons[0],
+        192 => &icons[1],
+        _ => &icons[2],
+    };
+    ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "public, max-age=86400"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], png.clone()).into_response()
+}
+
+/// On a chain with its own ticker: amounts in JSON responses read in it (`webapp::relabel_json`).
+async fn relabel_amounts(State(token): State<Arc<str>>, req: Request, next: Next) -> Response {
+    let res = next.run(req).await;
+    let json = res.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with("application/json"));
+    if !json {
+        return res;
+    }
+    let (mut parts, body) = res.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) else {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    };
+    crate::webapp::relabel_json(&mut v, &token);
+    let out = serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec());
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(out))
 }
 
 /// Set on requests a node forwards to another: how many nodes the request has come through (`1`
@@ -622,8 +656,16 @@ pub(crate) fn not_found(what: &str) -> ApiError {
 pub(crate) type ApiResult = Result<Json<Value>, ApiError>;
 
 pub fn router(node: Node) -> Router {
-    Router::new()
-        .route("/", get(explorer))
+    let chain_genesis = node.live.view().genesis.clone();
+    let page: Arc<str> = crate::webapp::explorer_page(EXPLORER, &chain_genesis).into();
+    let manifest = crate::webapp::manifest(&chain_genesis);
+    let token: Arc<str> = chain_genesis.token.as_str().into();
+    let router = Router::new()
+        .route("/", get(move || std::future::ready(explorer(page.clone()))))
+        .route("/manifest.webmanifest", get(move || std::future::ready(([(axum::http::header::CONTENT_TYPE, "application/manifest+json")], Json(manifest.clone())).into_response())))
+        .route("/icon-180.png", get(|| std::future::ready(icon(180))))
+        .route("/icon-192.png", get(|| std::future::ready(icon(192))))
+        .route("/icon-512.png", get(|| std::future::ready(icon(512))))
         .route("/haunt.js", get(haunt_js))
         .route("/api/status", get(status))
         .route("/api/blocks", get(blocks))
@@ -674,7 +716,14 @@ pub fn router(node: Node) -> Router {
         .layer(axum::middleware::from_fn_with_state(node.clone(), limit_reads))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, node.timeout))
         .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(node)
+        .with_state(node);
+    // Amounts in the chain's own ticker: only on a chain that has one, so a FANG chain's
+    // responses stay byte for byte what they were.
+    if crate::webapp::needs_relabel(&chain_genesis) {
+        router.layer(axum::middleware::from_fn_with_state(token, relabel_amounts))
+    } else {
+        router
+    }
 }
 
 pub(crate) fn label(v: &ReadView, addr: &str) -> Value {
@@ -917,6 +966,8 @@ async fn status(State(n): State<Node>) -> ApiResult {
         "chain_id": g.chain_id,
         "token": g.token,
         "decimals": g.decimals,
+        "name": g.brand.as_ref().map(|b| &b.name),
+        "description": g.brand.as_ref().map(|b| &b.description).filter(|d| !d.is_empty()),
         "height": h,
         "block_time_ms": g.block_time_ms,
         "validator": label(&v, &g.validators[0].address),
@@ -2875,6 +2926,43 @@ mod http_tests {
         big_block(&n, size, false);
         let (s, _, b) = get_big(&n, "/api/sync?from=122").await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{b}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A chain made with `blockula launch` (a name and a ticker): the explorer and its app
+    /// manifest carry the name, the home-screen icons are PNGs, and amounts people read are in
+    /// the ticker, while a FANG chain's responses are untouched.
+    #[tokio::test]
+    async fn a_named_chain_is_its_own_app() {
+        let root = std::env::temp_dir().join(format!("blockula-api-brand-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let brand = crate::chain::Brand { name: "Jack <in> the Block".into(), description: "Jack's friends' ledger.".into() };
+        let homes = Chain::summon(&root, &SummonOpts { token: Some("JACK".into()), brand: Some(brand), ..SummonOpts::new("jack-in-the-block", 1) }).unwrap();
+        let n = Node::new(Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap())), None, vec![], ClientIpPolicy::default());
+        let (s, _, html) = call(&n, "GET", "/", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(html.contains("<title>Jack &lt;in&gt; the Block Explorer</title>") && html.contains(r#"<meta name="apple-mobile-web-app-title" content="Jack &lt;in&gt; the Block" />"#), "the name, escaped");
+        assert!(html.contains(r#"<link rel="manifest" href="/manifest.webmanifest" />"#) && html.contains(r#"href="/icon-180.png""#));
+        assert_eq!(EXPLORER.matches("<script").count(), 1, "the head adds no script");
+        let (s, m, _) = call(&n, "GET", "/manifest.webmanifest", None, "127.0.0.1:1").await;
+        assert_eq!((s, m["name"].as_str(), m["short_name"].as_str(), m["display"].as_str()), (StatusCode::OK, Some("Jack <in> the Block"), Some("JACK"), Some("standalone")));
+        let app = router(n.clone()).layer(MockConnectInfo("127.0.0.1:1".parse::<SocketAddr>().unwrap()));
+        let res = app.oneshot(Request::builder().uri("/icon-180.png").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.headers()[axum::http::header::CONTENT_TYPE], "image/png");
+        assert!(axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap().starts_with(b"\x89PNG"));
+        // The CSP lets the browser read the manifest.
+        assert!(explorer_csp().contains("manifest-src 'self'"));
+        let (_, st, _) = call(&n, "GET", "/api/status", None, "127.0.0.1:1").await;
+        assert_eq!((st["name"].as_str(), st["description"].as_str(), st["token"].as_str()), (Some("Jack <in> the Block"), Some("Jack's friends' ledger."), Some("JACK")));
+        assert!(st["supply_display"].as_str().unwrap().ends_with(" JACK"), "{st}");
+        let (_, v, _) = call(&n, "GET", "/api/validators", None, "127.0.0.1:1").await;
+        assert!(v.to_string().contains(" JACK\"") && !v.to_string().contains(" FANG\""), "{v}");
+        std::fs::remove_dir_all(root).ok();
+        // A FANG chain: no name, FANG amounts.
+        let (root, n) = node("plain");
+        let (_, st, _) = call(&n, "GET", "/api/status", None, "127.0.0.1:1").await;
+        assert!(st["name"].is_null() && st["supply_display"].as_str().unwrap().ends_with(" FANG"));
+        let (_, _, html) = call(&n, "GET", "/", None, "127.0.0.1:1").await;
+        assert!(html.contains("<title>plain Explorer</title>"));
         std::fs::remove_dir_all(root).ok();
     }
 

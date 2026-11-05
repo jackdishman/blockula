@@ -216,7 +216,9 @@ const stat = (v, k) => `<div class="stat"><div class="v">${v}</div><div class="k
 const card = (inner, cls = "") => `<section class="card ${cls}">${inner}</section>`;
 const plural = (n, one, many = one + "s") => `${n} ${n == 1 ? one : many}`;
 // Drops ("1500000000") → "1.5 FANG", for fields the node sends without a *_display twin.
-const fmtDrops = (d) => { if (!/^\d+$/.test(String(d ?? ""))) return "—"; const b = BigInt(d); const f = (b % 1000000000n).toString().padStart(9, "0").replace(/0+$/, ""); return `${b / 1000000000n}${f ? "." + f : ""} FANG`; };
+// The chain's ticker (`blockula summon --token`; FANG unless it has one), from /api/status.
+let UNIT = "FANG";
+const fmtDrops = (d) => { if (!/^\d+$/.test(String(d ?? ""))) return "—"; const b = BigInt(d); const f = (b % 1000000000n).toString().padStart(9, "0").replace(/0+$/, ""); return `${b / 1000000000n}${f ? "." + f : ""} ${UNIT}`; };
 /** `o.k_display`, else `o.k` as drops; null when the node doesn't send it. Fields are read tolerantly: modules may add them later. */
 const amount = (o, ...keys) => { for (const k of keys) { if (o && o[k + "_display"] != null) return String(o[k + "_display"]); if (o && /^\d+$/.test(String(o[k] ?? ""))) return fmtDrops(o[k]); } return null; };
 const pick = (o, ...keys) => { for (const k of keys) if (o && o[k] != null) return o[k]; return undefined; };
@@ -264,7 +266,7 @@ const views = {
         ${s.history_from > 1 ? `<div class="dim">This node fast-synced from a certified snapshot at #${s.fast_synced_from}; history before #${s.history_from} isn't available here.</div>` : ""}
       </section>
       ${card(`<span class="eyebrow">New here?</span>
-        <p class="lede">This is <b>${esc(s.chain_id)}</b>, a blockchain secured by ${term("signature", "post-quantum signatures")}. Every second a new ${term("block")} is sealed. Click anything to dig in, or <a href="#/learn">read the two-minute guide</a>.</p>`, "learn")}
+        <p class="lede">This is <b>${esc(s.name || s.chain_id)}</b>, a blockchain secured by ${term("signature", "post-quantum signatures")}. ${Number(s.block_time_ms) > 1000 ? `Every ${span(1, s.block_time_ms)} a new ${term("block")} is sealed.` : `Every second a new ${term("block")} is sealed.`} Click anything to dig in, or <a href="#/learn">read the two-minute guide</a>.</p>`, "learn")}
       ${card(`<h2>Latest blocks</h2><div class="rows">
         ${blocks.map((b) => `<div class="row blockrow"><a class="height" href="#/block/${b.height}">#${b.height}</a><span class="dim">${b.tx_count ? `<a href="#/block/${b.height}">${plural(b.tx_count, "transaction")}</a>` : "no transactions"}<span class="proposer"> · proposed by ${who(b.proposer)}</span></span><span class="dim">${ago(b.timestamp_ms)}</span></div>`).join("")}
       </div>`)}
@@ -806,12 +808,19 @@ $("#search").addEventListener("submit", async (e) => {
 });
 window.addEventListener("hashchange", route);
 route();
-// The footer: a public testnet or a dev chain keeps the page's own text (test FANG has no value).
-// Any other chain is one someone launched, and its FANG has no value either.
+// The chain's own name and ticker (`blockula launch`), in the header and the footer. A public
+// testnet or a dev chain keeps the page's own footer (test FANG has no value); any other chain is
+// one someone launched, and its unit has no value either.
 api("/status").then((s) => {
+  if (/^[A-Z][A-Z0-9]{1,7}$/.test(s.token || "")) UNIT = s.token;
+  if (s.name) {
+    $(".wordmark").textContent = s.name;
+    $(".brand").title = `${s.name} (${s.chain_id}), on Blockula`;
+    document.title = `${s.name} Explorer`;
+  }
   if (/^blockula-(testnet|dev)/.test(s.chain_id)) return;
   $("#imprint").textContent = "Post-quantum signatures · ML-DSA-65 · Not audited";
-  $("#notice").textContent = "This chain's FANG has no value";
+  $("#notice").textContent = `This chain's ${UNIT} has no value`;
 }).catch(() => {});
 setInterval(() => { if (!location.hash || location.hash === "#/") route(); }, 3000);
 </script>

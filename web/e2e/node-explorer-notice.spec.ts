@@ -14,9 +14,12 @@ const BURNED = "Fees destroyed forever. The base fee prices block space so spam 
 const HUNT_TIP = "A bounty on a GitHub issue. Its FANG sits in escrow until the creator awards it. The chain doesn't check the pull request: the creator decides who's paid. Once it expires the creator can cancel it, refunding every funder exactly; before that only a governance refund can.";
 const CREATOR = { address: "boo1creatorqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq", name: "maker.boo", short: "boo1creato…qqqq" };
 
+/** What a chain made with `blockula launch --name … --token …` adds to its status. */
+let brand: { name?: string; token?: string } = {};
+
 /** A node's answers. `repos`: the contribution pool's repositories (none: it pays nothing). */
 function api(p: string, chainId: string, repos: { repo: string; weight: number }[]): unknown {
-  if (p === "/status") return { chain_id: chainId, height: 1000, block_time_ms: 1000, epoch: 3, active_validators: 4, mempool: 0, supply_display: "1000000000 FANG", burned_display: "12 FANG", accounts: 5, names: 1, head_age_ms: 500, history_from: 1 };
+  if (p === "/status") return { ...brand, chain_id: chainId, height: 1000, block_time_ms: 1000, epoch: 3, active_validators: 4, mempool: 0, supply_display: "1000000000 FANG", burned_display: "12 FANG", accounts: 5, names: 1, head_age_ms: 500, history_from: 1 };
   if (p.startsWith("/blocks")) return [];
   if (p.startsWith("/hunts")) return { count: 0, hunts: [], open_bounties_display: "0 FANG" };
   if (p === "/hunt/7") return { id: 7, amount_display: "100 FANG", repo: "jackdishman/blockula", issue: 12, issue_url: "https://github.com/jackdishman/blockula/issues/12", title: "Fix the thing", status: "open", creator: CREATOR, created_at: 900, expires_at: 5000, funders: [{ account: CREATOR, amount_display: "100 FANG" }] };
@@ -47,6 +50,19 @@ test("a chain someone launched says it isn't audited and its FANG has no value",
   await expect(page.locator("#notice")).toHaveText("This chain's FANG has no value");
   await expect(page.locator("footer")).not.toContainText("test chains only");
   await expect(page.locator("footer").getByRole("link")).toHaveCount(0);
+});
+
+test("a chain launched with a name and a ticker shows them", async ({ page }) => {
+  brand = { name: "Jack in the Block", token: "JACK" };
+  try {
+    await open(page, "jack-in-the-block");
+    await expect(page.locator(".wordmark")).toHaveText("Jack in the Block");
+    await expect(page).toHaveTitle("Jack in the Block Explorer");
+    await expect(page.locator("#notice")).toHaveText("This chain's JACK has no value");
+    await expect(page.locator("#app")).toContainText("This is Jack in the Block");
+  } finally {
+    brand = {};
+  }
 });
 
 for (const chain of ["blockula-testnet-2", "blockula-dev"]) {

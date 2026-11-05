@@ -16,6 +16,7 @@ import { type NodeError, useNode } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
 import type { AccountDetail, BlockView, ChainStatus, HuntView, TxDetail } from "@/lib/explorer/types";
 import { useWallet } from "@/lib/wallet";
+import { Unit } from "@/components/Unit";
 
 export default function TxPage() {
   const { id } = useParams<{ id: string }>();
@@ -174,7 +175,7 @@ export default function TxPage() {
         {!dropped && (t.amount || awarded != null) && (
           <div className="amount-hero" data-testid="amount-hero">
             <Amount drops={heroSign === 0n ? heroAmount : heroAmount * heroSign} signed={heroSign !== 0n} unit={false} />
-            <span className="unit">FANG</span>
+            <span className="unit"><Unit /></span>
             {heroNote && <span className="dim small block">{heroNote}</span>}
           </div>
         )}

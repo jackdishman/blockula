@@ -4,6 +4,8 @@
 
 > Add Blockula to this project. Install the MCP server with `claude mcp add blockula -- npx -y @blockula/mcp` (it uses a local `blockula dev` chain at http://localhost:7070: `install_node` and `start_dev_node` set one up; `BLOCKULA_RPC=<a node>` for a chain you launched), then call `create_wallet` and `faucet`. Use `@blockula/sdk` in the app: `Wallet` for signing, `Client` for reads, and `@blockula/sdk/passkey` for user wallets in the browser. Show balances and recipients by `.boo` name, never raw addresses.
 
+**To make a chain of your own:** `blockula launch --name "<name>" --token <TICKER> --reach local --yes` makes and starts one (the MCP's `summon_chain` makes one too, with `name` and `token`). A person runs plain `blockula launch` and answers its questions ([docs/LAUNCH.md](docs/LAUNCH.md)).
+
 ## Rules of the road
 
 - **Amounts are strings in FANG** (`"1.5"`), or bigint drops. Never JS floats.
@@ -80,7 +82,7 @@ Rules for programs:
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/status` | chain id, height, supply, burned, version, git sha, genesis hash, epoch, sync state (`syncing`, `sync_progress`, verified `finalized_height`, display-only `network_height_claimed`), `history_from` (first block this node holds), `pruning` (`{keep_blocks}` on a pruning node, `null` on an archive node), sync trust (`checkpoint_height`: newest trusted checkpoint; `weak_subjectivity_blocks`) |
+| GET | `/api/status` | chain id, its `name`, `description` and ticker (`token`; `summon --name`, `--description`, `--token`, bound by the genesis hash; `name` is `null` on a chain made without one), height, supply, burned, version, git sha, genesis hash, epoch, sync state (`syncing`, `sync_progress`, verified `finalized_height`, display-only `network_height_claimed`), `history_from` (first block this node holds), `pruning` (`{keep_blocks}` on a pruning node, `null` on an archive node), sync trust (`checkpoint_height`: newest trusted checkpoint; `weak_subjectivity_blocks`) |
 | GET | `/api/blocks?limit=&before=` | recent blocks (from `history_from` on) |
 | GET | `/api/block/{height\|hash}` | block + txs, the protocol `version` and `signal`, and once executed the `base_fee` it charged (`flat`, `rate`, `max_block_bytes`); `410` `pruned` for a height this node no longer holds |
 | GET | `/api/tx/{id}` | tx with `summary`, `status` (`pending`/`finalized`/`failed` + `error`; a failure without its tx says `dropped`: true, dropped unrun and nothing charged, or false, it ran and was charged); once executed, `fee` is what it was charged (the block's base fee for `size_bytes`, plus `tip`) out of its `max_fee`, and `to` is the account its action paid when it ran (`to_name`: the `.boo` name it was signed to) |

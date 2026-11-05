@@ -7,7 +7,7 @@ test("a first visit to / gets the landing page, and its button opens the wallet'
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Launch your own quantum-safe ledger" })).toBeVisible();
   await expect(page.locator(".landing-cmd code").first()).toHaveText("curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh");
-  await expect(page.locator(".landing-cmd code").nth(1)).toHaveText("blockula summon mychain --host <your address>");
+  await expect(page.locator(".landing-cmd code").nth(1)).toHaveText("blockula launch");
   await expect(page.getByRole("link", { name: "Read the launch guide" })).toHaveAttribute("href", "https://github.com/jackdishman/blockula/blob/main/docs/LAUNCH.md");
   // What FANG is, said as the wallet says it, and no mainnet.
   await expect(page.locator("main")).toContainText("has no value by design");

@@ -827,6 +827,7 @@ mod tests {
             upgrades: vec![],
             bootstrap_excluded: vec![],
             pool_repos: Default::default(),
+            brand: None,
         };
         let home = std::env::temp_dir().join(format!("blockula-econ-{tag}-{}-{}", now_ms(), std::process::id()));
         std::fs::create_dir_all(&home).unwrap();

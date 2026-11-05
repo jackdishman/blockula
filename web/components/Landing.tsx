@@ -4,18 +4,18 @@ import { Copy } from "@/components/ui";
 
 const REPO = "https://github.com/jackdishman/blockula";
 const INSTALL = `curl -fsSL ${REPO}/releases/latest/download/install.sh | sh`;
-const SUMMON = "blockula summon mychain --host <your address>";
+const LAUNCH = "blockula launch";
 
 const STEPS: { title: string; body: string }[] = [
-  { title: "Start the chain", body: "`blockula summon` makes the chain on your machine and prints its genesis hash and the command your friends join with." },
-  { title: "Friends join", body: "They install the same binary and run `blockula join`. Tailscale is the easy way to reach each other; a port forward works too." },
-  { title: "Friends become validators", body: "A bond from the chain's faucet and one command each. They start taking turns at the next epoch, within 10 minutes." },
+  { title: "Launch it", body: "`blockula launch` asks four questions (a name and ticker, who can reach it, how it runs, the apps), makes the chain on your machine and starts it." },
+  { title: "Friends join", body: "It prints the one command they run. Tailscale is the easy way to reach each other; a home network or a port forward works too." },
+  { title: "Friends become validators", body: "A bond from the chain's faucet and one command each, then you approve them. They start taking turns within 10 minutes." },
 ];
 
 const PARTS: { title: string; body: string }[] = [
   { title: "Post-quantum throughout", body: "ML-DSA-65 signatures (NIST FIPS 204) on every transaction and vote; validators key their channels with ML-KEM-768." },
   { title: "Runs at home", body: "A block every 5 seconds by default, sized for home connections. No hosting to pay for." },
-  { title: "Names, not addresses", body: "Pay `alice.boo`. Every node serves an explorer that explains each transaction in plain English." },
+  { title: "Its own apps", body: "Every node serves an explorer under your chain's name, in its ticker, that installs on a Mac's Dock or an iPhone's Home Screen. Pay `alice.boo`, not addresses." },
   { title: "Wallets on passkeys", body: "Face ID or a password manager unlocks a wallet: no seed phrase. The passkey only unlocks the key and never signs on-chain. Agents get budgets the chain enforces." },
   { title: "Staking and governance", body: "Delegation, slashing, on-chain proposals and votes, as your chain's validators and holders decide." },
   { title: "Programs (experimental)", body: "WebAssembly programs, off by default: `summon --programs` turns them on. Not audited yet." },
@@ -43,13 +43,13 @@ export function Landing() {
         <Apparition kind="moon" />
         <span className="eyebrow">Blockula 1.0</span>
         <h1>Launch your own quantum-safe ledger</h1>
-        <p className="lead">One command starts a chain, and your friends&apos; computers join it. Post-quantum signatures throughout, on machines you already have.</p>
+        <p className="lead">One command names a chain, gives it a ticker and starts it, and your friends&apos; computers join it. Post-quantum signatures throughout, on machines you already have.</p>
       </div>
       <section className="card stack">
         <h2>Two commands</h2>
         <Command text={INSTALL} />
-        <Command text={SUMMON} />
-        <p className="dim small">macOS and Linux. The launch guide covers reaching each other (Tailscale, a home network or the open internet), adding validators and keeping it running.</p>
+        <Command text={LAUNCH} />
+        <p className="dim small">macOS and Linux. It asks what your chain is called, who can reach it and how it runs, then starts it. The launch guide covers Tailscale, home networks and the open internet, adding validators and keeping it running.</p>
         <div className="row-gap">
           <a className="btn primary" href={`${REPO}/blob/main/docs/LAUNCH.md`}>Read the launch guide</a>
           <a className="btn" href={REPO}>Source on GitHub</a>
@@ -77,13 +77,13 @@ export function Landing() {
         </div>
       </section>
       <section className="card stack center">
-        <h2>Try it first</h2>
-        <p className="dim"><code>blockula dev</code> starts a one-node chain with a faucet on your machine. This wallet talks to it: make a wallet with a passkey, get FANG from the faucet and claim a <code>.boo</code> name.</p>
+        <h2>Your wallet</h2>
+        <p className="dim">This wallet talks to the chain on your machine: the one <code>blockula launch</code> started, or <code>blockula dev</code>&apos;s throwaway one. Make a wallet with a passkey, get coins from the faucet and claim a <code>.boo</code> name.</p>
         <Link className="btn primary big" href="/welcome">Open the wallet</Link>
         <Link className="link small" href="/explore">Or explore your chain</Link>
       </section>
       <p className="dim small center">
-        Each chain&apos;s unit, FANG, has no value by design: its faucet hands it out and it only prices spam. Nobody sells it, buys it or gets paid in it. Blockula isn&apos;t externally audited.
+        Each chain&apos;s unit (FANG, or the ticker you give it) has no value by design: its faucet hands it out and it only prices spam. Nobody sells it, buys it or gets paid in it. Blockula isn&apos;t externally audited.
       </p>
     </main>
   );

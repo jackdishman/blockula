@@ -1,6 +1,6 @@
 import { formatFang } from "@blockula/sdk";
 
-/** "123.456789 FANG" → "123.4568" with a separate unit, for big displays. */
+/** "123.456789 FANG" → "123.4568" with a separate unit (`<Unit />`), for big displays. */
 export function fangParts(drops: string | bigint) {
   const s = formatFang(BigInt(drops)).replace(/ FANG$/, "");
   const [w, f] = s.split(".");
@@ -30,6 +30,14 @@ export function blocksToHuman(blocks: number, blockTimeMs = 1000) {
 
 const DROPS = 1_000_000_000n;
 
+// The connected chain's ticker (`/api/status` `token`), set by the wallet provider. FANG until
+// then, and on every chain summoned without `--token`.
+let unit = "FANG";
+export const chainUnit = () => unit;
+export function setChainUnit(token: string | undefined | null) {
+  unit = token && /^[A-Z][A-Z0-9]{1,7}$/.test(token) ? token : "FANG";
+}
+
 /**
  * FANG for reading, from drops: thousands grouped ("40,000,010.4957 FANG"). Summaries show at most
  * 4 decimals, with "≈ " in front when that rounded anything away; `exact` (reviews, what gets
@@ -50,7 +58,7 @@ export function displayFang(drops: string | bigint, opts: { exact?: boolean; uni
   const whole = (d / DROPS).toLocaleString("en-US");
   const frac = (d % DROPS).toString().padStart(9, "0").replace(/0+$/, "");
   const n = `${neg && d > 0n ? "−" : ""}${whole}${frac ? `.${frac}` : ""}`;
-  return `${approx ? "≈ " : ""}${n}${opts.unit === false ? "" : " FANG"}`;
+  return `${approx ? "≈ " : ""}${n}${opts.unit === false ? "" : ` ${unit}`}`;
 }
 
 /** A FANG amount as the amount field takes it: plain digits, no grouping or unit ("49.99993508"). */

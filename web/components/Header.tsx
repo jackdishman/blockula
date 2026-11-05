@@ -13,10 +13,12 @@ export function NetworkBadge() {
   const { client, status, chain } = useWallet();
   const kind = NETWORK.key === "custom" ? "custom" : NETWORK.mainnet ? "main" : "test";
   const chainId = chain.state === "mismatch" ? "wrong chain" : (status?.chain_id ?? client.pin.chainId ?? "…");
+  // A chain summoned with --name shows it (the genesis hash binds it); its id is in the tooltip.
+  const label = chain.state !== "mismatch" && status?.name ? status.name : chainId;
   return (
-    <span className={`net-badge ${kind}`} data-testid="network-badge" title={`Connected to ${RPC}`}>
+    <span className={`net-badge ${kind}`} data-testid="network-badge" title={`Connected to ${RPC} (${chainId})`}>
       <span className="net-name">{NETWORK.label}</span>
-      <span className="net-chain">{chainId}</span>
+      <span className="net-chain">{label}</span>
     </span>
   );
 }

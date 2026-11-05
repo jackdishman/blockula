@@ -16,6 +16,7 @@ mod ghost;
 mod github;
 mod gov_cli;
 mod governance;
+mod launch_cli;
 mod snapshot;
 mod staking;
 mod state;
@@ -34,6 +35,7 @@ mod types;
 mod upgrade;
 mod validator_cli;
 mod view;
+mod webapp;
 
 #[cfg(test)]
 mod sim;
@@ -138,6 +140,12 @@ struct Net {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Launch your own chain: name it, choose who can reach it and how it runs, and start it. It
+    /// asks a step at a time, or takes every answer as a flag with --yes
+    Launch {
+        #[command(flatten)]
+        args: launch_cli::LaunchArgs,
+    },
     /// Start a local single-validator dev chain with a faucet and the built-in explorer
     Dev {
         #[arg(long, default_value = "7070")]
@@ -208,6 +216,17 @@ enum Cmd {
         /// after an update
         #[arg(long)]
         programs: bool,
+        /// The chain's name, as wallets and explorers show it ("Jack in the Block"). Up to 48
+        /// bytes. The genesis hash binds it
+        #[arg(long)]
+        name: Option<String>,
+        /// A sentence about the chain, shown under its name. Up to 280 bytes; needs --name
+        #[arg(long, requires = "name")]
+        description: Option<String>,
+        /// The chain's ticker: 2–8 characters, A–Z and 0–9 (default FANG). Wallets and explorers
+        /// show amounts in it; the protocol still counts in drops (a billion to one)
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Run a validator (a home with validator.key) or a joined full node
     Run {
@@ -389,6 +408,17 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     match Cli::parse().cmd {
+        Cmd::Launch { args } => {
+            let launched = launch_cli::launch(&args)?;
+            if args.no_start {
+                return Ok(());
+            }
+            println!("\n▶  Starting it. Ctrl-C stops it; the command above starts it again.\n");
+            // The defaults of `blockula run`, listening where the others reach it.
+            let mut net = <Net as clap::FromArgMatches>::from_arg_matches(&Net::augment_args(clap::Command::new("launch")).get_matches_from(["launch"]))?;
+            net.bind = launched.plan.bind().into();
+            node::run_validator(launched.home, net_opts(net, None, None, false))
+        }
         Cmd::Dev { port, reset, programs, net } => {
             let home = blockula_dir().join("dev");
             let stale = home.join("genesis.json").exists() && (chain::Genesis::load(&home.join("genesis.json")).is_err() || node::dev_is_stale(&home));
@@ -419,7 +449,7 @@ fn main() -> Result<()> {
             opts.http.program_views = true;
             node::run_validator(home, opts)
         }
-        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, host, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks, address_prefix, dev_durations, programs } => {
+        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, host, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks, address_prefix, dev_durations, programs, name, description, token } => {
             let home = home.unwrap_or_else(|| blockula_dir().join(&chain_id));
             if home.join("genesis.json").exists() {
                 anyhow::bail!("{} already has a chain", home.display());
@@ -444,10 +474,15 @@ fn main() -> Result<()> {
                 host: host.clone(),
                 upgrades: vec![],
                 features: vec![],
+                token,
+                brand: name.map(|name| chain::Brand { name, description: description.unwrap_or_default() }),
             };
             let opts = if programs { opts.with_programs() } else { opts };
             let homes = Chain::summon(&home, &opts)?;
             let g = chain::Genesis::load(&homes[0].join("genesis.json"))?;
+            if let Some(b) = &g.brand {
+                println!("🦇 {} ({})", b.name, g.token);
+            }
             println!("🪦 Summoned chain `{chain_id}` with {validators} validator{} at {}", if validators == 1 { "" } else { "s" }, home.display());
             // Published at another host, a validator listens on every interface (`::` for an IPv6 one).
             let bind = match &host {
@@ -459,7 +494,7 @@ fn main() -> Result<()> {
                 println!("   blockula run --home {}{bind}    # http://{}  p2p {}", h.display(), v.http_addr, v.p2p_addr);
             }
             println!("   genesis hash: {}  (joiners can pin it with --genesis-hash)", hex::encode(consensus::genesis_block(&g).digest_bytes()));
-            println!("   a block every {} · epochs: {} blocks (about {} min) · min self-bond: {} · validator admins: {}", fmt_block_time(block_time_ms), g.epoch_blocks, g.epoch_blocks.saturating_mul(block_time_ms).div_ceil(60_000), types::fmt_fang(g.chain_params()?.min_self_bond), g.validator_admins.join(", "));
+            println!("   a block every {} · epochs: {} blocks (about {} min) · min self-bond: {} · validator admins: {}", fmt_block_time(block_time_ms), g.epoch_blocks, g.epoch_blocks.saturating_mul(block_time_ms).div_ceil(60_000), types::fmt_fang(g.chain_params()?.min_self_bond).replace(" FANG", &format!(" {}", g.token)), g.validator_admins.join(", "));
             if programs {
                 println!("   programs are on from block 1 (protocol v2): `blockula program` uploads, creates, calls and views them. Full nodes serve program views; a validator serves them only with --program-views. Programs are experimental and not yet audited: a chain made with them now may need to be recreated after an update");
             }

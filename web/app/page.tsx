@@ -15,6 +15,7 @@ import { explorer } from "@/lib/config";
 import { fangParts, shortAddr } from "@/lib/format";
 import type { TxView } from "@/lib/types";
 import { useUnlocked, useWallet } from "@/lib/wallet";
+import { Unit } from "@/components/Unit";
 
 /**
  * Ids of payments into `me` that showed up since the last poll (none on first load), held for a
@@ -72,7 +73,7 @@ function Home() {
         <div className="balance" aria-label={`${account.balance_display}`}>
           {whole}
           {frac && <span className="frac">.{frac}</span>}
-          <span className="unit">FANG</span>
+          <span className="unit"><Unit /></span>
         </div>
         <BalanceBreakdown account={account} />
         <div className="actions">

@@ -5,6 +5,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { ChainMismatchError, networkClient, type PinnedClient } from "./chain";
 import { ensureRpcCookie } from "./config";
 import { friendly } from "./errors";
+import { setChainUnit } from "./format";
 import { clearHint, loadHint, saveHint, tutorialScope, type Hint } from "./session";
 import type { AccountView, Status } from "./types";
 
@@ -66,6 +67,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       return null;
     });
     if (!st) return;
+    setChainUnit(st.token);
     setStatus(st);
     setChain((c) => (c.state === "ok" ? c : { state: "ok" }));
     const w = walletRef.current;

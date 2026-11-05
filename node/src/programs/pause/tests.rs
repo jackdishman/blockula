@@ -80,6 +80,7 @@ fn chain_with(n: usize, epoch_blocks: u64) -> State {
         upgrades: vec![ScheduledUpgrade { version: PROGRAMS_VERSION, activation_height: 1 }],
         bootstrap_excluded: vec![],
         pool_repos: Default::default(),
+        brand: None,
     };
     g.check().unwrap();
     let st = g.initial_state();

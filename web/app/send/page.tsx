@@ -21,6 +21,7 @@ import { PAYMENTS_FINAL } from "@/lib/money-copy";
 import { checkLinkChain, linkChain } from "@/lib/paylink";
 import type { AccountView, TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
+import { Unit } from "@/components/Unit";
 
 export default function SendPage() {
   return (
@@ -364,7 +365,7 @@ function Send() {
           <span>Amount</span>
           <div className="suffix-input">
             <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.0" inputMode="decimal" />
-            <span className="suffix">FANG</span>
+            <span className="suffix"><Unit /></span>
           </div>
         </label>
         <div className="name-status money-amount-row">

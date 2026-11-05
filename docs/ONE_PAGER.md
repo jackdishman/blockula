@@ -1,6 +1,6 @@
 # 🧛 Blockula: launch your own quantum-safe ledger
 
-**What it is.** Blockula is a kit for running your own ledger: one command starts a chain, and your friends' computers join it, with no hosting to pay for and nothing to buy ([docs/LAUNCH.md](LAUNCH.md)). Its signatures are built so that the coming generation of quantum computers can't forge them. It also aims to be the easiest chain to use, for people and AI agents alike. You sign in with a passkey (Face ID or Touch ID) instead of a seed phrase, pay `alice.boo` instead of `0x7f3a…`, and an agent can start using it from a single copy-paste prompt.
+**What it is.** Blockula is a kit for running your own ledger: `blockula launch` names a chain, gives it a ticker and starts it, and your friends' computers join it, with no hosting to pay for and nothing to buy ([docs/LAUNCH.md](LAUNCH.md)). Its signatures are built so that the coming generation of quantum computers can't forge them. It also aims to be the easiest chain to use, for people and AI agents alike. You sign in with a passkey (Face ID or Touch ID) instead of a seed phrase, pay `alice.boo` instead of `0x7f3a…`, and an agent can start using it from a single copy-paste prompt.
 
 ## Why now
 - **Quantum computers threaten today's chains.** Bitcoin and Ethereum sign with elliptic curves (ECDSA, BLS). A large enough quantum computer breaks those with Shor's algorithm. Attackers can record transactions today and forge them later.
@@ -25,8 +25,9 @@
 - **`@blockula/sdk`** (TypeScript) and **`@blockula/mcp`** (for Claude Code or any MCP agent): `claude mcp add blockula -- npx -y @blockula/mcp` works against a local `blockula dev` chain, or any node you name.
 - **A public testnet ran** from October to November 2026 (`blockula-testnet-2`: 4 validators across the US and Europe, then a fifth run by an outside operator). It was retired once Blockula became a kit for running your own ledger; its history is archived, and CI replays it nightly.
 - **Run your own:**
-  - `blockula dev` gives you a local chain in one command.
-  - `blockula summon mychain --host <your address>` creates your own network, and friends' machines reach it (a Tailscale address works).
+  - `blockula launch` asks four questions (a name and ticker, who can reach it, how it runs, the apps) and starts your chain; friends' machines reach it over Tailscale, a home network or the internet.
+  - Every node's explorer carries the chain's name and ticker and installs as an app on a Mac's Dock or an iPhone's Home Screen.
+  - `blockula dev` gives you a throwaway local chain in one command.
   - `blockula join` syncs a full node, with the explorer browsable while it syncs.
   - `blockula validator register` registers a validator with a bond, and the chain's admin approves it.
   - The whole flow, step by step: [docs/LAUNCH.md](LAUNCH.md).
@@ -40,8 +41,8 @@
    - Jury-run sybil flags, replacing the governance vote that flags a sybil today.
    - Covens (teams) and Seasons, plus a juror UI in the web wallet.
 2. **👻 Ghost Mode and 🪦 The Crypt (Phase 2):** private transfers and encrypted storage, built on hash-based STARKs and ML-KEM, so the privacy layer is quantum-safe too. Viewing keys allow selective disclosure.
-3. **Lighter launches:** blocks only when there are transactions, a guided launch on the web, and an optional mode without a unit at all. **Programs** (small WebAssembly programs that run on the chain) are built into the node and switched off, as an option for later. There's no mainnet: Blockula is software for running your own ledger.
+3. **Lighter launches:** blocks only when there are transactions, the wallet bundled into the node, and an optional mode without a unit at all. **Programs** (small WebAssembly programs that run on the chain) are built into the node and switched off, as an option for later. There's no mainnet: Blockula is software for running your own ledger.
 
-**Unit:** FANG (1 FANG = 10⁹ drops), each chain's own. It pays fees (the base fee is burned), bonds and names, and a chain's faucet hands it out. It has no value: nobody sells it, buys it or gets paid in it.
+**Unit:** FANG, or the ticker you give your chain (10⁹ drops each), each chain's own. It pays fees (the base fee is burned), bonds and names, and a chain's faucet hands it out. It has no value: nobody sells it, buys it or gets paid in it.
 
 **Status:** software, unaudited by a third party, no value anywhere. Built in the open: start with `AGENTS.md` and `docs/PLAN.md`.

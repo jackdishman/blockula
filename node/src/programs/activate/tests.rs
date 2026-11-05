@@ -60,6 +60,7 @@ fn genesis(upgrades: Vec<ScheduledUpgrade>, features: Vec<String>) -> Genesis {
         upgrades,
         bootstrap_excluded: vec![],
         pool_repos: Default::default(),
+        brand: None,
     }
 }
 

@@ -58,6 +58,7 @@ pub fn genesis(features: &[&str]) -> Genesis {
         upgrades: vec![ScheduledUpgrade { version: PROGRAMS_VERSION, activation_height: 1 }],
         bootstrap_excluded: vec![],
         pool_repos: Default::default(),
+        brand: None,
     }
 }
 

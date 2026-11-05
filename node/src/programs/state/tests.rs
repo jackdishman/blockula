@@ -57,6 +57,7 @@ fn genesis() -> Genesis {
         upgrades: vec![ScheduledUpgrade { version: 2, activation_height: 1 }],
         bootstrap_excluded: vec![],
         pool_repos: Default::default(),
+        brand: None,
     }
 }
 

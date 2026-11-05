@@ -12,6 +12,7 @@ import { useNode } from "@/lib/explorer/node";
 import { program } from "@/lib/explorer/programs";
 import { to } from "@/lib/explorer/routes";
 import type { ChainStatus, HuntView, ValidatorsDetail } from "@/lib/explorer/types";
+import { Unit } from "@/components/Unit";
 
 const action = (kind: string) => program("hunts")?.actions.find((a) => a.kind === kind);
 
@@ -51,7 +52,7 @@ export default function HuntPage() {
         <p className="headline">“{h.title}”</p>
         <div className="amount-hero">
           <Amount drops={h.amount} unit={false} />
-          <span className="unit">FANG</span>
+          <span className="unit"><Unit /></span>
         </div>
         <div className="row-gap">
           <StatusPill status={h.status} />

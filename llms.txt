@@ -4,12 +4,13 @@
 
 - [Agent guide](AGENTS.md): copy-paste prompt, rules, HTTP API
 - [README](README.md): quickstart, SDK examples, run your own chain
-- [Launch your own ledger](docs/LAUNCH.md): start a chain, friends join, validators get approved
+- [Launch your own ledger](docs/LAUNCH.md): `blockula launch` names and starts a chain, friends join, validators get approved
+- [Reference](docs/REFERENCE.md): chains by hand, public servers, the CLI wallet, validators, Hunts
 - [Run a node](docs/RUN-A-NODE.md): a full node or a validator, and using your own node
 - [Plan](docs/PLAN.md): architecture, privacy (Ghost Mode), tokenomics, roadmap
 - [Security](SECURITY.md): how to report vulnerabilities
 
-One-pager: docs/ONE_PAGER.md · No public chain: run `blockula dev` locally or launch your own (the public testnet was retired in November 2026)
+One-pager: docs/ONE_PAGER.md · No public chain: `blockula launch` makes your own (`blockula dev` for a throwaway one) (the public testnet was retired in November 2026)
 
 ## Fastest path
 1. `claude mcp add blockula -- npx -y @blockula/mcp` (a local `blockula dev` chain at http://localhost:7070; `BLOCKULA_RPC=<a node>` for a chain you launched). The network is pinned (chain id + genesis hash) and never switches on its own.

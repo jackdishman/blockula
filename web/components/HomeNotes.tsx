@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import "@/app/onboarding.css";
 import type { NameDetail } from "@/lib/explorer/types";
-import { aboutWhen, blocksToHuman, fangParts } from "@/lib/format";
+import { aboutWhen, blocksToHuman, chainUnit, fangParts } from "@/lib/format";
 import { breakdown, NAME_WARN_DAYS, nameAlert, type BalanceParts, type NameAlert, type StakeTotals } from "@/lib/onboarding";
 import { SAFETY } from "@/lib/onboarding-copy";
 import { KIT_LABEL } from "@/lib/recovery";
@@ -14,7 +14,7 @@ import { useUnlocked } from "@/lib/wallet";
 /** FANG as Home's balance shows it: grouped, at most four decimals. */
 const fang = (drops: bigint) => {
   const { whole, frac } = fangParts(drops);
-  return `${whole}${frac ? `.${frac}` : ""} FANG`;
+  return `${whole}${frac ? `.${frac}` : ""} ${chainUnit()}`;
 };
 
 /**

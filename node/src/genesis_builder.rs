@@ -705,6 +705,7 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
         upgrades,
         bootstrap_excluded: excluded,
         pool_repos,
+        brand: None,
     };
     ensure!(!genesis.validators.is_empty(), "a genesis needs at least one operator");
     genesis.check()?;

@@ -15,6 +15,7 @@ import { ACCOUNT_HISTORY, MAX_LOCKS, voteLockEnd, voteLocks, type HistoryTx, typ
 import { voteTerms } from "@/lib/money-copy";
 import type { AccountView, TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
+import { Unit } from "@/components/Unit";
 
 export default function GovernancePage() {
   return (
@@ -313,7 +314,7 @@ function VoteForm({ p, lockPeriod, votable, run }: { p: ProposalSummary; lockPer
         <span>Vote with</span>
         <div className="suffix-input">
           <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.0" inputMode="decimal" aria-label="Amount to vote with" />
-          <span className="suffix">FANG</span>
+          <span className="suffix"><Unit /></span>
         </div>
       </label>
       <div className="name-status">{amountErr ? <span className="warn">{amountErr}</span> : <span className="dim small">{votable !== null ? `You can vote with up to ${exact(votable)} (your balance, plus staked and unbonding FANG)` : "Staked FANG can vote too"}</span>}</div>

@@ -11,6 +11,7 @@ import { DEFAULT_NETWORK, explorer, NETWORK, walletUrl } from "@/lib/config";
 import { PUBLIC_MEMOS } from "@/lib/creators";
 import { payLink, requestAmountError } from "@/lib/paylink";
 import { useUnlocked } from "@/lib/wallet";
+import { Unit } from "@/components/Unit";
 
 export default function ReceivePage() {
   return (
@@ -93,7 +94,7 @@ function PayRequest({ name, address }: { name?: string; address: string }) {
         <span>Amount <span className="dim">(optional)</span></span>
         <div className="suffix-input">
           <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="Payer chooses" inputMode="decimal" />
-          <span className="suffix">FANG</span>
+          <span className="suffix"><Unit /></span>
         </div>
       </label>
       {amountErr && <span className="warn">{amountErr}</span>}

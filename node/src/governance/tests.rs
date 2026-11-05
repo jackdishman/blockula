@@ -77,6 +77,7 @@ fn genesis(params: &[(&str, u64)]) -> Genesis {
         upgrades: vec![],
         bootstrap_excluded: vec![],
         pool_repos: Default::default(),
+        brand: None,
     }
 }
 

@@ -74,7 +74,7 @@ export default function ExplorePage() {
     <main className="wide stack-lg">
       <div className="page-head">
         <span className="eyebrow">The pulse</span>
-        <h1>{s ? s.chain_id : "…"}, live</h1>
+        <h1>{s ? (s.name ?? s.chain_id) : "…"}, live</h1>
         <span className="sub">
           A new block about every {(blockMs / 1000).toLocaleString("en-US")}s, final the moment it&apos;s sealed. Click any block, name or transaction to dig in, or press <span className="kbd">⌘K</span> to search.
         </span>

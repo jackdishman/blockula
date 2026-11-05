@@ -15,6 +15,7 @@ import { aboutWhen, blocksToHuman, displayFang, shortAddr } from "@/lib/format";
 import { FOUNDER_RUN, moveRisk, stakeRisk, unstakeRisk } from "@/lib/money-copy";
 import type { TxView, ValidatorsView, ValidatorView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
+import { Unit } from "@/components/Unit";
 
 export default function StakePage() {
   return (
@@ -298,7 +299,7 @@ function PoolRow({ d, v, validators, terms, run }: { d: StakeDelegation; v?: Val
               <span>How much <span className="dim">(empty: all of it)</span></span>
               <div className="suffix-input">
                 <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="all" inputMode="decimal" aria-label="Amount to unstake" />
-                <span className="suffix">FANG</span>
+                <span className="suffix"><Unit /></span>
               </div>
             </label>
             {amountErr && <span className="warn">{amountErr}</span>}
@@ -340,7 +341,7 @@ function PoolRow({ d, v, validators, terms, run }: { d: StakeDelegation; v?: Val
               <span>How much <span className="dim">(empty: all of it)</span></span>
               <div className="suffix-input">
                 <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="all" inputMode="decimal" aria-label="Amount to move" />
-                <span className="suffix">FANG</span>
+                <span className="suffix"><Unit /></span>
               </div>
             </label>
             {amountErr && <span className="warn">{amountErr}</span>}
@@ -420,7 +421,7 @@ function Delegate({ validators, terms, run }: { validators: ValidatorView[]; ter
         <span>Amount</span>
         <div className="suffix-input">
           <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.0" inputMode="decimal" aria-label="Amount to delegate" />
-          <span className="suffix">FANG</span>
+          <span className="suffix"><Unit /></span>
         </div>
       </label>
       <div className="name-status">{amountErr ? <span className="warn">{amountErr}</span> : <span className="dim small">Available: {free !== null ? exact(free) : "…"}</span>}</div>

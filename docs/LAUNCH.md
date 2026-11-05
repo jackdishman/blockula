@@ -6,9 +6,82 @@ Blockula is a kit for running your own quantum-safe ledger: a few computers that
 - **Light.** With the default 5-second blocks, an idle validator in a set of 4 uses about 80 MB of memory, a quarter of a percent of one CPU core and about 16 KB/s of upload ([what it costs](#what-it-costs)).
 - **Complete.** Accounts with several keys and spending limits, readable `.boo` names, an explorer in every node, a passkey wallet, a TypeScript SDK and an MCP server for agents.
 
-**Its unit has no value.** Each chain has a native unit, FANG, that its faucet hands out. It's there so every transaction pays a tiny fee, which keeps spam expensive. Nobody sells it, buys it or gets paid in it, and each chain's FANG is its own.
+**Its unit has no value.** Each chain has a native unit (FANG, or the ticker you give it) that its faucet hands out. It's there so every transaction pays a tiny fee, which keeps spam expensive. Nobody sells it, buys it or gets paid in it, and each chain's unit is its own.
 
-## 1. Pick how your machines reach each other
+## 1. Launch it
+
+On your machine (macOS or Linux):
+
+```bash
+curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh
+blockula launch
+```
+
+`blockula launch` asks four things, each with a default you can take by pressing Enter:
+
+1. **Name it.** What wallets and explorers call your chain ("Jack in the Block"), its ticker (2–8 letters or digits, like `JACK`; it suggests the name's initials) and a line about it.
+2. **Who can reach it.** Just this machine, [Tailscale](#reaching-each-other) (recommended for friends in different places), one home network, or the open internet. It finds this machine's Tailscale and local addresses for you.
+3. **How it runs.** A block every 1, 2, 5 (the default) or 10 seconds, a faucet or not, the validator bond, and [programs](#programs-experimental-off-by-default) (off by default).
+4. **Apps.** The explorer is built in. On Tailscale it can also serve it over HTTPS on your tailnet ([Apps](#apps)).
+
+Then it shows what it'll make, makes the chain and starts it. It prints the explorer's address, the one command your friends run to join, and how to start it again, and keeps all of that in `~/.blockula/<chain id>/LAUNCH.md`. Ctrl-C stops the node; `blockula run --home ~/.blockula/<chain id> --bind 0.0.0.0` starts it again.
+
+To answer with flags instead, for a script or an agent:
+
+```bash
+blockula launch --name "Jack in the Block" --token JACK --reach tailscale --yes
+```
+
+`blockula launch --help` lists them all (`--description`, `--chain-id`, `--host`, `--block-time-ms`, `--no-faucet`, `--min-bond`, `--programs`, `--https`, `--no-start`).
+
+The name, ticker and description are your chain's for good: the genesis hash binds them, so nobody's node can show your chain under another name. They're labels: the chain still counts in drops (a billion to one unit), addresses still start with `boo1` and names end in `.boo`.
+
+The defaults: a block every 5 seconds, a validator set that can change every 10 minutes (an epoch), a faucet that gives 100 at a time, a 50 validator bond (10,000 without a faucet), and you as the chain's admin.
+
+## 2. Friends join
+
+A full node keeps its own copy of the chain, checks every block, and gives its owner their own explorer and API:
+
+```bash
+blockula join --genesis http://<your address>:7070 --genesis-hash <hash> --home ~/.blockula/<chain id>
+```
+
+Its explorer is at `http://localhost:7171`. The wallet, the SDK and the MCP can all use it ([RUN-A-NODE.md, "Use your node"](RUN-A-NODE.md#use-your-node)).
+
+## 3. Friends become validators
+
+Validators take turns making blocks. On the friend's machine:
+
+```bash
+# A validator home: a new key, and the addresses the others reach it at
+blockula validator init --home ~/.blockula/<chain id>-validator \
+  --genesis http://<your address>:7070 --genesis-hash <hash> \
+  --public-p2p-addr <their address>:30300 --public-http-addr http://<their address>:7070
+
+# Its bond, from the faucet, to the validator address init printed (it waits until the payment is final)
+blockula wallet faucet --to <validator address> --rpc http://<your address>:7070
+
+# Start it, then register it
+blockula run --home ~/.blockula/<chain id>-validator --bind 0.0.0.0
+blockula validator register --home ~/.blockula/<chain id>-validator --rpc http://<your address>:7070
+```
+
+`register` bonds 50 FANG and prints how the validator gets in. On your machine, approve it:
+
+```bash
+blockula validator approve <validator address> --key ~/.blockula/<chain id>/validator.key --rpc http://localhost:7070
+```
+
+It joins at the next epoch boundary, within 10 minutes, and starts taking turns.
+
+## Apps
+
+- **Explorer.** Every node serves one at port 7070, under your chain's name and in its ticker. It installs as an app: on a Mac, open it in Safari and choose **File > Add to Dock**; on an iPhone or iPad, open it in Safari and choose **Share > Add to Home Screen**. It gets the chain's name and a bat icon.
+- **HTTPS on your tailnet.** On Tailscale, `blockula launch` can run `tailscale serve --bg 7070`, which serves the explorer at `https://<this machine>.<your tailnet>.ts.net` to everyone on your tailnet (turn on HTTPS certificates in the Tailscale admin console first). Phones install it best that way. `--https` asks for it with `--yes`.
+- **Wallet.** The passkey wallet (`web/`) talks to the node on its own machine. With Node.js 20 or later: `git clone --depth 1 https://github.com/jackdishman/blockula && cd blockula && npm ci && npm run wallet`, then open http://localhost:3000. Friends run it against their own node (it can pick any node in its header).
+- **Agents.** `claude mcp add blockula -- npx -y @blockula/mcp` gives a coding agent a wallet on the chain at http://localhost:7070 ([AGENTS.md](../AGENTS.md)).
+
+## Reaching each other
 
 Validators connect to each other on TCP port 30300, and people's nodes read from a validator's HTTP API on port 7070. Pick one way for everyone:
 
@@ -20,57 +93,18 @@ Validators connect to each other on TCP port 30300, and people's nodes read from
 
 Below, `<your address>` is the creator's address and `<their address>` a friend's.
 
-## 2. Start the chain
+## By hand
 
-On your machine:
+`blockula launch` runs these two commands; you can run them yourself:
 
 ```bash
-curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh
-blockula summon mychain --host <your address>
+blockula summon mychain --host <your address> --name "My Chain" --token MINE
 blockula run --home ~/.blockula/mychain --bind 0.0.0.0
 ```
 
 - `summon` prints the chain's **genesis hash** and the command others join with. Everyone who joins pins that hash, so share it with the address.
 - `--bind 0.0.0.0` listens on every network the machine is on. On Tailscale, `--bind <your Tailscale address>` listens on your tailnet only.
-- The explorer is at `http://<your address>:7070`.
-
-The defaults: a block every 5 seconds, a validator set that can change every 10 minutes (an epoch), a faucet that gives 100 FANG at a time, a 50 FANG validator bond, and you as the chain's admin. `blockula summon --help` lists the options, such as `--block-time-ms 1000` for faster blocks, `--no-faucet` and `--min-bond`.
-
-## 3. Friends join
-
-A full node keeps its own copy of the chain, checks every block, and gives its owner their own explorer and API:
-
-```bash
-blockula join --genesis http://<your address>:7070 --genesis-hash <hash> --home ~/.blockula/mychain
-```
-
-Its explorer is at `http://localhost:7171`. The wallet, the SDK and the MCP can all use it ([RUN-A-NODE.md, "Use your node"](RUN-A-NODE.md#use-your-node)).
-
-## 4. Friends become validators
-
-Validators take turns making blocks. On the friend's machine:
-
-```bash
-# A validator home: a new key, and the addresses the others reach it at
-blockula validator init --home ~/.blockula/mychain-validator \
-  --genesis http://<your address>:7070 --genesis-hash <hash> \
-  --public-p2p-addr <their address>:30300 --public-http-addr http://<their address>:7070
-
-# Its bond, from the faucet, to the validator address init printed (it waits until the payment is final)
-blockula wallet faucet --to <validator address> --rpc http://<your address>:7070
-
-# Start it, then register it
-blockula run --home ~/.blockula/mychain-validator --bind 0.0.0.0
-blockula validator register --home ~/.blockula/mychain-validator --rpc http://<your address>:7070
-```
-
-`register` bonds 50 FANG and prints how the validator gets in. On your machine, approve it:
-
-```bash
-blockula validator approve <validator address> --key ~/.blockula/mychain/validator.key --rpc http://localhost:7070
-```
-
-It joins at the next epoch boundary, within 10 minutes, and starts taking turns.
+- `blockula summon --help` lists the options, such as `--block-time-ms 1000` for faster blocks, `--no-faucet`, `--min-bond`, `--description` and `--programs`.
 
 ## How many validators?
 
@@ -87,13 +121,13 @@ It joins at the next epoch boundary, within 10 minutes, and starts taking turns.
 - **On the open internet,** keep the seats for people you know. Summon with `--no-faucet`, which also raises the bond to 10,000 FANG, and give FANG yourself to people you trust. Your validator's account holds the chain's starting FANG:
 
   ```bash
-  blockula wallet send <their account> 10000 --key ~/.blockula/mychain/validator.key --rpc http://localhost:7070
+  blockula wallet send <their account> 10000 --key ~/.blockula/<chain id>/validator.key --rpc http://localhost:7070
   ```
 
 - **As the admin, you can remove a validator.** It leaves at the next epoch, for good:
 
   ```bash
-  blockula validator remove <validator address> --key ~/.blockula/mychain/validator.key --rpc http://localhost:7070
+  blockula validator remove <validator address> --key ~/.blockula/<chain id>/validator.key --rpc http://localhost:7070
   ```
 
 ## What it costs
@@ -123,7 +157,8 @@ Programs are small programs, written for WebAssembly, that anyone on your chain 
 **Start a chain with programs from the first block:**
 
 ```bash
-blockula summon mychain --host <your address> --programs
+blockula launch --programs      # or answer yes when it asks
+blockula summon mychain --host <your address> --programs   # by hand
 ```
 
 `blockula dev --programs` does the same for a throwaway local chain to experiment on (add `--reset` to replace one that already exists). It's the genesis that says so, so a chain made without `--programs` can't get them by restarting it with the flag. It can get them by a vote: the validators schedule protocol v2 if the chain isn't on it yet, then switch the feature on ([GOVERNANCE.md](GOVERNANCE.md#programs-optional-off-by-default)). Either way, the machines need a release that supports protocol v2, and `blockula program --help` then uploads, creates, calls and views programs. The full specification is [PROGRAMS-V0.md](PROGRAMS-V0.md).
@@ -133,7 +168,7 @@ blockula summon mychain --host <your address> --programs
 - **Strangers' code runs on every validator.** It's metered and sandboxed, and the node is built to cope when it misbehaves, but it's new and not yet audited. Treat programs as an experiment, not as something to rely on: a chain made with them now may need to be recreated after an update.
 - **A little more memory.** Don't set a tight memory or process limit on the service ([OPERATIONS.md](OPERATIONS.md#limits-a-validator-needs) has the numbers).
 - **Everyone runs the same release.** If one validator runs another build, it can fail on programs the others run fine.
-- **A pause button, and the duty to agree on it.** If something is wrong with programs, enough validators can stop new program transactions for three days (one if your chain has 1 to 3 validators, two of 4, three of 7). On a small chain that means any one of you can pause programs for three days, and keep doing it for up to 30 days of every 60, so choose validators you trust. Agree with the others before anyone signs, then `blockula program pause --key ~/.blockula/mychain/validator.key`. A validator signs it from its own account, so keep a few FANG there. [OPERATIONS.md](OPERATIONS.md#the-pause) walks through it.
+- **A pause button, and the duty to agree on it.** If something is wrong with programs, enough validators can stop new program transactions for three days (one if your chain has 1 to 3 validators, two of 4, three of 7). On a small chain that means any one of you can pause programs for three days, and keep doing it for up to 30 days of every 60, so choose validators you trust. Agree with the others before anyone signs, then `blockula program pause --key ~/.blockula/<chain id>/validator.key`. A validator signs it from its own account, so keep a few FANG there. [OPERATIONS.md](OPERATIONS.md#the-pause) walks through it.
 - **Programs can hold FANG.** FANG has no value on your chain, but there's a cap on how much programs can hold together (10,000,000 FANG to start with) that a vote can change, and a vote can switch programs off again (they keep what they hold and people can take it out).
 
 ## Good to know

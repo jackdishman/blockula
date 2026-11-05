@@ -191,6 +191,43 @@ pub struct Genesis {
     /// ordinary allocation to the pool's account (`poc::pool_address`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pool_repos: BTreeMap<String, u64>,
+    /// What the chain calls itself (`blockula summon --name`), for wallets and explorers. Display
+    /// only: the protocol's unit is drops either way. Absent on every chain made without it, so
+    /// their genesis and its hash don't change; present, the genesis hash binds it (with a
+    /// `token` other than FANG), so a node can't rename a chain it serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand: Option<Brand>,
+}
+
+/// A chain's display name and description (`Genesis::brand`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Brand {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// The unit every chain had before `--token`: the genesis hash binds a `token` other than this.
+pub const DEFAULT_TOKEN: &str = "FANG";
+/// Longest chain name, in bytes.
+pub const MAX_CHAIN_NAME: usize = 48;
+/// Longest chain description, in bytes.
+pub const MAX_CHAIN_DESCRIPTION: usize = 280;
+
+/// A ticker is 2 to 8 characters, A–Z and 0–9, starting with a letter ("JACK", "B2B").
+pub fn check_token(t: &str) -> Result<()> {
+    let ok = (2..=8).contains(&t.len()) && t.starts_with(|c: char| c.is_ascii_uppercase()) && t.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+    ensure!(ok, "token must be 2–8 characters, A–Z and 0–9, starting with a letter (like JACK), not {t:?}");
+    Ok(())
+}
+
+/// A chain name is 1 to [`MAX_CHAIN_NAME`] bytes and a description up to [`MAX_CHAIN_DESCRIPTION`],
+/// neither with control characters or space around it.
+pub fn check_brand(b: &Brand) -> Result<()> {
+    let clean = |v: &str| v.trim() == v && !v.chars().any(|c| c.is_control());
+    ensure!(!b.name.is_empty() && b.name.len() <= MAX_CHAIN_NAME && clean(&b.name), "chain name must be 1–{MAX_CHAIN_NAME} bytes, with no control characters or space around it");
+    ensure!(b.description.len() <= MAX_CHAIN_DESCRIPTION && clean(&b.description), "chain description must be at most {MAX_CHAIN_DESCRIPTION} bytes, with no control characters or space around it");
+    Ok(())
 }
 
 fn default_epoch_blocks() -> u64 {
@@ -418,6 +455,12 @@ impl Genesis {
     pub fn check(&self) -> Result<()> {
         use std::collections::BTreeSet;
         self.check_prefix()?;
+        if self.token != DEFAULT_TOKEN {
+            check_token(&self.token)?;
+        }
+        if let Some(b) = &self.brand {
+            check_brand(b)?;
+        }
         if let Some(t) = &self.contribution {
             t.check()?;
         }
@@ -1993,11 +2036,15 @@ pub struct SummonOpts {
     pub upgrades: Vec<crate::upgrade::ScheduledUpgrade>,
     /// Features on from genesis (`Genesis::features`). Empty by default, like `upgrades`.
     pub features: Vec<String>,
+    /// The chain's ticker (`Genesis::token`). `None`: FANG.
+    pub token: Option<String>,
+    /// The chain's display name and description (`Genesis::brand`). `None`: none.
+    pub brand: Option<Brand>,
 }
 
 impl SummonOpts {
     pub fn new(chain_id: &str, validators: usize) -> Self {
-        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None, contribution: None, address_prefix: default_address_prefix(), params: BTreeMap::new(), host: None, upgrades: vec![], features: vec![] }
+        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None, contribution: None, address_prefix: default_address_prefix(), params: BTreeMap::new(), host: None, upgrades: vec![], features: vec![], token: None, brand: None }
     }
 
     /// These options with programs on from block 1 (docs/PROGRAMS-V0.md §1.5; `blockula summon
@@ -2020,7 +2067,7 @@ pub fn summon_epoch_blocks(block_time_ms: u64) -> u64 {
 }
 
 /// `host` as it goes before `:port` (an IPv6 address in brackets), checked as an address.
-fn summon_host(host: &str) -> Result<String> {
+pub(crate) fn summon_host(host: &str) -> Result<String> {
     let h = if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host.to_string() };
     check_host_port(&format!("{h}:{SUMMON_P2P_PORT}")).map_err(|_| anyhow!("--host must be an IP address or a DNS name, got {host:?}"))?;
     Ok(h)
@@ -2634,9 +2681,15 @@ impl Chain {
             }
             None => {}
         }
+        if let Some(t) = &o.token {
+            check_token(t)?;
+        }
+        if let Some(b) = &o.brand {
+            check_brand(b)?;
+        }
         let mut genesis = Genesis {
             chain_id: chain_id.to_string(),
-            token: "FANG".into(),
+            token: o.token.clone().unwrap_or_else(|| DEFAULT_TOKEN.into()),
             decimals: DECIMALS,
             block_time_ms,
             validators: infos,
@@ -2655,6 +2708,7 @@ impl Chain {
             upgrades: o.upgrades.clone(),
             bootstrap_excluded: vec![],
             pool_repos: Default::default(),
+            brand: o.brand.clone(),
         };
         // Every validator stakes: each owns itself and bonds twice the minimum from its
         // allocation, so a light slash (downtime) doesn't leave it under-bonded.
@@ -4438,6 +4492,59 @@ mod tests {
         fs::remove_dir_all(home).ok();
     }
 
+    /// `summon --name/--description/--token`: the genesis carries the chain's name and ticker,
+    /// the genesis hash binds them (so a node serving the genesis can't rename the chain), and a
+    /// chain made without them hashes as it always did.
+    #[test]
+    fn summon_names_the_chain_and_the_genesis_hash_binds_it() {
+        let base = std::env::temp_dir().join(format!("blockula-brand-{}-{}", now_ms(), std::process::id()));
+        let summon = |dir: &str, token: Option<&str>, brand: Option<Brand>| {
+            let home = base.join(dir);
+            Chain::summon(&home, &SummonOpts { token: token.map(String::from), brand, ..SummonOpts::new("jack-in-the-block", 1) }).map(|_| Genesis::load(&home.join("genesis.json")).unwrap())
+        };
+        let hash = |g: &Genesis| hex::encode(crate::consensus::genesis_block(g).digest_bytes());
+        let jack = Brand { name: "Jack in the Block".into(), description: "A ledger for Jack's friends.".into() };
+        let g = summon("jack", Some("JACK"), Some(jack.clone())).unwrap();
+        assert_eq!((g.token.as_str(), g.brand.as_ref()), ("JACK", Some(&jack)));
+        g.check().unwrap();
+        // Renaming it, or changing its ticker or description, gives another chain.
+        let h = hash(&g);
+        for edit in [
+            (|g: &mut Genesis| g.brand.as_mut().unwrap().name = "Jack in the Box".into()) as fn(&mut Genesis),
+            |g| g.brand.as_mut().unwrap().description.clear(),
+            |g| g.token = "BOX".into(),
+            |g| g.brand = None,
+            |g| g.token = DEFAULT_TOKEN.into(),
+        ] {
+            let mut other = g.clone();
+            edit(&mut other);
+            assert_ne!(hash(&other), h);
+        }
+        // Without a brand and with FANG, the hash is the one chains always had: brand-free bytes.
+        let plain = summon("plain", None, None).unwrap();
+        assert_eq!((plain.token.as_str(), plain.brand.is_none()), (DEFAULT_TOKEN, true));
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("brand").is_none(), "no brand key in an unbranded genesis.json");
+        let (id, prefix) = (plain.chain_id.as_bytes(), plain.address_prefix.as_bytes());
+        let legacy_seed = <commonware_cryptography::Blake3 as commonware_cryptography::Hasher>::hash(&[b"BLOCKULA_GENESIS_V2", &(id.len() as u32).to_be_bytes(), id, &(prefix.len() as u32).to_be_bytes(), prefix, &plain.created_at_ms.to_be_bytes(), serde_json::to_string(&plain.validators).unwrap().as_bytes()]);
+        let legacy = crate::consensus::CBlock::new(legacy_seed, 0, 0, 0, plain.created_at_ms, String::new(), 0, crate::consensus::hex_32(&plain.initial_state().root()), vec![]).with_versions(crate::consensus::GENESIS_PROTOCOL_VERSION, crate::consensus::GENESIS_PROTOCOL_VERSION);
+        assert_eq!(hash(&plain), hex::encode(legacy.digest_bytes()));
+        // A ticker alone (no name) is bound too.
+        let ticker = summon("ticker", Some("JACK"), None).unwrap();
+        assert_ne!(hash(&ticker), hash(&Genesis { token: DEFAULT_TOKEN.into(), ..ticker.clone() }));
+        // What's refused, by summon and by the genesis check.
+        for (i, bad) in ["J", "jack", "JACKJACKJ", "1JACK", "JA CK", "JÄCK"].into_iter().enumerate() {
+            assert!(summon(&format!("badtoken{i}"), Some(bad), None).unwrap_err().to_string().contains("token must be"), "{bad:?}");
+            assert!(Genesis { token: bad.into(), ..plain.clone() }.check().is_err(), "{bad:?}");
+        }
+        let named = |name: &str, description: &str| Some(Brand { name: name.into(), description: description.into() });
+        for (i, bad) in [named("", ""), named(" Jack", ""), named("Jack\nBlock", ""), named(&"x".repeat(MAX_CHAIN_NAME + 1), ""), named("Jack", &"x".repeat(MAX_CHAIN_DESCRIPTION + 1)), named("Jack", "line\u{7}")].into_iter().enumerate() {
+            assert!(summon(&format!("badname{i}"), None, bad.clone()).unwrap_err().to_string().contains("chain "), "{bad:?}");
+        }
+        assert!(summon("emoji", Some("B2B"), named("🦇 Jack in the Block", "")).is_ok(), "names can be any printable text");
+        fs::remove_dir_all(base).ok();
+    }
+
     /// `summon --host`: other machines reach the validators at the host, on fixed ports counted up
     /// from the defaults, and each operator's proof of possession signs those addresses (the
     /// genesis checks it). Without a host the chain stays on 127.0.0.1.
@@ -5735,6 +5842,7 @@ mod scaffold {
             upgrades: vec![],
             bootstrap_excluded: vec![],
             pool_repos: Default::default(),
+            brand: None,
         }
     }
 
