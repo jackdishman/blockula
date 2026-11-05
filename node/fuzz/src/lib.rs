@@ -28,6 +28,7 @@ mod node_src {
     pub mod github;
     pub mod gov_cli;
     pub mod governance;
+    pub mod launch_cli;
     pub mod node;
     pub mod params;
     pub mod poc;
@@ -46,6 +47,7 @@ mod node_src {
     pub mod upgrade;
     pub mod validator_cli;
     pub mod view;
+    pub mod webapp;
 }
 pub use node_src::*;
 
