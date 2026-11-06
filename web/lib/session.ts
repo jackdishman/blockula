@@ -43,14 +43,21 @@ export const clearHint = () => localStorage.removeItem(HINT);
 
 export interface TutorialState {
   dismissed?: boolean;
+  /** Set by any explorer link (components/ui `ExplorerLink`). Kept from the first checklist; no task reads it now. */
   viewedExplorer?: boolean;
-  /** Items ticked once stay ticked (e.g. after revoking the agent you set up). */
+  /**
+   * Tasks done, by id (components/Tutorial): ticked by the user, or proven by the chain and kept
+   * (e.g. after revoking the agent you set up). Ids from the first checklist still load: "kit"
+   * counts as "device", and "explorer" is ignored.
+   */
   done?: string[];
+  /** Tasks the user chose to skip, so the next stage opens without them. */
+  skipped?: string[];
 }
 
 /**
  * Checklist progress is kept per chain and account: the same key has the same address on every
- * chain, but what it did on a testnet that has since been relaunched (or with another account)
+ * chain, but what it did on a chain that has since been relaunched (or with another account)
  * isn't done here. A store from before this (no `v`) can't say which chain it was for, so it's dropped.
  */
 interface TutorialStore {

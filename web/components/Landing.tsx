@@ -1,90 +1,253 @@
+"use client";
+
 import Link from "next/link";
+import type { ReactNode } from "react";
 import { Apparition } from "@/components/Haunt";
+import { Flow, type FeesView, type ParamsView } from "@/components/landing/Flow";
 import { Copy } from "@/components/ui";
+import { agentPrompt } from "@/lib/agent-prompt";
+import { DEFAULT_NETWORK, RP_ID, RPC } from "@/lib/config";
+import { useNode } from "@/lib/explorer/node";
+import { useWallet } from "@/lib/wallet";
 
 const REPO = "https://github.com/jackdishman/blockula";
 const INSTALL = `curl -fsSL ${REPO}/releases/latest/download/install.sh | sh`;
 const LAUNCH = "blockula launch";
+const DEV = "blockula dev";
+const BUILD_ON_IT = `${REPO}/blob/main/docs/BUILD-ON-IT.md`;
+const LAUNCH_GUIDE = `${REPO}/blob/main/docs/LAUNCH.md`;
 
-const STEPS: { title: string; body: string }[] = [
-  { title: "Launch it", body: "`blockula launch` asks four questions (a name and ticker, who can reach it, how it runs, the apps), makes the chain on your machine and starts it." },
-  { title: "Friends join", body: "It prints the one command they run. Tailscale is the easy way to reach each other; a home network or a port forward works too." },
-  { title: "Friends become validators", body: "A bond from the chain's faucet and one command each, then you approve them. They start taking turns within 10 minutes." },
-];
+const LOCAL = /^(localhost|127\.0\.0\.1|\[::1\])$/;
+const isLocalUrl = (u: string) => {
+  try {
+    return LOCAL.test(new URL(u).hostname);
+  } catch {
+    return false;
+  }
+};
 
-const PARTS: { title: string; body: string }[] = [
-  { title: "Post-quantum throughout", body: "ML-DSA-65 signatures (NIST FIPS 204) on every transaction and vote; validators key their channels with ML-KEM-768." },
-  { title: "Runs at home", body: "A block every 5 seconds by default, sized for home connections. No hosting to pay for." },
-  { title: "Its own apps", body: "Every node serves an explorer under your chain's name, in its ticker, that installs on a Mac's Dock or an iPhone's Home Screen. Pay `alice.boo`, not addresses." },
-  { title: "Wallets on passkeys", body: "Face ID or a password manager unlocks a wallet: no seed phrase. The passkey only unlocks the key and never signs on-chain. Agents get budgets the chain enforces." },
-  { title: "Staking and governance", body: "Delegation, slashing, on-chain proposals and votes, as your chain's validators and holders decide." },
-  { title: "Programs (experimental)", body: "WebAssembly programs, off by default: `summon --programs` turns them on. Not audited yet." },
-];
-
-/** `code` spans in the copy above, rendered as code. */
+/** `code` spans in plain copy, rendered as code. */
 function Text({ children }: { children: string }) {
   return <>{children.split("`").map((part, i) => (i % 2 ? <code key={i}>{part}</code> : part))}</>;
 }
 
-function Command({ text }: { text: string }) {
+function Command({ text, label }: { text: string; label?: string }) {
   return (
     <div className="landing-cmd">
       <code>{text}</code>
-      <Copy text={text} />
+      <Copy text={text} label={label} />
     </div>
   );
 }
 
-/** What a first visit to `/` shows: Blockula 1.0, the kit, with the wallet a click away. */
+const USES: { title: string; body: string }[] = [
+  { title: "A friends' IOU ledger", body: "Pay `sam.boo` back for pizza, with a memo saying why. Everyone sees the same history." },
+  { title: "A shared kitty", body: "A multisig account that spends only when, say, 2 of 3 of you approve." },
+  { title: "Group decisions", body: "Put a question up as a proposal; holders vote with their coins." },
+  { title: "Bounties", body: "Hunts escrow coins on a GitHub issue and pay whoever's PR fixes it." },
+  { title: "A notary log", body: "Send yourself a file's hash as a memo: the block dates it for good." },
+  { title: "Agents on a budget", body: "Give a coding agent a key with a spending limit the chain enforces." },
+];
+
+/** What a first visit to `/` shows: the chain this wallet is talking to, and a short path of things to do on it. */
 export function Landing() {
+  const { status, chain } = useWallet();
+  const fees = useNode<FeesView>(status ? "/fees" : null, { every: 30_000 });
+  const params = useNode<ParamsView>(status ? "/params" : null, { every: 60_000 });
+  const down = !status && chain.state !== "checking";
+  const token = status?.token ?? "FANG";
+  const name = status?.name || status?.chain_id;
+  // `undefined` until /api/fees answers: programs are on only when it has a `fuel` section.
+  const programs = !status ? undefined : fees.data ? !!fees.data.fuel : fees.error ? false : undefined;
+
   return (
     <main className="narrow stack-lg landing">
       <div className="center">
         <Apparition kind="moon" />
-        <span className="eyebrow">Blockula 1.0</span>
-        <h1>Launch your own quantum-safe ledger</h1>
-        <p className="lead">One command names a chain, gives it a ticker and starts it, and your friends&apos; computers join it. Post-quantum signatures throughout, on machines you already have.</p>
+        <span className="eyebrow">Blockula</span>
+        {status ? (
+          <>
+            <h1 data-testid="landing-chain">{name}</h1>
+            <p className="lead">
+              You&apos;re looking at <b>{name}</b>, a chain whose unit is <b>{token}</b>. Here&apos;s what to do on it.
+            </p>
+            <span className="landing-meta mono">
+              {status.chain_id} · block {status.height.toLocaleString("en-US")}
+            </span>
+          </>
+        ) : (
+          <>
+            <h1>Launch your own quantum-safe ledger</h1>
+            <p className="lead">One command names a chain and starts it on your machine. Friends&apos; computers join it.</p>
+          </>
+        )}
       </div>
-      <section className="card stack">
-        <h2>Two commands</h2>
-        <Command text={INSTALL} />
-        <Command text={LAUNCH} />
-        <p className="dim small">macOS and Linux. It asks what your chain is called, who can reach it and how it runs, then starts it. The launch guide covers Tailscale, home networks and the open internet, adding validators and keeping it running.</p>
-        <div className="row-gap">
-          <a className="btn primary" href={`${REPO}/blob/main/docs/LAUNCH.md`}>Read the launch guide</a>
-          <a className="btn" href={REPO}>Source on GitHub</a>
-        </div>
-      </section>
-      <section className="stack">
-        <h2>How a chain comes together</h2>
-        <ol className="landing-steps">
-          {STEPS.map((s) => (
-            <li key={s.title}>
-              <strong>{s.title}.</strong> <Text>{s.body}</Text>
-            </li>
-          ))}
+
+      {down && (
+        <section className="card stack" data-testid="landing-no-chain">
+          <h2>No chain is running here yet</h2>
+          <p className="dim">Install Blockula and launch one (macOS and Linux):</p>
+          <Command text={INSTALL} />
+          <Command text={LAUNCH} />
+          <p className="dim small">
+            Or <code>{DEV}</code> for a throwaway one to try things on. Then reload this page. <a href={LAUNCH_GUIDE}>The launch guide</a> has the rest.
+          </p>
+        </section>
+      )}
+
+      <section className="stack" aria-labelledby="get-started">
+        <h2 id="get-started">Get started</h2>
+        <ol className="landing-path">
+          <Step n={1} title="Make a wallet" action={<Link className="btn primary small" href="/welcome">Make a wallet</Link>}>
+            A passkey unlocks it: Face ID or your password manager. No seed phrase.
+          </Step>
+          <Step n={2} title="Get coins, send one" action={<Link className="btn small" href="/send">Send</Link>}>
+            {status?.faucet === false ? "Ask the chain's creator for some" : "The faucet fills a new wallet"}. Pay a name like <code>alice.boo</code>, not an address.
+          </Step>
+          <Step n={3} title="Invite a friend" action={<a className="btn small" href="#invite">Invite</a>}>
+            One link to share, and how they join and become a validator.
+          </Step>
+          <Step n={4} title="Bring your coding agent" action={<a className="btn small" href="#agent">Get the prompt</a>}>
+            Paste one prompt into Claude Code: it gets a wallet on this chain.
+          </Step>
+          <Step n={5} title="Build a program" action={programs ? <Link className="btn small" href="/programs">Programs</Link> : null} testid="step-programs">
+            <Programs on={programs} />
+          </Step>
+          <Step n={6} title="Make it yours" action={<a className="btn small" href={BUILD_ON_IT}>Build on it</a>}>
+            Everything here, this wallet and the node&apos;s explorer, can be changed with Claude Code.
+          </Step>
         </ol>
       </section>
-      <section className="stack">
-        <h2>What&apos;s in it</h2>
-        <div className="landing-parts">
-          {PARTS.map((p) => (
-            <div key={p.title}>
-              <h3>{p.title}</h3>
-              <p className="dim"><Text>{p.body}</Text></p>
+
+      <Invite />
+      <Agent />
+
+      <section className="stack" aria-labelledby="flow-title">
+        <h2 id="flow-title">Where {token} goes</h2>
+        <Flow params={params.data} fees={fees.data} faucet={status?.faucet} blockMs={status?.block_time_ms} />
+      </section>
+
+      <section className="stack" aria-labelledby="uses">
+        <h2 id="uses">What a small chain is good for</h2>
+        <div className="landing-uses">
+          {USES.map((u) => (
+            <div key={u.title} className="landing-use">
+              <h3>{u.title}</h3>
+              <p className="dim small"><Text>{u.body}</Text></p>
             </div>
           ))}
         </div>
       </section>
-      <section className="card stack center">
-        <h2>Your wallet</h2>
-        <p className="dim">This wallet talks to the chain on your machine: the one <code>blockula launch</code> started, or <code>blockula dev</code>&apos;s throwaway one. Make a wallet with a passkey, get coins from the faucet and claim a <code>.boo</code> name.</p>
-        <Link className="btn primary big" href="/welcome">Open the wallet</Link>
-        <Link className="link small" href="/explore">Or explore your chain</Link>
-      </section>
+
       <p className="dim small center">
-        Each chain&apos;s unit (FANG, or the ticker you give it) has no value by design: its faucet hands it out and it only prices spam. Nobody sells it, buys it or gets paid in it. Blockula isn&apos;t externally audited.
+        Blockula isn&apos;t externally audited. <a href={REPO}>Source on GitHub</a>.
       </p>
     </main>
+  );
+}
+
+function Step({ n, title, action, children, testid }: { n: number; title: string; action: ReactNode; children: ReactNode; testid?: string }) {
+  return (
+    <li className="landing-step" data-testid={testid}>
+      <span className="landing-n" aria-hidden="true">{n}</span>
+      <div className="landing-step-body">
+        <strong>{title}</strong>
+        <span className="dim">{children}</span>
+      </div>
+      {action && <div className="landing-step-action">{action}</div>}
+    </li>
+  );
+}
+
+/** Step 5: on chains with programs, the three CLI calls; elsewhere, how a chain gets them. */
+function Programs({ on }: { on: boolean | undefined }) {
+  if (on)
+    return (
+      <span className="stack landing-programs" data-state="on">
+        <span>Programs are on here: WebAssembly anyone can upload and call.</span>
+        <Command text="blockula program upload code.wasm --interface iface.json" />
+        <Command text="blockula program create <wasm_hash> <interface_hash>" />
+        <Command text="blockula program call <address> <method>" />
+      </span>
+    );
+  return (
+    <span className="landing-programs" data-state={on === false ? "off" : "unknown"}>
+      {on === false ? "Programs are off on this chain. " : "WebAssembly programs are off unless a chain is made with them. "}
+      A new chain gets them with <code>blockula launch --programs</code> (or <code>blockula dev --programs</code>); an existing one only by a governance vote.
+    </span>
+  );
+}
+
+/**
+ * The invite: one link to this wallet when a friend's browser can use it (HTTPS, on the host its
+ * passkeys are bound to), and in every case the command their own node joins with.
+ */
+function Invite() {
+  const { status } = useWallet();
+  const origin = window.location.origin;
+  const host = window.location.hostname;
+  const link = `${origin}/welcome`;
+  const shareable = window.isSecureContext && !LOCAL.test(host) && (host === RP_ID || host.endsWith(`.${RP_ID}`));
+  const nodeLocal = isLocalUrl(RPC);
+  const node = nodeLocal ? "http://<your address>:7070" : RPC;
+  // A friend's browser starts on this deployment's default node; another one they pick in the header.
+  const pickNode = RPC !== DEFAULT_NETWORK.rpc.replace(/\/$/, "") || nodeLocal;
+  const id = status?.chain_id ?? "<chain id>";
+  const join = `blockula join --genesis ${node} --genesis-hash ${status?.genesis_hash ?? "<genesis hash>"} --home ~/.blockula/${id}`;
+  return (
+    <section className="card stack landing-invite" id="invite" aria-labelledby="invite-title">
+      <h2 id="invite-title">Invite a friend</h2>
+      {shareable ? (
+        <>
+          <p>Send them this link. They make a wallet and can transact right away.</p>
+          <Command text={link} label="Copy link" />
+          {pickNode && (
+            <p className="dim small">
+              In the wallet&apos;s header they choose <b>Custom node</b> and enter <code>{node}</code>.
+            </p>
+          )}
+        </>
+      ) : (
+        <>
+          <p data-testid="invite-local">
+            This wallet runs at <code>{host}</code>, so a link to it opens only on this computer. A friend joins with their own node instead:
+          </p>
+          <Command text={INSTALL} />
+          <Command text={join} label="Copy join command" />
+          <p className="dim small">
+            Then they run the wallet against their node (<a href={LAUNCH_GUIDE}>Apps, in the launch guide</a>). Serve this wallet over HTTPS on your tailnet and this box becomes a link to share.
+          </p>
+        </>
+      )}
+      <details className="landing-more">
+        <summary>Make them a validator</summary>
+        <p className="dim small">On their machine: a validator home, a bond from the faucet, then start and register it.</p>
+        <Command text={`blockula validator init --home ~/.blockula/${id}-validator --genesis ${node} --genesis-hash ${status?.genesis_hash ?? "<genesis hash>"} --public-p2p-addr <their address>:30300 --public-http-addr http://<their address>:7070`} />
+        <Command text={`blockula wallet faucet --to <validator address> --rpc ${node}`} />
+        <Command text={`blockula run --home ~/.blockula/${id}-validator --bind 0.0.0.0`} />
+        <Command text={`blockula validator register --home ~/.blockula/${id}-validator --rpc ${node}`} />
+        <p className="dim small">Then you approve it, and it starts taking turns at the next epoch:</p>
+        <Command text={`blockula validator approve <validator address> --key ~/.blockula/${id}/validator.key --rpc http://localhost:7070`} />
+        <p className="dim small">
+          <code>~/.blockula/{id}/LAUNCH.md</code> on your machine has these with your addresses filled in.
+        </p>
+      </details>
+    </section>
+  );
+}
+
+/** The paste-in prompt for a coding agent, pinned to this chain (CLAUDE.md, "Contribute to Blockula"). */
+function Agent() {
+  const { status } = useWallet();
+  const prompt = agentPrompt(status ? { rpc: RPC, chainId: status.chain_id, genesisHash: status.genesis_hash, unit: status.token, name: status.name, faucet: status.faucet } : null);
+  return (
+    <section className="card stack" id="agent" aria-labelledby="agent-title">
+      <div className="row-between">
+        <h2 id="agent-title">For your coding agent</h2>
+        <Copy text={prompt} label="Copy prompt" />
+      </div>
+      <pre className="landing-prompt" data-testid="agent-prompt">{prompt}</pre>
+      {isLocalUrl(RPC) && <p className="dim small">From another computer, put your node&apos;s address in place of localhost.</p>}
+    </section>
   );
 }
