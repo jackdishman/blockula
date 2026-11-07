@@ -7,6 +7,7 @@ import { useProgramActivity } from "@/lib/explorer/useProgramActivity";
 import type { TxStatus } from "@/lib/explorer/types";
 import { Amount, Section, Stat, plural } from "./kit";
 import { Ledger } from "./Ledger";
+import { chainUnit } from "@/lib/format";
 
 export function ProgramActivity({ program }: { program: Program }) {
   const activity = useProgramActivity(program.calls);
@@ -25,7 +26,7 @@ export function ProgramActivity({ program }: { program: Program }) {
         <Stat v={activity.loading ? "…" : count("finalized")} k="finalized" />
         <Stat v={activity.loading ? "…" : count("pending")} k="pending" />
         <Stat v={activity.loading ? "…" : count("failed")} k="failed" />
-        <Stat v={activity.loading ? "…" : <Amount drops={fees} unit={false} />} k="fees charged · FANG" />
+        <Stat v={activity.loading ? "…" : <Amount drops={fees} unit={false} />} k={`fees charged · ${chainUnit()}`} />
       </div>
       <div className="activity-controls">
         <label className="activity-search">Search transactions

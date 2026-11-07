@@ -505,7 +505,7 @@ fn explorer_csp() -> &'static str {
 }
 
 /// Standard base64 with padding (RFC 4648), for the CSP hash.
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for c in bytes.chunks(3) {
@@ -716,7 +716,10 @@ pub fn router(node: Node) -> Router {
         .layer(axum::middleware::from_fn_with_state(node.clone(), limit_reads))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, node.timeout))
         .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(node);
+        .with_state(node)
+        // The passkey wallet (src/wallet.rs): files from memory, so outside the read limits (a
+        // first visit loads a few dozen), and not for other sites' scripts (no CORS).
+        .merge(crate::wallet::router(&crate::webapp::chain_name(&chain_genesis)));
     // Amounts in the chain's own ticker: only on a chain that has one, so a FANG chain's
     // responses stay byte for byte what they were.
     if crate::webapp::needs_relabel(&chain_genesis) {
@@ -982,6 +985,8 @@ async fn status(State(n): State<Node>) -> ApiResult {
         "epoch": epoch,
         "active_validators": st.active_sets.get(&epoch).map(|s| s.len()).unwrap_or(0),
         "faucet": g.faucet,
+        // The passkey wallet this node serves (src/wallet.rs), or null when built without it.
+        "wallet": crate::wallet::embedded().then(|| format!("{}/", crate::wallet::BASE)),
         "supply": st.supply.to_string(),
         "supply_display": fmt_fang(st.supply),
         "burned": st.burned.to_string(),

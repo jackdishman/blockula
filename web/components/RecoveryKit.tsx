@@ -1,10 +1,10 @@
 "use client";
 
 import { useState } from "react";
-import { explorer, NETWORK } from "@/lib/config";
+import { BASE_PATH, explorer, NETWORK } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { SAFETY } from "@/lib/onboarding-copy";
-import { shortAddr } from "@/lib/format";
+import { shortAddr, chainUnit } from "@/lib/format";
 import { confirmPositions, generateKit, KIT_LABEL, kitText, wordIndex, type Kit } from "@/lib/recovery";
 import type { TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
@@ -63,7 +63,7 @@ export function RecoveryKitSetup({
         network: NETWORK.label,
         chainId: status?.chain_id ?? client.pin.chainId ?? "",
         created: new Date().toISOString().slice(0, 10),
-        walletUrl: window.location.origin,
+        walletUrl: `${window.location.origin}${BASE_PATH}`,
       },
     });
   };
@@ -192,7 +192,7 @@ export function RecoveryKitSetup({
       <section className="card stack warn-card" data-testid="kit-pending">
         <h2>Kit saved, not active yet</h2>
         <p>
-          Adding the kit to your account is a transaction, and it needs a tiny fee. Once you have some FANG, activate it from <b>Devices &amp; agents → Recovery kit</b>. Until then the words can&apos;t open anything.
+          Adding the kit to your account is a transaction, and it needs a tiny fee. Once you have some {chainUnit()}, activate it from <b>Devices &amp; agents → Recovery kit</b>. Until then the words can&apos;t open anything.
         </p>
         {onFinish && <button className="btn primary" onClick={onFinish}>{finishLabel}</button>}
       </section>

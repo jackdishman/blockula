@@ -39,7 +39,8 @@ async fn serve_http(node: Node, bind: SocketAddr) {
         SocketAddr::V6(a) => format!("[{}]", a.ip()),
         SocketAddr::V4(a) => a.ip().to_string(),
     };
-    println!("🦇 Explorer:  http://{host}:{port}\n🔌 API:       http://{host}:{port}/api/status   (bound to {bind})\n📁 Data:      {}", home.display());
+    let wallet = if crate::wallet::embedded() { format!("http://{host}:{port}/wallet/") } else { "not built into this binary (npm run build:wallet, then rebuild)".into() };
+    println!("🦇 Explorer:  http://{host}:{port}\n👛 Wallet:    {wallet}\n🔌 API:       http://{host}:{port}/api/status   (bound to {bind})\n📁 Data:      {}", home.display());
     if let Err(e) = axum::serve(listener, api::router(node).into_make_service_with_connect_info::<SocketAddr>()).await {
         eprintln!("http server failed: {e}");
     }

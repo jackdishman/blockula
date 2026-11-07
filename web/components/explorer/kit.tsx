@@ -11,6 +11,7 @@ import { compactDrops, formatDrops, parseDrops, type Holding, type Me } from "@/
 import { to } from "@/lib/explorer/routes";
 import type { KeyView, Label } from "@/lib/types";
 import { useWallet } from "@/lib/wallet";
+import { chainUnit } from "@/lib/format";
 
 /**
  * Who "you" are, for writing pages from your side. Known from the unlocked account, or from the
@@ -109,7 +110,7 @@ export function Amount({ drops, signed = false, unit = true, exact = false, clas
     <span className={`amt ${signed ? "signed" : ""} ${className}`} title={formatDrops(d)}>
       {sign}
       {exact ? formatDrops(abs, "") : compactDrops(abs)}
-      {unit && <small>FANG</small>}
+      {unit && <small>{chainUnit()}</small>}
     </span>
   );
 }

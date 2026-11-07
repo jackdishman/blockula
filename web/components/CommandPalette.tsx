@@ -7,6 +7,7 @@ import { nodeGet } from "@/lib/explorer/node";
 import { searchHref, to } from "@/lib/explorer/routes";
 import type { NameDetail, SearchHit } from "@/lib/explorer/types";
 import { useWallet } from "@/lib/wallet";
+import { chainUnit } from "@/lib/format";
 
 interface Item {
   id: string;
@@ -103,7 +104,7 @@ export function CommandPalette() {
         const hit = await nodeGet<SearchHit>(`/search/${encodeURIComponent(raw.toLowerCase())}`);
         if (hit.type === "account") {
           out.push({ id: "acct", group: "On the chain", label: hit.id, hint: "account", href: searchHref(hit) });
-          if (known && /\.boo$/.test(hit.id)) out.push({ id: "pay", group: "Do", label: `Send FANG to ${hit.id}`, hint: "send", href: `/send?to=${encodeURIComponent(hit.id)}` });
+          if (known && /\.boo$/.test(hit.id)) out.push({ id: "pay", group: "Do", label: `Send ${chainUnit()} to ${hit.id}`, hint: "send", href: `/send?to=${encodeURIComponent(hit.id)}` });
           out.push({ id: "trace", group: "Do", label: `Follow the money around ${/\.boo$/.test(hit.id) ? hit.id : `${hit.id.slice(0, 12)}…`}`, hint: "trace", href: to.trace(hit.id) });
         } else if (hit.type === "name") {
           const n = await nodeGet<NameDetail>(`/name/${encodeURIComponent(hit.id)}`).catch(() => null);
@@ -131,7 +132,7 @@ export function CommandPalette() {
       ...(hint?.account ? [{ id: "home", group: "Wallet", label: "Wallet home", href: "/" }] : [{ id: "home", group: "Wallet", label: "Open the wallet", href: "/" }]),
       ...(known
         ? [
-            { id: "send", group: "Wallet", label: "Send FANG", href: "/send" },
+            { id: "send", group: "Wallet", label: `Send ${chainUnit()}`, href: "/send" },
             { id: "recv", group: "Wallet", label: "Receive", href: "/receive" },
             { id: "dev", group: "Wallet", label: "Devices & agents", href: "/devices" },
           ]

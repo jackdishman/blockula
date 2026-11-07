@@ -121,7 +121,9 @@ fn is_local(u: &reqwest::Url) -> bool {
 fn is_private(u: &reqwest::Url) -> bool {
     let h = host(u);
     let second = |p: &str| h.strip_prefix(p).and_then(|r| r.split('.').next()).and_then(|o| o.parse::<u8>().ok());
-    is_local(u) || h.starts_with("10.") || h.starts_with("192.168.") || second("172.").is_some_and(|o| (16..=31).contains(&o)) || [".internal", ".local", ".lan"].iter().any(|s| h.ends_with(s))
+    // 100.64.0.0/10 and `.ts.net` are Tailscale's: WireGuard-encrypted, tailnet members only.
+    let tailscale = second("100.").is_some_and(|o| (64..=127).contains(&o));
+    is_local(u) || h.starts_with("10.") || h.starts_with("192.168.") || second("172.").is_some_and(|o| (16..=31).contains(&o)) || tailscale || [".internal", ".local", ".lan", ".ts.net"].iter().any(|s| h.ends_with(s))
 }
 
 /// A node URL: http(s) without credentials, plain http only on this machine or a private
@@ -307,6 +309,7 @@ impl Remote {
             };
             bail!("Refusing {} ({} network): {why}. Nothing was signed or sent.{fix}", net.rpc, net.key.name());
         }
+        crate::types::set_display_unit(status["token"].as_str().unwrap_or_default());
         let full = complete_pin(&pin, &status);
         let (Some(chain_id), Some(genesis_hash)) = (full.chain_id.clone(), full.genesis_hash.clone()) else {
             bail!("{} didn't report its chain id and genesis hash; nothing was signed", net.rpc);
@@ -503,6 +506,16 @@ mod tests {
 
     fn status(chain_id: &str, genesis: &str, prefix: &str) -> Value {
         json!({ "chain_id": chain_id, "genesis_hash": genesis, "address_prefix": prefix, "height": 10 })
+    }
+
+    #[test]
+    fn plain_http_reaches_private_networks_and_tailscale_only() {
+        for ok in ["http://localhost:7070", "http://192.168.1.20:7070", "http://10.0.0.5:7070", "http://172.20.0.2:7070", "http://100.64.0.7:7070", "http://100.127.255.254:7070", "http://jacks-mac.tail1234.ts.net:7070", "http://box.lan:7070"] {
+            assert!(check_rpc_url(ok).is_ok(), "{ok}");
+        }
+        for no in ["http://100.63.0.1:7070", "http://100.128.0.1:7070", "http://8.8.8.8:7070", "http://rpc.example:7070", "http://ts.net.example:7070"] {
+            assert!(check_rpc_url(no).is_err(), "{no}");
+        }
     }
 
     #[test]

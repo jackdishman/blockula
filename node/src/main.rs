@@ -35,6 +35,7 @@ mod types;
 mod upgrade;
 mod validator_cli;
 mod view;
+mod wallet;
 mod webapp;
 
 #[cfg(test)]

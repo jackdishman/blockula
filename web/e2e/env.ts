@@ -31,3 +31,6 @@ export const MAINNET_GENESIS = /export const MAINNET_GENESIS_HASH: string \| und
 const clock = /export const MAINNET_GENESIS_CLOCK: GenesisClock \| undefined = \{ createdAtMs: (\d+), blockTimeMs: (\d+) \};/.exec(config);
 export const MAINNET_GENESIS_CLOCK = clock ? { createdAtMs: Number(clock[1]), blockTimeMs: Number(clock[2]) } : undefined;
 export const MAINNET_PORT = 3218;
+
+/** A real node serving its built-in wallet (e2e/served-node.sh, e2e/served.spec.ts; E2E_SERVED=1). */
+export const SERVED_PORT = 3219;

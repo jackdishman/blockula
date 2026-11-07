@@ -7,6 +7,7 @@ import { compactDrops } from "@/lib/explorer/ledger";
 import { to } from "@/lib/explorer/routes";
 import type { Edge, Trace, TraceNode } from "@/lib/explorer/trace";
 import { whoText } from "./kit";
+import { chainUnit } from "@/lib/format";
 
 const NODE_W = 176;
 const NODE_H = 56;
@@ -218,13 +219,13 @@ export function TraceGraph({
             const meta = n.holding
               ? "held by a program"
               : isRoot
-                ? bal != null ? `start · ${compactDrops(bal)} FANG` : "start here"
+                ? bal != null ? `start · ${compactDrops(bal)} ${chainUnit()}` : "start here"
                 : loading.has(n.id)
                   ? "following…"
                   : failed.has(n.id)
                     ? "couldn't load it"
                     : n.followed
-                      ? bal != null ? `${compactDrops(bal)} FANG` : "following"
+                      ? bal != null ? `${compactDrops(bal)} ${chainUnit()}` : "following"
                       : "follow its money →";
             const cls = ["tnode", isRoot ? "root" : "", n.followed ? "followed" : "", n.holding ? "holding" : "", hoverNode === n.id ? "hover" : "", n.id === me ? "mine" : ""].join(" ");
             const body = (
@@ -263,7 +264,7 @@ export function TraceGraph({
           })}
           {hovered && (
             <div className="tooltip" ref={cssVars({ "--x": hovered.mid.x, "--y": hovered.mid.y - hovered.w / 2 - 8 })}>
-              <b>{compactDrops(hovered.e.amount)} FANG</b>{" "}
+              <b>{compactDrops(hovered.e.amount)} {chainUnit()}</b>{" "}
               <span className="tl">
                 {whoText(at.get(hovered.e.from)?.n.who)} → {whoText(at.get(hovered.e.to)?.n.who)} · {hovered.e.txs.length} tx{hovered.e.txs.length === 1 ? "" : "s"}
               </span>

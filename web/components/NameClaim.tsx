@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import "@/app/onboarding.css";
 import { friendly } from "@/lib/errors";
 import type { NameDetail } from "@/lib/explorer/types";
-import { blocksToHuman } from "@/lib/format";
+import { blocksToHuman, chainUnit } from "@/lib/format";
 import { SAFETY } from "@/lib/onboarding-copy";
 import { useUnlocked } from "@/lib/wallet";
 import { ErrorNote, Spinner } from "./ui";
@@ -97,7 +97,7 @@ export function NameClaim({ onClaimed, onName, suggestion = "" }: { onClaimed: (
       </div>
       {short && view?.price && (
         <p className="warn">
-          You need {view.price_display} plus a small fee.{status?.faucet ? " Grab test FANG from the faucet first." : ""}
+          You need {view.price_display} plus a small fee.{status?.faucet ? ` Grab test ${chainUnit()} from the faucet first.` : ""}
         </p>
       )}
       {/* Prices are governance parameters: always the node's answer for this name, never a table. */}

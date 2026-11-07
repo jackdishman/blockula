@@ -14,7 +14,7 @@ import { submitTx } from "@/lib/explorer/node";
 import type { Preflight } from "@/lib/explorer/preflight";
 import { type ActionSpec, type Param, signature, type Values } from "@/lib/explorer/programs";
 import { to } from "@/lib/explorer/routes";
-import { shortAddr } from "@/lib/format";
+import { shortAddr, chainUnit } from "@/lib/format";
 import { hintAccount, openLocalKey, unlockPasskey } from "@/lib/keys";
 import { useWallet } from "@/lib/wallet";
 import { Amount, Term } from "./kit";
@@ -202,7 +202,7 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
               {p.type === "fang" || p.type === "days" || p.type === "years" ? (
                 <div className="suffix-input">
                   <input value={raw[p.key]} onChange={(e) => set(p.key, e.target.value)} onBlur={() => setTouched((t) => ({ ...t, [p.key]: true }))} placeholder={p.placeholder} inputMode={p.type === "fang" ? "decimal" : "numeric"} aria-label={p.label} />
-                  <span className="suffix">{p.type === "fang" ? "FANG" : p.type}</span>
+                  <span className="suffix">{p.type === "fang" ? chainUnit() : p.type}</span>
                 </div>
               ) : (
                 <input

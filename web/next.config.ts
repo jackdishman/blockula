@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { isNodeUrl, MAINNET_GENESIS_HASH, MAINNET_GENESIS_HASH_ENV, NETWORKS, rpIdProblem } from "./lib/config";
 import { STATIC_HEADERS } from "./lib/csp";
@@ -22,6 +23,42 @@ if (process.env.NEXT_PUBLIC_NETWORK === "mainnet") {
   if (problems.length) throw new Error(`Refusing to build the mainnet wallet: ${problems.join("; ")}.`);
 }
 
+/**
+ * `BLOCKULA_SERVED=1` (`npm run build:wallet`): the wallet every node serves at `/wallet/`, a
+ * static export into `out/` that the node binary embeds (node/build.rs, node/src/wallet.rs).
+ * No server runs it, so there's no proxy.ts (the node sets the CSP, hashing the page's inline
+ * scripts) and no headers() (the node sends them); it reads its node, chain and passkey domain
+ * from the page's location at runtime (lib/config.ts `servedConfig`).
+ */
+const SERVED = process.env.BLOCKULA_SERVED === "1";
+if (SERVED && process.env.NEXT_PUBLIC_NETWORK === "mainnet") throw new Error("The served wallet is for the chain of whichever node serves it; it can't be a mainnet build.");
+
+const served: NextConfig = {
+  output: "export",
+  basePath: "/wallet",
+  // Every page is a directory with an index.html (and its RSC payloads beside it), which the
+  // node maps a dynamic route's id onto (`app/tx/[id]` → `tx/_/`).
+  trailingSlash: true,
+  // The export (in this mode distDir is where it goes): web/out, which node/build.rs embeds.
+  distDir: "out",
+  env: { NEXT_PUBLIC_BLOCKULA_SERVED: "1" },
+  // The build id is in every page, and Next makes a random one. The commit's makes the export the
+  // same bytes on every machine, so a release binary that embeds it rebuilds bit for bit.
+  generateBuildId: () => servedBuildId(),
+  // One page at a time, so how each page's inline data is cut into scripts doesn't depend on
+  // the machine's load.
+  experimental: { sri: { algorithm: "sha384" }, cpus: 1, staticGenerationMaxConcurrency: 1 },
+};
+
+function servedBuildId(): string {
+  if (process.env.BLOCKULA_GIT_SHA) return process.env.BLOCKULA_GIT_SHA;
+  try {
+    return execFileSync("git", ["rev-parse", "--short=12", "HEAD"], { encoding: "utf8" }).trim();
+  } catch {
+    return "wallet";
+  }
+}
+
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
@@ -39,4 +76,4 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default nextConfig;
+export default SERVED ? { ...nextConfig, headers: undefined, ...served } : nextConfig;

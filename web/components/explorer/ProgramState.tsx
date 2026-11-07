@@ -6,7 +6,7 @@ import { compactDrops, parseDrops } from "@/lib/explorer/ledger";
 import { useNode } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
 import type { ChainStatus, ClaimView, ContributionsView, HuntsView, NameDetail, SoulRow, ValidatorRow, ValidatorsDetail } from "@/lib/explorer/types";
-import { isKeyId } from "@/lib/format";
+import { isKeyId, chainUnit } from "@/lib/format";
 import { Bars, Meter } from "./charts";
 import { Fang, plural, Section, Stat, StatusPill, Term, useMe, Who } from "./kit";
 
@@ -29,7 +29,7 @@ function HuntsState() {
   return (
     <>
       <div className="figures">
-        <Stat v={<>{compactDrops(escrow)}<small>FANG</small></>} k={<Term k="escrow">in escrow</Term>} />
+        <Stat v={<>{compactDrops(escrow)}<small>{chainUnit()}</small></>} k={<Term k="escrow">in escrow</Term>} />
         <Stat v={open.length} k="open hunts" />
         <Stat v={(all.data?.hunts ?? []).filter((h) => h.status === "awarded").length} k="awarded" />
         <Stat v={new Set(open.flatMap((h) => h.funders.map((f) => f.account.address))).size} k="funders" />
@@ -54,7 +54,7 @@ function HuntsState() {
               value: Number(parseDrops(h.amount) / 1_000_000n) / 1000,
               note: `${h.amount_display} from ${plural(h.funders.length, "funder")}`,
             }))}
-            format={(v) => `${v.toLocaleString("en-US")} FANG`}
+            format={(v) => `${v.toLocaleString("en-US")} ${chainUnit()}`}
           />
         ) : (
           <p className="ledger-empty">No {status} hunts.</p>

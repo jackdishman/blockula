@@ -4,7 +4,7 @@
  * labels and agent budgets. Every class is prefixed onb-.
  */
 
-/* "How FANG reaches you": a left-aligned card even inside a centered step. */
+/* "How coins reach you": a left-aligned card even inside a centered step. */
 .onb-card { text-align: left; align-self: stretch; }
 .onb-card h2 { margin-bottom: 4px; }
 .onb-list { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 8px; color: var(--ink-soft); font-size: 17px; }

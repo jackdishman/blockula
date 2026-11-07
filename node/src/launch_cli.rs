@@ -146,6 +146,11 @@ impl Plan {
         format!("http://localhost:{}", chain::SUMMON_HTTP_PORT)
     }
 
+    /// The passkey wallet the node serves (src/wallet.rs), for this machine's browser.
+    pub fn wallet_url(&self) -> String {
+        format!("{}/wallet/", self.local_url())
+    }
+
     /// The node's URL for the others.
     pub fn shared_url(&self) -> Option<String> {
         self.host.as_ref().map(|h| chain::http_url(&format!("{}:{}", if h.contains(':') { format!("[{h}]") } else { h.clone() }, chain::SUMMON_HTTP_PORT)))
@@ -180,6 +185,7 @@ impl Plan {
         if self.https {
             out.push(("HTTPS", "on your tailnet, with tailscale serve".into()));
         }
+        out.push(("Wallet", if self.https { format!("{}, and for friends at https://<this machine>.<your tailnet>.ts.net/wallet/", self.wallet_url()) } else { self.wallet_url() }));
         out
     }
 }
@@ -476,20 +482,37 @@ pub fn guide(plan: &Plan, g: &Genesis, home: &Path, genesis_hash: &str, https_ur
     if let Some(u) = https_url {
         s += &format!("\n- HTTPS on your tailnet: {u}");
     }
+    s += &format!("\n- Wallet: {}", plan.wallet_url());
+    if let Some(u) = https_url {
+        s += &format!(" (friends: {u}/wallet/)");
+    } else if let Some(u) = plan.shared_url() {
+        s += &format!(" (others: {u}/wallet/)");
+    }
     s += &format!("\n- Your validator's account: `{}`\n\n", g.validators[0].address);
     s += &format!("## Start it again\n\n```sh\n{}\n```\n\n", plan.run_command(home));
     s += "Back up `validator.key` in this folder: whoever holds it is your validator. Never run two copies of it.\n\n";
+    // The one link friends need: the wallet this node serves.
+    s += "## Invite friends\n\n";
+    match (https_url, plan.shared_url()) {
+        (Some(u), _) => s += &format!("Send them {u}/wallet/. They open it on a phone or laptop, make a wallet with a passkey{} and can pay right away. Nothing to install.\n\n", if plan.faucet { ", take coins from the faucet" } else { "" }),
+        (None, Some(u)) => s += &format!(
+            "Send them {u}/wallet/. It opens in any browser, but over plain http browsers won't make passkeys (it offers a browser-only key for testing). For passkeys, serve it over HTTPS: on Tailscale, `tailscale serve --bg {port}` (turn on HTTPS certificates in the Tailscale admin console first), then send https://<this machine>.<your tailnet>.ts.net/wallet/.\n\n",
+            port = chain::SUMMON_HTTP_PORT
+        ),
+        (None, None) => s += &format!("The wallet is at {}, on this machine only: this chain is reached from this machine alone. Launch one with `--reach tailscale` (or `home`) to share it.\n\n", plan.wallet_url()),
+    }
     if let Some(u) = plan.shared_url() {
         s += &format!(
-            "## Friends join\n\nThey install Blockula, then run:\n\n```sh\ncurl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh\nblockula join --genesis {u} --genesis-hash {genesis_hash} --home ~/.blockula/{id}\n```\n\nTheir node checks every block, and its explorer is at http://localhost:7171. To make them a validator, follow step 4 of https://github.com/jackdishman/blockula/blob/main/docs/LAUNCH.md and approve them with:\n\n```sh\nblockula validator approve <their validator address> --key {key} --rpc {local}\n```\n\n",
+            "## Friends run their own node\n\nThey install Blockula, then run:\n\n```sh\ncurl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh\nblockula join --genesis {u} --genesis-hash {genesis_hash} --home ~/.blockula/{id}\n```\n\nTheir node checks every block, and its explorer is at http://localhost:7171. To make them a validator, follow step 4 of https://github.com/jackdishman/blockula/blob/main/docs/LAUNCH.md and approve them with:\n\n```sh\nblockula validator approve <their validator address> --key {key} --rpc {local}\n```\n\n",
             id = g.chain_id,
             key = display_home(&home.join("validator.key")),
             local = plan.local_url(),
         );
     }
     s += &format!(
-        "## Apps\n\n- **Explorer:** every node serves one. On a Mac, open it in Safari and choose File > Add to Dock. On an iPhone or iPad, open it in Safari and choose Share > Add to Home Screen. It installs as \"{}\".\n- **Wallet:** passkey wallets in the browser. With Node.js 20 or later: `git clone --depth 1 https://github.com/jackdishman/blockula && cd blockula && npm ci && npm run wallet`, then open http://localhost:3000 (it talks to the node on this machine).\n- **Agents:** `claude mcp add blockula -- npx -y @blockula/mcp` (it uses the node at http://localhost:7070).\n",
-        plan.name
+        "## Apps\n\n- **Explorer:** every node serves one. On a Mac, open it in Safari and choose File > Add to Dock. On an iPhone or iPad, open it in Safari and choose Share > Add to Home Screen. It installs as \"{}\".\n- **Wallet:** every node serves a passkey wallet at /wallet/ ({wallet} here). It talks to the node that serves it, so a friend's own node serves them one too. Passkeys need HTTPS (or localhost).\n- **Agents:** `claude mcp add blockula -- npx -y @blockula/mcp` (it uses the node at http://localhost:7070).\n",
+        plan.name,
+        wallet = plan.wallet_url(),
     );
     s
 }
@@ -554,11 +577,22 @@ pub fn launch(a: &LaunchArgs) -> Result<Launched> {
 
     println!("\n🪦 {} is summoned ({}).", plan.name, plan.token);
     println!("   Explorer:      {}", plan.local_url());
-    if let Some(u) = plan.shared_url() {
-        println!("   For friends:   blockula join --genesis {u} --genesis-hash {hash} --home ~/.blockula/{}", plan.chain_id);
+    if crate::wallet::embedded() {
+        println!("   Wallet:        {}", plan.wallet_url());
+    } else {
+        println!("   Wallet:        not built into this binary (npm run build:wallet, then rebuild; releases have it)");
     }
     if let Some(u) = &https {
         println!("   HTTPS:         {u}  (anyone on your tailnet)");
+    }
+    // The one link to send: the wallet, where friends' browsers make passkeys.
+    match (&https, plan.shared_url()) {
+        (Some(u), _) => println!("   Send friends:  {u}/wallet/"),
+        (None, Some(u)) => println!("   Send friends:  {u}/wallet/  (plain http: for passkeys, serve it over HTTPS with `tailscale serve --bg {}`)", chain::SUMMON_HTTP_PORT),
+        (None, None) => {}
+    }
+    if let Some(u) = plan.shared_url() {
+        println!("   Their own node: blockula join --genesis {u} --genesis-hash {hash} --home ~/.blockula/{}", plan.chain_id);
     }
     println!("   Start again:   {}", plan.run_command(&home));
     println!("   Everything else (apps, adding validators): {}", display_home(&home.join("LAUNCH.md")));
@@ -689,6 +723,14 @@ mod tests {
             assert!(guide.contains(&want), "{want}: {guide}");
         }
         assert!(plan.summary().iter().any(|(k, v)| *k == "Validator bond" && v == "500 JACK"));
+        // The wallet every node serves: the one link friends get.
+        assert!(guide.contains("- Wallet: http://localhost:7070/wallet/ (friends: https://box.tail1234.ts.net/wallet/)"), "{guide}");
+        assert!(guide.contains("Send them https://box.tail1234.ts.net/wallet/."), "{guide}");
+        let plain = super::guide(&plan, &g, &home, &hash, None);
+        assert!(plain.contains("Send them http://100.64.0.7:7070/wallet/") && plain.contains("tailscale serve --bg 7070"), "{plain}");
+        assert!(plan.summary().iter().any(|(k, v)| *k == "Wallet" && v == "http://localhost:7070/wallet/"));
+        let https = Plan { https: true, ..plan };
+        assert!(https.summary().iter().any(|(k, v)| *k == "Wallet" && v.contains("ts.net/wallet/")));
         std::fs::remove_dir_all(home).ok();
     }
 }

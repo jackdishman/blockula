@@ -2,16 +2,34 @@
 
 Humans and agents are both welcome. Agents contribute as **Familiars** of a human sponsor, who is accountable for their work and receives their rewards (see "Proof of Contribution" in [docs/PLAN.md](docs/PLAN.md)).
 
-> FANG, Hunts and Soul have no value. Hunts and the contribution pool below are on-chain: they ran on the public testnet (`blockula-testnet-2`) until it was retired in November 2026, and no public chain runs them now. Until one does, PRs are reviewed and merged as usual, without on-chain rewards.
+## Start in two minutes
 
-## Hunts: bounties with acceptance criteria
+**With a coding agent.** Paste this into Claude Code (or any agent that runs shell commands) in an empty folder:
+
+> Contribute to Blockula (https://github.com/jackdishman/blockula). Clone it, read AGENTS.md and CONTRIBUTING.md, run `npm ci && npm run build`, and start a local chain with `blockula dev` (or `node/target/release/blockula dev`). Pick an open issue labeled `good first issue` or `familiar-friendly` (`gh issue list --repo jackdishman/blockula --label familiar-friendly`), or ask me what to work on. Make one focused change with tests, run what CONTRIBUTING.md's "What to run" table says for the parts you touched, and open a PR that references the issue and explains how you verified it. One solid PR beats many small ones.
+
+**By hand.**
+
+```bash
+git clone https://github.com/jackdishman/blockula && cd blockula
+npm ci && npm run build      # the node (Rust), the SDK, the MCP server and the wallet
+blockula dev                 # or node/target/release/blockula dev: a throwaway chain at http://localhost:7070
+```
+
+Then pick an issue (`good first issue`, `familiar-friendly`, or anything in [the tracker](https://github.com/jackdishman/blockula/issues)), make the change, and run the checks for what you touched ([What to run](#what-to-run)). No Rust toolchain? Web, SDK and MCP work runs against the release binary (`curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh`).
+
+## On-chain rewards (on chains that run them)
+
+FANG, Hunts and Soul have no value. Hunts and the contribution pool are chain features: any chain can run them for its own repos ([docs/BUILD-ON-IT.md](docs/BUILD-ON-IT.md#7-contributors-paste-this-into-your-coding-agent) has the prompt for a chain someone launched). Blockula's own repo isn't paid on any chain right now (the public testnet that ran them, `blockula-testnet-2`, was retired in November 2026), so its PRs are reviewed and merged as usual.
+
+### Hunts: bounties with acceptance criteria
 - Open Hunts are GitHub issues labeled [`hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt). Each has objective acceptance criteria, and a FANG bounty escrowed on a chain that runs Hunts.
 - `familiar-friendly` marks Hunts specified tightly enough for an agent to finish end to end.
-- **To claim one:** comment on the issue, link your GitHub handle to your Blockula account (`link_github`, with a public gist containing your `tboo1…` address), and open a PR that references the issue and meets every acceptance criterion.
+- **To claim one:** comment on the issue, link your GitHub handle to your Blockula account (`link_github`, with a public gist containing your account's address), and open a PR that references the issue and meets every acceptance criterion.
 - **Payout:** when the PR merges, the Hunt's creator awards it on-chain (`blockula hunt award <id> --pr <n>` checks the merge on GitHub and pays the account you linked), and the explorer shows it on your profile.
 
-## The contribution pool: any merged PR
-On a chain whose contribution pool lists the repo (Blockula's own was first on testnet-2), merged PRs can earn FANG even without a Hunt:
+### The contribution pool: any merged PR
+On a chain whose contribution pool lists the repo, merged PRs can earn FANG even without a Hunt:
 1. Link your GitHub handle, then claim the merged PR: `blockula contrib claim jackdishman/blockula <pr>`, `wallet.submitClaim(...)`, or the MCP's `submit_contribution`. It costs a small refundable bond and needs **Soul** or a **vouch** from someone who has it. (New here? Ask for a vouch with the [vouch form](https://github.com/jackdishman/blockula/issues/new?template=vouch-request.yml).)
 2. Validators check GitHub: the PR must be merged into the default branch and authored by your linked handle. After a revert window, the next **Séance** judges it: a random jury compares claims in pairs.
 3. Your claims are scored against other people's, and all your claims in one Séance share one win rate, pooled over all their comparisons: the first counts in full at that rate, each next one a quarter of the one before (all of them together less than 4/3 of one), so one solid PR beats a pile of tiny ones, weak claims pull your rate down, and claims a jury marks as spam lose their bond and your Soul. Rewards vest over ~90 days and can be clawed back if the PR is reverted.

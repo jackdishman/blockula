@@ -6,7 +6,7 @@ import { ChainGate } from "@/components/ChainGate";
 import { Haunt, MotionToggle } from "@/components/Haunt";
 import { Header } from "@/components/Header";
 import { Ornament } from "@/components/Ornament";
-import { IS_MAINNET_BUILD } from "@/lib/config";
+import { IS_MAINNET_BUILD, SERVED } from "@/lib/config";
 import { WalletProvider } from "@/lib/wallet";
 import "./globals.css";
 
@@ -27,7 +27,8 @@ export const viewport: Viewport = { themeColor: "#ece3cd", width: "device-width"
 
 export default async function RootLayout({ children }: { children: ReactNode }) {
   // Render per request: the CSP nonce (proxy.ts) is new on every response, so no page is static.
-  await connection();
+  // The served wallet is a static export instead, whose CSP hashes its inline scripts (node/src/wallet.rs).
+  if (!SERVED) await connection();
   return (
     <html lang="en" className={`${fell.variable} ${fellSc.variable} ${garamond.variable} ${courier.variable} ${fraktur.variable}`}>
       <body>

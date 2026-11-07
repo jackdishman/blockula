@@ -64,7 +64,7 @@ function useRecipient(input: string): Recipient {
     // This chain's address prefix (DEC-7): another network's address is refused, never "converted".
     const hrp = client.pin.prefix ?? MAINNET_PREFIX;
     const prefix = q.match(/^([a-z]+)1[a-z0-9]{40,}$/)?.[1];
-    if (prefix && prefix !== hrp) return setR({ state: "bad", msg: `That's an address on another network (${prefix}1…). ${NETWORK.label} addresses start with ${hrp}1.` });
+    if (prefix && prefix !== hrp) return setR({ state: "bad", msg: `That's an address on another network (${prefix}1…). Addresses on ${NETWORK.label} start with ${hrp}1.` });
     if (q.startsWith(`${hrp}1`)) {
       if (!isAddress(q)) return setR({ state: "bad", msg: "That address doesn't look right. Check for typos." });
       const label = status?.validator.address === q ? "the validator" : "an address";

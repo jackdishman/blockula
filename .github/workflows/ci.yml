@@ -54,6 +54,8 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22, cache: npm }
       - run: npm ci
+      # The wallet nodes serve at /wallet/ (web/out), built into every binary below as releases are.
+      - run: npm run build:wallet
       - run: cargo test --release --locked --manifest-path node/Cargo.toml
       # The v1 replay gate (docs/REPLAY.md): this PR's binary replays the recorded v1 history in
       # node/testdata/replay through sync and startup, block by block (every certificate, cited
@@ -63,6 +65,12 @@ jobs:
         run: |
           cargo build --release --locked --manifest-path node/Cargo.toml
           for archive in node/testdata/replay/v1-*; do node/target/release/blockula replay "$archive"; done
+      # That binary's /wallet/ on a fresh named chain: passkey onboarding, faucet, a name, a
+      # payment, client-side navigation and the node's CSP (web/e2e/served.spec.ts).
+      - name: Served wallet e2e (the node's /wallet/, Playwright)
+        run: |
+          npx playwright install --with-deps chromium
+          E2E_SERVED=only npm run test:e2e -w @blockula/web
       # Hybrid X25519 + ML-KEM-768 p2p handshake (vendored commonware-stream, docs/PQ-TRANSPORT.md).
       - run: cargo test --release --locked --manifest-path node/Cargo.toml -p commonware-stream
       - run: bash node/vendor/commonware-stream/verify-vendor.sh

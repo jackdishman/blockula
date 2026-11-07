@@ -95,9 +95,16 @@ function saveClock(chainId: string, genesisHash: string, c: GenesisClock) {
   }
 }
 
+/**
+ * Networks pinned on first use and remembered per node URL: a custom node, and the node that
+ * served this wallet (config.ts `SERVED`: the code came from it, so its first answer is trusted
+ * as far as the code is).
+ */
+export const remembersPin = (net: Network) => net.key === "custom" || net.key === "served";
+
 /** The pin to start from for a network: its configured chain, or a custom node's remembered one. */
 export function initialPin(net: Network): ChainPin {
-  if (net.key === "custom") return (typeof window !== "undefined" && savedCustomPin(net.rpc)) || {};
+  if (remembersPin(net)) return (typeof window !== "undefined" && savedCustomPin(net.rpc)) || {};
   return { chainId: net.chainId, genesisHash: net.genesisHash, prefix: net.prefix };
 }
 
@@ -184,7 +191,7 @@ export function networkClient() {
     NETWORK.rpc.replace(/\/$/, ""),
     initialPin(NETWORK),
     (pin) => {
-      if (NETWORK.key === "custom") saveCustomPin(NETWORK.rpc, pin);
+      if (remembersPin(NETWORK)) saveCustomPin(NETWORK.rpc, pin);
     },
     NETWORK.witnesses ?? [],
     NETWORK.genesisClock,

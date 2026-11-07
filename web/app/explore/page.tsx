@@ -63,7 +63,7 @@ export default function ExplorePage() {
           <p className="dim">
             {(status.error ?? error)?.message}.{" "}
             {/* `blockula dev` only helps a local node; anywhere else the node or the network is down. */}
-            {NETWORK.key === "local" ? <>Start a local node with <code>blockula dev</code>, or pick another network at the top.</> : "Try again in a minute, or pick another node at the top."}
+            {NETWORK.key === "served" ? "The node that serves this wallet isn&apos;t answering. Check it&apos;s still running, then reload." : NETWORK.key === "local" ? <>Start a local node with <code>blockula dev</code>, or pick another network at the top.</> : "Try again in a minute, or pick another node at the top."}
           </p>
         </section>
       </main>

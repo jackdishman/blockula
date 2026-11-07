@@ -670,7 +670,7 @@ fn create_lines(c: &CreateCost) -> Vec<String> {
         format!("   deposit {} for the record (bonded, and v0 has no way to take it back){}", fmt_fang(c.record_deposit), if c.init { "; the initializer's writes bond more, up to --storage-limit" } else { "" }),
     ];
     out.push(match c.opening {
-        Opening::Adopted => "   FANG sent to that address already opened its account, which the create adopts: no creation fee burns".to_string(),
+        Opening::Adopted => format!("   {} sent to that address already opened its account, which the create adopts: no creation fee burns", crate::types::display_unit()),
         Opening::Burns(0) => "   this chain charges no account creation fee for opening the program's account".to_string(),
         Opening::Burns(fee) => format!("   opening the program's account burns {} too (the account creation fee: gone for good, not a deposit)", fmt_fang(fee)),
     });
@@ -718,7 +718,7 @@ fn call(dir: &Path, a: CallArgs, signer: &Signer) -> Result<()> {
             Some("view") => bail!("{:?} is a view: read it with `blockula program view {address} {}` (a transaction can't call it)", a.method, a.method),
             _ => bail!("{:?} is the program's initializer, which runs only when it's created", a.method),
         }
-        ensure!(value == 0 || method["payable"] == true, "{:?} isn't payable, so the call can't send it FANG", a.method);
+        ensure!(value == 0 || method["payable"] == true, "{:?} isn't payable, so the call can't send it {}", a.method, crate::types::display_unit());
         let mut declared = std::collections::BTreeMap::new();
         if let (Some(hash), Some(size)) = (record["code"]["wasm_hash"].as_str(), record["code"]["size"].as_u64()) {
             declared.insert(hash.to_string(), size as usize);
@@ -744,7 +744,7 @@ fn call(dir: &Path, a: CallArgs, signer: &Signer) -> Result<()> {
 fn call_lines(address: &str, version_digest: &str, fee: u64, reserved: u64, storage_limit_given: bool) -> Vec<String> {
     let mut out = vec![format!("calling {address} at version {version_digest}"), format!("   fees at most {} ({reserved} fuel reserved: unused fuel isn't refunded; --fuel lowers it)", fmt_fang(fee))];
     if !storage_limit_given {
-        out.push("   storage limit 0: this call can't bond new storage; if the method writes, pass --storage-limit FANG (a call that traps on it still pays its fee)".to_string());
+        out.push(format!("   storage limit 0: this call can't bond new storage; if the method writes, pass --storage-limit {} (a call that traps on it still pays its fee)", crate::types::display_unit()));
     }
     out
 }
@@ -823,7 +823,7 @@ fn outcome_words(o: &Value) -> String {
         Some("aborted") => format!("program {program} aborted with code {}{}", o["abort_code"], o["untrusted_message"].as_str().filter(|m| !m.is_empty()).map(|m| format!(" and the message {m:?} (the program's words)")).unwrap_or_default()),
         Some("commit") => format!("the changes failed the chain's own commit checks (commit error {})", o["commit_error"]),
         Some("value_cap") => format!("programs would hold more than the value cap ({} drops)", o["cap"].as_str().unwrap_or("?")),
-        Some("exit_only") => "programs are exit-only: a call may not put more FANG under programs' control".into(),
+        Some("exit_only") => format!("programs are exit-only: a call may not put more {} under programs' control", crate::types::display_unit()),
         Some("storage_limit") => "the deposits passed --storage-limit".into(),
         Some("state_full") => "program state is full".into(),
         Some("invalid_code") => format!("the code was refused: validation rule {} ({})", o["rule"]["number"], o["rule"]["name"].as_str().unwrap_or("?")),
@@ -944,7 +944,7 @@ fn pause_cmd(dir: &Path, key: &Path, yes: bool, rpc: &str, pin: &ChainPin) -> Re
         let needed = crate::ghost::pause_threshold(active.len());
         let live = facts.votes.iter().filter(|(v, at)| active.contains(&v.as_str()) && height < at.saturating_add(spans.vote_blocks)).count();
         let days = |blocks: u64| blocks / crate::params::blocks_per_day(genesis.block_time_ms).max(1);
-        println!("A pause stops new program transactions (uploads, creates and calls, the ones that withdraw FANG too) for {} days ({} blocks) from the block after enough validators have signed: {needed} of the {} in the active set. It moves no funds, ends on its own, and has no undo. Views and plain transfers to accounts that aren't programs go on.", days(spans.pause_blocks), spans.pause_blocks, active.len());
+        println!("A pause stops new program transactions (uploads, creates and calls, the ones that withdraw {} too) for {} days ({} blocks) from the block after enough validators have signed: {needed} of the {} in the active set. It moves no funds, ends on its own, and has no undo. Views and plain transfers to accounts that aren't programs go on.", crate::types::display_unit(), days(spans.pause_blocks), spans.pause_blocks, active.len());
         match section["status"].as_str() {
             Some("paused") => println!("Programs are paused now, until block {}: a signature now counts toward renewing it.", section["paused_until"]),
             Some("exit_only") => println!("Programs are exit-only (switched off by governance): a pause is still possible."),

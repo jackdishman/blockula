@@ -137,7 +137,8 @@ const isLocalUrl = (u: string) => {
 const isPrivateUrl = (u: string) => {
   if (isLocalUrl(u)) return true;
   const h = new URL(u).hostname;
-  return /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h) || /\.(internal|local|lan)$/.test(h);
+  // 100.64.0.0/10 and .ts.net are Tailscale's: WireGuard-encrypted, tailnet members only.
+  return /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(h) || /\.(internal|local|lan|ts\.net)$/.test(h);
 };
 
 /**

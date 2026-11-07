@@ -823,7 +823,7 @@ pub enum WalletCmd {
         #[arg(long, default_value = "http://localhost:7070")]
         rpc: String,
     },
-    /// Send FANG to a boo1… address or a .boo name
+    /// Send coins (in the chain's unit) to a boo1… address or a .boo name
     Send {
         to: String,
         /// Amount in FANG, e.g. 1.5
@@ -847,7 +847,7 @@ pub enum WalletCmd {
         #[command(flatten)]
         pin: ChainPin,
     },
-    /// Testnets: get 100 FANG from the faucet
+    /// Get 100 coins from the chain's faucet (chains launched with one)
     Faucet {
         #[arg(long, default_value = "http://localhost:7070")]
         rpc: String,

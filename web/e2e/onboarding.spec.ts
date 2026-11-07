@@ -9,7 +9,7 @@ import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
 
 /** Words the wallet no longer says: absolute quantum claims, FANG as a currency, a mainnet to come. */
 const OVERCLAIMS = /quantum-safe|Safe from tomorrow|Blockula's currency|mainnet/i;
-const NO_VALUE = "FANG has no value: nobody sells it, buys it or gets paid in it.";
+const NO_VALUE = "These coins have no value: nobody sells them, buys them or gets paid in them.";
 
 async function introAndCreate(page: Page) {
   await page.goto("/welcome");
@@ -24,7 +24,7 @@ test("a faucet chain: FANG is said to have no value, and the story makes no abso
   await watchCsp(page);
   await page.goto("/welcome");
   // Chapter I doesn't claim "many computers", or one Blockula blockchain: each chain is its own.
-  await expect(page.locator(".chapter-body")).toContainText("Your FANG lives on a Blockula chain, a shared ledger kept by its validators.");
+  await expect(page.locator(".chapter-body")).toContainText("Your coins live on a Blockula chain, a shared ledger kept by its validators.");
   await expect(page.locator("main")).not.toContainText(OVERCLAIMS);
   await introAndCreate(page);
   await expect(page.getByRole("heading", { name: "100 FANG landed!" })).toBeVisible();
@@ -39,7 +39,7 @@ test("a faucet chain: FANG is said to have no value, and the story makes no abso
   await page.getByRole("button", { name: "Skip for now" }).click();
   await expect(page.getByRole("heading", { name: "Your wallet is ready" })).toBeVisible();
   await expect(page.getByText("Your account signs with ML-DSA-65, a post-quantum signature standard.")).toBeVisible();
-  // A faucet chain needs no "How FANG reaches you".
+  // A faucet chain needs no "How coins reach you".
   await expect(page.getByTestId("first-fang")).toHaveCount(0);
   await expect(page.locator("main")).not.toContainText(OVERCLAIMS);
   await page.getByRole("button", { name: "Open my wallet" }).click();
@@ -59,7 +59,7 @@ test("a chain without a faucet: no faucet copy, the name waits, and onboarding s
   await expect(page.locator("main")).not.toContainText(/faucet/i);
   await page.getByRole("button", { name: "Skip for now" }).click();
   const card = page.getByTestId("first-fang");
-  await expect(card.getByRole("heading", { name: "How FANG reaches you" })).toBeVisible();
+  await expect(card.getByRole("heading", { name: "How coins reach you" })).toBeVisible();
   await expect(card.locator("li")).toHaveText(["Someone sends it to you. Share your address or its QR code from Receive. Open Receive", "This chain has no faucet.", NO_VALUE]);
   await expect(card.getByRole("link", { name: "Open Receive" })).toHaveAttribute("href", "/receive");
   // Nothing to buy, no other network to go to, no promise.

@@ -6,7 +6,9 @@ import { BRAND, FIRST_FANG } from "./onboarding-copy";
  * node; anywhere else it's the node or the network that's down.
  */
 export const unreachableHint = () =>
-  NETWORK.key === "local"
+  NETWORK.key === "served"
+    ? "The node that serves this wallet isn't answering: check it's still running, then reload."
+    : NETWORK.key === "local"
     ? "Start a local node with `blockula dev`, or pick another network in the menu at the top."
     : "Try again in a minute, or pick another node in the menu at the top.";
 

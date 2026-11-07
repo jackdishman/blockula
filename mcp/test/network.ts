@@ -19,7 +19,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { MAINNET_CHAIN_ID, RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
-import { BLOCKULA_1, KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, canonicalUrl, completePin, defaultWitnesses, effectivePin, mismatch, networkArg, networkLabel, resolveNetwork, unpinnedBlockula1, unusableChain } from "../src/network.js";
+import { BLOCKULA_1, KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, canonicalUrl, checkRpcUrl, completePin, defaultWitnesses, effectivePin, mismatch, networkArg, networkLabel, resolveNetwork, unpinnedBlockula1, unusableChain } from "../src/network.js";
 import { RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
 
 const G1 = "11".repeat(32);
@@ -112,6 +112,8 @@ assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171"
 assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }), "blockula-dev"), "local dev node");
 assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "testnet"]), "blockula-testnet-2"), "testnet");
 for (const [env, argv, re] of refusals) assert.throws(() => resolveNetwork(env, argv), re, JSON.stringify([env, argv]));
+for (const ok of ["http://localhost:7070", "http://192.168.1.20:7070", "http://10.0.0.5:7070", "http://100.64.0.7:7070", "http://100.127.255.254:7070", "http://jacks-mac.tail1234.ts.net:7070"]) assert.doesNotThrow(() => checkRpcUrl(ok), ok);
+for (const no of ["http://100.63.0.1:7070", "http://100.128.0.1:7070", "http://8.8.8.8:7070", "http://ts.net.example:7070"]) assert.throws(() => checkRpcUrl(no), /must use https/, no);
 console.log("✓ the network comes from the configuration only (default: a local dev node; the retired testnet takes BLOCKULA_RPC); a node is one node however its URL is spelled");
 
 // ---- 2. pins ----

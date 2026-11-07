@@ -1010,7 +1010,7 @@ pub fn stake(cmd: StakeCmd, dir: &Path) -> Result<()> {
         StakeCmd::Undelegate { validator, shares: Unbonding { amount: Some(amount), .. }, signer } => {
             let amount = parse_fang(&amount)?;
             if amount == 0 {
-                bail!("undelegate more than 0 FANG");
+                bail!("undelegate more than 0 {}", crate::types::display_unit());
             }
             submit(dir, &signer, Action::Undelegate { validator, shares: 0, amount }).map(|_| ())
         }

@@ -6,6 +6,8 @@
 #   blockula-<target>.tar.gz   one per release target. The Linux ones are rebuilt bit for bit by
 #                              scripts/reproduce-release.sh (two builders); the macOS ones only
 #                              with the same Xcode, otherwise they're signed on provenance.
+#   blockula-wallet.tar.gz     the wallet the binaries embed (scripts/release-wallet.sh), rebuilt
+#                              bit for bit by the same builders, before the Linux archives
 #   install.sh                 the tag's scripts/install.sh, byte for byte
 #   genesis-<id>.json          the tag's genesis/<id>/genesis.json
 #   checkpoints-<id>.json      the tag's node/checkpoints/<id>.json
@@ -14,10 +16,11 @@
 # tag that doesn't point at COMMIT: a tag moved to another commit would rebuild and match from its
 # own source, so only the commit you reviewed says the source is the one you meant to sign.
 # GitHub serves the draft to each builder and to the signer separately, and could serve the signer
-# a checksums.txt the builders never rebuilt; REPRODUCED binds the Linux archive lines to the
-# hashes the builders reported (on a channel GitHub doesn't control): each must be there.
+# a checksums.txt the builders never rebuilt; REPRODUCED binds the Linux archive and wallet lines
+# to the hashes the builders reported (on a channel GitHub doesn't control): each must be there.
 #   COMMIT=<full sha you reviewed> REPRODUCED=rebuilt.txt scripts/check-release-files.sh v0.5.0 /tmp/rel/checksums.txt
-# Env: COMMIT (required), REPRODUCED (a file of "<sha256>  blockula-<linux target>.tar.gz" lines,
+# Env: COMMIT (required), REPRODUCED (a file of "<sha256>  blockula-<linux target>.tar.gz" and
+#      "<sha256>  blockula-wallet.tar.gz" lines, as scripts/reproduce-release.sh prints them,
 #      the builders' rebuilt hashes: the signer always sets it), SRC=<checkout that has the tag>
 #      instead of a fresh clone, BLOCKULA_REPO (default jackdishman/blockula). Needs git.
 set -euo pipefail
@@ -67,6 +70,7 @@ while IFS= read -r line || [ -n "$line" ]; do
   [ -z "$(hash_of "$name")" ] || { bad "$name is listed twice"; continue; }
   printf '%s\t%s\n' "$name" "$hash" >> "$listed"
   case $name in
+    blockula-wallet.tar.gz) ;;
     blockula-*.tar.gz)
       t=${name#blockula-}; t=${t%.tar.gz}
       known=0
@@ -76,7 +80,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     install.sh) path=scripts/install.sh ;;
     genesis-*.json) path=genesis/${name#genesis-}; path=${path%.json}/genesis.json ;;
     checkpoints-*.json) path=node/checkpoints/${name#checkpoints-} ;;
-    *) bad "$name isn't a file a release carries (archives, install.sh, genesis-<id>.json, checkpoints-<id>.json)" ;;
+    *) bad "$name isn't a file a release carries (archives, blockula-wallet.tar.gz, install.sh, genesis-<id>.json, checkpoints-<id>.json)" ;;
   esac
   case $name in
     install.sh | genesis-*.json | checkpoints-*.json)
@@ -88,15 +92,13 @@ while IFS= read -r line || [ -n "$line" ]; do
   esac
 done < <(tail -n +2 "$sums")
 
-# The Linux archives are the ones the builders rebuilt.
-linux=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu)
+# The Linux archives and the wallet are the ones the builders rebuilt.
 if [ -n "${REPRODUCED:-}" ]; then
   [ -f "$REPRODUCED" ] || die "REPRODUCED=$REPRODUCED isn't a file"
-  for t in "${linux[@]}"; do
-    name=blockula-$t.tar.gz
+  for name in blockula-wallet.tar.gz blockula-x86_64-unknown-linux-gnu.tar.gz blockula-aarch64-unknown-linux-gnu.tar.gz; do
     listed_hash=$(hash_of "$name")
     rebuilt=$(awk -v n="$name" '$2 == n {print $1}' "$REPRODUCED" | sort -u)
-    if [ -z "$rebuilt" ]; then bad "$name: no rebuilt hash for it in $REPRODUCED (two builders reproduce each Linux archive)"
+    if [ -z "$rebuilt" ]; then bad "$name: no rebuilt hash for it in $REPRODUCED (two builders reproduce each Linux archive and the wallet)"
     elif [ "$(printf '%s\n' "$rebuilt" | wc -l | tr -d ' ')" != 1 ]; then bad "$name: the builders' hashes in $REPRODUCED disagree: $(printf '%s ' $rebuilt)"
     elif [ "$rebuilt" != "$listed_hash" ]; then bad "$name is listed as ${listed_hash:-nothing}, but the builders rebuilt $rebuilt"
     else echo "✓ $name is the archive the builders rebuilt"; fi
@@ -109,6 +111,7 @@ fi
 
 # Everything the tag would publish is there.
 for t in "${targets[@]}"; do [ -n "$(hash_of "blockula-$t.tar.gz")" ] || bad "blockula-$t.tar.gz isn't listed"; done
+[ -n "$(hash_of blockula-wallet.tar.gz)" ] || bad "blockula-wallet.tar.gz isn't listed"
 [ -n "$(hash_of install.sh)" ] || bad "install.sh isn't listed"
 while IFS= read -r path; do
   case $path in
@@ -124,7 +127,7 @@ if [ $errors -gt 0 ]; then
   exit 1
 fi
 if [ $reproduced = 1 ]; then
-  echo "✓ $sums: $tag is $commit; the Linux archives are the builders' rebuilds; install.sh, the genesis and checkpoint files are the tag's own; the macOS archives are listed (signed on provenance)"
+  echo "✓ $sums: $tag is $commit; the Linux archives and the wallet are the builders' rebuilds; install.sh, the genesis and checkpoint files are the tag's own; the macOS archives are listed (signed on provenance)"
 else
   echo "✓ $sums: $tag is $commit; install.sh, the genesis and checkpoint files are the tag's own; ${#targets[@]} archives listed (not compared with rebuilds)"
 fi

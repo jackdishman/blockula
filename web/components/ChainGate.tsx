@@ -54,7 +54,7 @@ function WrongChain({ error }: { error: ChainMismatchError }) {
       <div className="center">
         <Apparition kind="candle" />
         <span className="eyebrow">Wrong chain</span>
-        <h1>This node isn&apos;t on {NETWORK.label}</h1>
+        <h1>{NETWORK.key === "served" ? "This node is on another chain now" : <>This node isn&apos;t on {NETWORK.label}</>}</h1>
         <p className="lead">{error.message} The wallet won&apos;t show balances or sign anything through it.</p>
       </div>
       <section className="card stack warn-card">
@@ -78,7 +78,7 @@ function WrongChain({ error }: { error: ChainMismatchError }) {
         {others.map((n) => (
           <button key={n.key} className="btn" onClick={() => setNetwork(n.key)}>Switch to {n.label}</button>
         ))}
-        {NETWORK.key === "custom" && (
+        {(NETWORK.key === "custom" || NETWORK.key === "served") && (
           <button
             className="btn danger"
             onClick={() => {

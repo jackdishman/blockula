@@ -7,6 +7,7 @@ import { Suspense, useEffect, useRef, useState } from "react";
 import { HowFangReachesYou, PayRequestBanner } from "@/components/FirstFang";
 import { Splash, useAccountResolution } from "@/components/Gate";
 import { epitaph, NameClaim } from "@/components/NameClaim";
+import { PasskeyNotice, usePasskeyProblem } from "@/components/PasskeyNotice";
 import { Apparition } from "@/components/Haunt";
 import { RecoveryKitSetup } from "@/components/RecoveryKit";
 import { ErrorNote, Spinner, Tip } from "@/components/ui";
@@ -72,6 +73,7 @@ function Welcome() {
   const [typed, setTyped] = useState("");
   const { resolve, picker } = useAccountResolution(home);
   const inFlow = useRef(false);
+  const noPasskeys = usePasskeyProblem();
 
   // Already set up on this browser? Go home, or to the payment (unless we're mid-onboarding).
   useEffect(() => {
@@ -219,16 +221,20 @@ function Welcome() {
           <h1>Create your wallet</h1>
           <p className="dim">One tap with your passkey. Takes about five seconds.</p>
         </div>
-        <section className="card stack">
-          <label className="field">
-            <span>Passkey nickname <span className="dim">(optional, only you see this)</span></span>
-            <input value={nickname} onChange={(e) => setNickname(e.target.value)} placeholder="Blockula wallet" />
-          </label>
-          <button className="btn primary big" disabled={!!busy} onClick={create}>
-            {busy === "create" ? <Spinner>Waiting for your passkey…</Spinner> : "Create wallet with passkey"}
-          </button>
-          <ErrorNote error={error} />
-        </section>
+        {noPasskeys ? (
+          <PasskeyNotice problem={noPasskeys} onLocalKey={localKeysAllowed(client.pin.chainId) ? local : undefined} />
+        ) : (
+          <section className="card stack">
+            <label className="field">
+              <span>Passkey nickname <span className="dim">(optional, only you see this)</span></span>
+              <input value={nickname} onChange={(e) => setNickname(e.target.value)} placeholder="Blockula wallet" />
+            </label>
+            <button className="btn primary big" disabled={!!busy} onClick={create}>
+              {busy === "create" ? <Spinner>Waiting for your passkey…</Spinner> : "Create wallet with passkey"}
+            </button>
+            <ErrorNote error={error} />
+          </section>
+        )}
         <section className="card stack">
           <h2>Already have a wallet?</h2>
           {haveWallet}
@@ -246,6 +252,7 @@ function Welcome() {
           <h1>Open your wallet here</h1>
           <p className="dim">How should this device get in?</p>
         </div>
+        {noPasskeys && <PasskeyNotice problem={noPasskeys} />}
         <section className="card stack">
           {haveWallet}
           <ErrorNote error={error} />

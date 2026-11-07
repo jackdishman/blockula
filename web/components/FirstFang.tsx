@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import "@/app/onboarding.css";
-import { shortAddr } from "@/lib/format";
+import { shortAddr, chainUnit } from "@/lib/format";
 import type { PayRequest } from "@/lib/onboarding";
 import { FIRST_FANG } from "@/lib/onboarding-copy";
 import type { LinkCheck } from "@/lib/paylink";
@@ -40,7 +40,7 @@ export function PayRequestBanner({ request, check }: { request: PayRequest; chec
       </div>
     );
   const who = request.to ? (request.to.endsWith(".boo") ? request.to : shortAddr(request.to)) : null;
-  const lead = request.amount ? `This link asks for ${request.amount} FANG${who ? ` to ${who}` : ""}.` : who ? `This link opens a payment to ${who}.` : "This link opens a payment.";
+  const lead = request.amount ? `This link asks for ${request.amount} ${chainUnit()}${who ? ` to ${who}` : ""}.` : who ? `This link opens a payment to ${who}.` : "This link opens a payment.";
   return (
     <div className="banner onb-ask" data-testid="pay-request">
       <b>{lead}</b> Once your wallet is ready, you&apos;ll see the payment filled in, and nothing is sent until you confirm it.

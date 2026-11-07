@@ -34,7 +34,7 @@ while read -r where image; do
   [[ $image =~ @sha256:[0-9a-f]{64}$ ]] || bad "image not pinned by digest: $where $image"
 done < <( {
   grep -nE '^FROM ' deploy/Dockerfile | sed -E 's/^([0-9]+):FROM ([^ ]+).*/deploy\/Dockerfile:\1 \2/'
-  grep -nE '^RELEASE_IMAGE=' scripts/reproduce-release.sh | sed -E 's/^([0-9]+):RELEASE_IMAGE=/scripts\/reproduce-release.sh:\1 /'
+  grep -nE '^(RELEASE|WALLET)_IMAGE=' scripts/reproduce-release.sh | sed -E 's/^([0-9]+):[A-Z]+_IMAGE=/scripts\/reproduce-release.sh:\1 /'
   grep -noE '(image|container): *"?[^"}, ]+' deploy/monitoring/docker-compose.yml "${workflows[@]}" /dev/null \
     | grep -vF "\${{" | sed -E 's/^([^:]+:[0-9]+):(image|container): *"?/\1 /'
 } || true)
@@ -47,6 +47,15 @@ while IFS= read -r hit; do
   [ "$v" = "$channel" ] || bad "rust image $v != rust-toolchain.toml $channel: $hit"
 done < <(grep -noE 'rust:[0-9][0-9.]*-[a-z]+' deploy/Dockerfile scripts/reproduce-release.sh "${workflows[@]}" /dev/null || true)
 grep -qE 'rust:[0-9]' deploy/Dockerfile || bad "deploy/Dockerfile must build FROM a versioned rust image"
+
+# The wallet every binary embeds is built (release.yml) and rebuilt (reproduce-release.sh) in one
+# Node.js image: its export is only the same bytes there.
+wallet_image=$(sed -nE 's/^WALLET_IMAGE=//p' scripts/reproduce-release.sh)
+[ -n "$wallet_image" ] || bad "scripts/reproduce-release.sh has no WALLET_IMAGE"
+while IFS= read -r hit; do
+  [ "${hit#*container: }" = "\"$wallet_image\"" ] || bad "a node image in release.yml isn't WALLET_IMAGE ($wallet_image): $hit"
+done < <(grep -nE 'container: *"node:' .github/workflows/release.yml || true)
+[ "$(grep -cE 'container: *"node:' .github/workflows/release.yml)" -ge 2 ] || bad "release.yml's wallet and reproduce-wallet jobs must run in WALLET_IMAGE"
 
 # --locked on every cargo build/test/clippy/run/install in CI, scripts and the image.
 while IFS= read -r hit; do

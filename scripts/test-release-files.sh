@@ -32,6 +32,7 @@ release() {
   for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
     printf 'archive %s\n' "$t" > "$dir/blockula-$t.tar.gz"
   done
+  printf 'wallet\n' > "$dir/blockula-wallet.tar.gz"
   cp "$T/repo/scripts/install.sh" "$dir/install.sh"
   cp "$T/repo/genesis/blockula-1/genesis.json" "$dir/genesis-blockula-1.json"
   cp "$T/repo/node/checkpoints/blockula-1.json" "$dir/checkpoints-blockula-1.json"
@@ -69,6 +70,8 @@ release "$T/nockpt" && rm "$T/nockpt/checkpoints-blockula-1.json" && sums "$T/no
 refused "a checkpoint file left out" "v9.9.9 has node/checkpoints/blockula-1.json, but checkpoints-blockula-1.json isn't listed" "$T/nockpt"
 release "$T/noarch" && rm "$T/noarch/blockula-aarch64-apple-darwin.tar.gz" && sums "$T/noarch"
 refused "an archive missing" "blockula-aarch64-apple-darwin.tar.gz isn't listed" "$T/noarch"
+release "$T/nowallet" && rm "$T/nowallet/blockula-wallet.tar.gz" && sums "$T/nowallet"
+refused "the wallet archive missing" "blockula-wallet.tar.gz isn't listed" "$T/nowallet"
 release "$T/oddarch" && echo x > "$T/oddarch/blockula-riscv64gc-unknown-linux-gnu.tar.gz" && sums "$T/oddarch"
 refused "an archive for no release target" "isn't a release target's archive" "$T/oddarch"
 release "$T/dup" && sums "$T/dup" && tail -n 1 "$T/dup/checksums.txt" >> "$T/dup/checksums.txt"
@@ -79,12 +82,16 @@ release "$T/tagline" && sums "$T/tagline" v9.9.8
 refused "another release's tag line" "not '# blockula-release v9.9.9'" "$T/tagline"
 
 # The builders' rebuilt hashes (REPRODUCED): the draft the signer got must list exactly those.
-for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do grep " blockula-$t.tar.gz\$" "$T/genuine/checksums.txt"; done > "$T/rebuilt.txt"
+for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu wallet; do grep " blockula-$t.tar.gz\$" "$T/genuine/checksums.txt"; done > "$T/rebuilt.txt"
 out=$(REPRODUCED=$T/rebuilt.txt check "$T/genuine") || fail "the genuine release with the builders' hashes is refused: $out"
 printf '%s' "$out" | grep -qF "blockula-x86_64-unknown-linux-gnu.tar.gz is the archive the builders rebuilt" || fail "REPRODUCED wasn't compared: $out"
 ok "REPRODUCED: the Linux archives are the ones the builders rebuilt"
 release "$T/swapped" && printf 'evil archive\n' > "$T/swapped/blockula-aarch64-unknown-linux-gnu.tar.gz" && sums "$T/swapped"
 REPRODUCED=$T/rebuilt.txt refused "a Linux archive the builders didn't rebuild (the draft changed after they checked it)" "blockula-aarch64-unknown-linux-gnu.tar.gz is listed as" "$T/swapped"
+release "$T/swapwallet" && printf 'evil wallet\n' > "$T/swapwallet/blockula-wallet.tar.gz" && sums "$T/swapwallet"
+REPRODUCED=$T/rebuilt.txt refused "a wallet the builders didn't rebuild" "blockula-wallet.tar.gz is listed as" "$T/swapwallet"
+grep -v wallet "$T/rebuilt.txt" > "$T/rebuilt-nowallet.txt"
+REPRODUCED=$T/rebuilt-nowallet.txt refused "the wallet not reproduced" "blockula-wallet.tar.gz: no rebuilt hash for it" "$T/genuine"
 grep -v aarch64 "$T/rebuilt.txt" > "$T/rebuilt-one.txt"
 REPRODUCED=$T/rebuilt-one.txt refused "only one Linux archive reproduced" "blockula-aarch64-unknown-linux-gnu.tar.gz: no rebuilt hash for it" "$T/genuine"
 { cat "$T/rebuilt.txt"; echo "$(printf 'f%.0s' $(seq 64))  blockula-x86_64-unknown-linux-gnu.tar.gz"; } > "$T/rebuilt-split.txt"

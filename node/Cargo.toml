@@ -142,6 +142,11 @@ overflow-checks = true
 [profile.release.package.wasmparser-nostd]
 overflow-checks = true
 
+[build-dependencies]
+# build.rs gzips the embedded wallet's text files (src/wallet.rs): the same crate and features as
+# the dependency above, so nothing new is built.
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+
 [dev-dependencies]
 proptest = "1.12"
 tower = { version = "0.5", features = ["util"] }

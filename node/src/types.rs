@@ -2633,14 +2633,33 @@ pub fn normalize_name(input: &str) -> Result<String> {
     Ok(n)
 }
 
+/// The unit the CLI prints amounts in: the ticker of the chain a command connected to
+/// (`cli_net::Remote::connect_in` sets it). A running node never sets it, so everything a node
+/// writes (receipts, errors, summaries) says FANG exactly as it always has, and the API relabels
+/// it for display (`webapp::relabel`).
+static DISPLAY_UNIT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Sets the CLI's display unit once, to a well-formed ticker other than FANG.
+pub fn set_display_unit(token: &str) {
+    if token != crate::chain::DEFAULT_TOKEN && crate::chain::check_token(token).is_ok() {
+        let _ = DISPLAY_UNIT.set(token.to_string());
+    }
+}
+
+/// The unit amounts are printed in: FANG, or the CLI's chain's ticker.
+pub fn display_unit() -> &'static str {
+    DISPLAY_UNIT.get().map_or(crate::chain::DEFAULT_TOKEN, |s| s.as_str())
+}
+
 pub fn fmt_fang(drops: u64) -> String {
     let whole = drops / DROPS_PER_FANG;
     let frac = drops % DROPS_PER_FANG;
+    let unit = display_unit();
     if frac == 0 {
-        format!("{whole} FANG")
+        format!("{whole} {unit}")
     } else {
         let f = format!("{frac:09}");
-        format!("{whole}.{} FANG", f.trim_end_matches('0'))
+        format!("{whole}.{} {unit}", f.trim_end_matches('0'))
     }
 }
 

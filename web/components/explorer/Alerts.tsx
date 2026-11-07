@@ -13,6 +13,7 @@ import { useWatchlist } from "@/lib/explorer/watch";
 import { useWallet } from "@/lib/wallet";
 import { Amount, useMe, whoText } from "./kit";
 import { signerOf } from "./Ledger";
+import { chainUnit } from "@/lib/format";
 
 interface Notice {
   key: string;
@@ -140,7 +141,7 @@ export function Alerts() {
           const extra = moved - (toldBy.get(id) ?? 0n);
           if (k.agent && extra > 0n && id !== myKey) {
             named = true;
-            out.push({ key: `${addr}:spent:${id}:${a.nonce}`, tx: "", title: `Your agent “${k.label}” spent`, body: `${missed} transaction${missed === 1 ? "" : "s"} from your account were pushed out of view by newer activity before this page saw ${missed === 1 ? "it" : "them"}. Check your activity.`, delta: -extra, tone: "agent", meta: `${compactDrops(k.spent)} FANG used this period`, href: to.account(addr) });
+            out.push({ key: `${addr}:spent:${id}:${a.nonce}`, tx: "", title: `Your agent “${k.label}” spent`, body: `${missed} transaction${missed === 1 ? "" : "s"} from your account were pushed out of view by newer activity before this page saw ${missed === 1 ? "it" : "them"}. Check your activity.`, delta: -extra, tone: "agent", meta: `${compactDrops(k.spent)} ${chainUnit()} used this period`, href: to.account(addr) });
           }
         }
         if (!named) out.push({ key: `${addr}:missed:${a.nonce}`, tx: "", title: "Signed on your account", body: `${missed} transaction${missed === 1 ? "" : "s"} from your account were pushed out of view by newer activity before this page saw ${missed === 1 ? "it" : "them"}. Check your activity.`, delta: null, tone: "out", href: to.account(addr) });
@@ -259,7 +260,7 @@ function describe(t: TxDetail, addr: string, a: AccountDetail, viewer: Me | null
   }
   if (signer.agent) {
     const k = a.keys.find((x) => x.key_id === t.signer_key);
-    const meta = k?.role.type === "session" ? `${compactDrops(parseDrops(k.spent_this_period))} of ${compactDrops(parseDrops(k.role.limit))} FANG used this period` : undefined;
+    const meta = k?.role.type === "session" ? `${compactDrops(parseDrops(k.spent_this_period))} of ${compactDrops(parseDrops(k.role.limit))} ${chainUnit()} used this period` : undefined;
     return { key, tx: t.id, title: `Your agent “${signer.label}” ${t.kind === "transfer" ? "spent" : "acted"}`, body: summary, delta, tone: "agent", meta };
   }
   return { key, tx: t.id, title: `Signed on “${signer.label}”`, body: summary, delta, tone: "out", meta: "another of your devices" };

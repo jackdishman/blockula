@@ -24,6 +24,20 @@ function walletRpId(): string {
   return RP_ID;
 }
 
+/**
+ * Why passkeys can't work on this page, or null if they can. Browsers offer passkeys only in a
+ * secure context (https, or localhost), and only for a domain name, never an IP address: a node
+ * reached at `http://100.x.y.z:7070` serves the wallet, but its passkey button would only fail.
+ */
+export function passkeyProblem(): "insecure" | "ip" | "unsupported" | null {
+  if (typeof window === "undefined") return null;
+  const host = window.location.hostname;
+  if (!window.isSecureContext) return "insecure";
+  if (!DEV_HOSTS.includes(host) && (/^\d+(\.\d+){3}$/.test(host) || host.includes(":") || host.startsWith("["))) return "ip";
+  if (typeof window.PublicKeyCredential === "undefined") return "unsupported";
+  return null;
+}
+
 export async function createPasskey(client: PinnedClient, username: string) {
   const wallet = await createPasskeyWallet({ username, client, rpName: "Blockula Wallet", rpId: walletRpId() });
   const credentialId = wallet.credentialId ? b64url(wallet.credentialId) : undefined;

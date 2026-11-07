@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Rebuilds a release's Linux archive from source in the pinned build image and compares it with
-# the published checksums.txt. Independent builders run this before a release is signed
+# Rebuilds a release's Linux archive from source in the pinned build images and compares it with
+# the published checksums.txt: first the wallet the binary embeds (blockula-wallet.tar.gz, in the
+# pinned Node.js image), then the binary with that wallet in it (in the pinned rust image). Independent builders run this before a release is signed
 # (docs/OPERATIONS.md "Releases"). Needs git, curl and docker.
 #   COMMIT=<sha> scripts/reproduce-release.sh v0.5.0          target = this machine's arch
 #   COMMIT=<sha> scripts/reproduce-release.sh v0.5.0 aarch64-unknown-linux-gnu
@@ -15,6 +16,9 @@ set -euo pipefail
 # The image release.yml builds Linux targets in. Its rust version must match rust-toolchain.toml
 # (scripts/check-pins.sh enforces both).
 RELEASE_IMAGE=rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+# The image release.yml builds the wallet in (scripts/release-wallet.sh), which every binary
+# embeds. scripts/check-pins.sh holds release.yml's wallet jobs to it.
+WALLET_IMAGE=node:22.21.1-bookworm@sha256:b84d52cd45bfe261096ccbf886955d431b8b9ed01b72eaef588e8886bda09e78
 
 tag=${1:?usage: scripts/reproduce-release.sh <tag> [target]}
 case "$(uname -m)" in arm64 | aarch64) arch=aarch64 ;; *) arch=x86_64 ;; esac
@@ -39,20 +43,39 @@ if [ -n "$commit" ] && [ "$built" != "$commit" ]; then
   echo "✗ $tag is $built here, not the commit you reviewed ($commit). Don't sign or install it: find out who moved the tag." >&2
   exit 1
 fi
-echo "🔨 Building $asset from $built in $RELEASE_IMAGE ($platform)…"
+if [ -n "${CHECKSUMS:-}" ]; then cp "$CHECKSUMS" "$work/checksums.txt"
+else curl -fsSL "https://github.com/$repo/releases/download/$tag/checksums.txt" -o "$work/checksums.txt"; fi
+
+# The wallet first: the binary embeds it, so it's rebuilt from the same source and must match too.
+echo "🔨 Building blockula-wallet.tar.gz from $built in $WALLET_IMAGE ($platform)…"
+mkdir -p "$work/wallet" "$work/dist"
+docker run --rm --platform "$platform" -v "$src:/src:ro" -v "$work/wallet:/out" "$WALLET_IMAGE" bash -euc "
+  git config --global --add safe.directory '*'
+  git clone -q /src /work/blockula
+  cd /work/blockula
+  scripts/release-wallet.sh /out >&2
+  chown -R $(id -u):$(id -g) /out"
+wallet_expected=$(awk '$2 == "blockula-wallet.tar.gz" {print $1}' "$work/checksums.txt")
+wallet_actual=$(awk '{print $1}' "$work/wallet/blockula-wallet.tar.gz.sha256")
+echo "published: ${wallet_expected:-<missing>}"
+echo "rebuilt:   $wallet_actual"
+if [ "$wallet_expected" != "$wallet_actual" ]; then
+  echo "✗ blockula-wallet.tar.gz does NOT match the release. Don't sign or install it; report the diff (diffoscope helps)." >&2
+  exit 1
+fi
+echo "✓ blockula-wallet.tar.gz reproduces bit for bit"
+
+echo "🔨 Building $asset from $built in $RELEASE_IMAGE ($platform), with that wallet…"
 # A fresh clone inside a throwaway container, at a path unlike CI's: the build remaps paths, so
 # the output must not change. Only committed files are built.
-mkdir -p "$work/dist"
-docker run --rm --platform "$platform" -v "$src:/src:ro" -v "$work/dist:/out" "$RELEASE_IMAGE" bash -euc "
+docker run --rm --platform "$platform" -v "$src:/src:ro" -v "$work/wallet:/wallet:ro" -v "$work/dist:/out" "$RELEASE_IMAGE" bash -euc "
   git config --global --add safe.directory '*'
   git clone -q /src /work/blockula
   cd /work/blockula
   rustup toolchain install >/dev/null
-  scripts/release-build.sh $target /out
+  BLOCKULA_WALLET=/wallet/blockula-wallet.tar.gz scripts/release-build.sh $target /out
   chown -R $(id -u):$(id -g) /out"
 
-if [ -n "${CHECKSUMS:-}" ]; then cp "$CHECKSUMS" "$work/checksums.txt"
-else curl -fsSL "https://github.com/$repo/releases/download/$tag/checksums.txt" -o "$work/checksums.txt"; fi
 expected=$(awk -v a="$asset" '$2 == a {print $1}' "$work/checksums.txt")
 actual=$(awk '{print $1}' "$work/dist/$asset.sha256")
 echo "published: ${expected:-<missing>}"
@@ -60,6 +83,7 @@ echo "rebuilt:   $actual"
 if [ "$expected" = "$actual" ]; then
   echo "✓ $asset reproduces bit for bit"
   echo "  For the signer's REPRODUCED file (send it on the operators' channel, not only the release issue):"
+  echo "  $wallet_actual  blockula-wallet.tar.gz"
   echo "  $actual  $asset"
 else
   echo "✗ $asset does NOT match the release. Don't sign or install it; report the diff (diffoscope helps)." >&2

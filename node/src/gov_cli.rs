@@ -76,8 +76,8 @@ pub(crate) fn fang_text(drops: u64) -> String {
         g.push(c);
     }
     match drops % DROPS_PER_FANG {
-        0 => format!("{g} FANG"),
-        f => format!("{g}.{} FANG", format!("{f:09}").trim_end_matches('0')),
+        0 => format!("{g} {}", crate::types::display_unit()),
+        f => format!("{g}.{} {}", format!("{f:09}").trim_end_matches('0'), crate::types::display_unit()),
     }
 }
 
@@ -173,7 +173,7 @@ pub(crate) fn describe_action(a: &Action) -> String {
         Action::FundHunt { hunt_id, amount } => format!("Add {} to hunt #{hunt_id}", fang_text(*amount)),
         Action::AwardHunt { hunt_id, to, pr, .. } => format!("Pay hunt #{hunt_id}'s bounty to {} for PR #{pr}", account(to)),
         Action::GrantSoul { to, amount, reason } => format!("Grant {} Soul to {} (admin chains only){}", crate::poc::fmt_soul(*amount), account(to), quoted("reason", reason)),
-        Action::Vouch { account: a } => format!("Stake 10 FANG vouching for {}", account(a)),
+        Action::Vouch { account: a } => format!("Stake 10 {} vouching for {}", crate::types::display_unit(), account(a)),
         Action::Unvouch { account: a } => format!("Withdraw the vouch for {}", account(a)),
         Action::JoinJury { bond } => format!("Join the Séance juror pool, bonding {}", fang_text(*bond)),
         Action::FundPool { amount } => format!("Add {} to the contribution pool", fang_text(*amount)),

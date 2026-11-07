@@ -4,7 +4,7 @@ import type { Wallet } from "@blockula/sdk";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
-import { localKeysAllowed } from "@/lib/config";
+import { appPath, localKeysAllowed } from "@/lib/config";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
 import { findAccounts, hintAccount, openLocalKey, unlockPasskey, type AccountChoice } from "@/lib/keys";
 import { welcomeHref } from "@/lib/onboarding";
@@ -32,7 +32,7 @@ export function RequireWallet({ children }: { children: ReactNode }) {
   const router = useRouter();
   useEffect(() => {
     if (!ready) return;
-    if (!hint) router.replace(welcomeHref(window.location.pathname, window.location.search));
+    if (!hint) router.replace(welcomeHref(appPath(), window.location.search));
     else if (wallet && !hint.account) router.replace("/link");
   }, [ready, hint, wallet, router]);
   if (!ready || !hint) return <Splash />;
@@ -58,7 +58,7 @@ export function useAccountResolution(home = "/") {
     if (opts.waitingForLink && list.every((c) => c.address === w.address)) {
       unlocked(w, { ...h, account: undefined });
       // Already on /link? Keep the other device's link (its account) it was opened with.
-      router.replace(window.location.pathname === "/link" ? `/link${window.location.search}` : "/link");
+      router.replace(appPath() === "/link" ? `/link${window.location.search}` : "/link");
       return;
     }
     if (list.length === 1) return finish(w, h, list[0]);
