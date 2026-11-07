@@ -5,6 +5,9 @@
 # docs/OPERATIONS.md "Repository settings"). scripts/check-required-checks.mjs (the `ops` job)
 # fails unless this list, that file and the jobs that run on every pull request agree:
 #   required: Node (Rust tests + local multi-validator testnet)
+#   required: Node unit tests (Rust)
+#   required: Node v1 replay gate (release binary)
+#   required: Node engines (p2p handshake, Ghost Mode, programs VM)
 #   required: Packages + wallet build
 #   required: Wallet e2e (Playwright, Chromium)
 #   required: Clippy
@@ -36,8 +39,48 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  node:
-    name: Node (Rust tests + local multi-validator testnet)
+  # The node's checks run as four jobs side by side (each builds what it needs), so a PR waits
+  # for the longest one rather than for all of them in a row.
+  node-unit:
+    name: Node unit tests (Rust)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with: { workspaces: node }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      # The wallet nodes serve at /wallet/ (web/out), built into every binary as releases are.
+      - run: npm run build:wallet
+      - run: cargo test --release --locked --manifest-path node/Cargo.toml
+
+  node-replay:
+    name: Node v1 replay gate (release binary)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with: { workspaces: node }
+      # The v1 replay gate (docs/REPLAY.md): this PR's binary replays the recorded v1 history in
+      # node/testdata/replay through sync and startup, block by block (every certificate, cited
+      # state root, tx outcome, block state root and record). `cargo test` (node-unit) runs the
+      # same corpus in the test build, and shows a binary that diverges from it fails.
+      - name: v1 replay gate (the recorded corpus)
+        run: |
+          cargo build --release --locked --manifest-path node/Cargo.toml
+          for archive in node/testdata/replay/v1-*; do node/target/release/blockula replay "$archive"; done
+
+  node-engines:
+    name: Node engines (p2p handshake, Ghost Mode, programs VM)
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     steps:
@@ -51,26 +94,6 @@ jobs:
           workspaces: |
             node
             node/vm
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with: { node-version: 22, cache: npm }
-      - run: npm ci
-      # The wallet nodes serve at /wallet/ (web/out), built into every binary below as releases are.
-      - run: npm run build:wallet
-      - run: cargo test --release --locked --manifest-path node/Cargo.toml
-      # The v1 replay gate (docs/REPLAY.md): this PR's binary replays the recorded v1 history in
-      # node/testdata/replay through sync and startup, block by block (every certificate, cited
-      # state root, tx outcome, block state root and record). `cargo test` above ran the same
-      # corpus in the test build, and showed a binary that diverges from it fails.
-      - name: v1 replay gate (the recorded corpus)
-        run: |
-          cargo build --release --locked --manifest-path node/Cargo.toml
-          for archive in node/testdata/replay/v1-*; do node/target/release/blockula replay "$archive"; done
-      # That binary's /wallet/ on a fresh named chain: passkey onboarding, faucet, a name, a
-      # payment, client-side navigation and the node's CSP (web/e2e/served.spec.ts).
-      - name: Served wallet e2e (the node's /wallet/, Playwright)
-        run: |
-          npx playwright install --with-deps chromium
-          E2E_SERVED=only npm run test:e2e -w @blockula/web
       # Hybrid X25519 + ML-KEM-768 p2p handshake (vendored commonware-stream, docs/PQ-TRANSPORT.md).
       - run: cargo test --release --locked --manifest-path node/Cargo.toml -p commonware-stream
       - run: bash node/vendor/commonware-stream/verify-vendor.sh
@@ -85,6 +108,32 @@ jobs:
       # sources with the pinned compiler: this Linux build is the reference.
       - name: Programs engine guests rebuild byte for byte (node/vm/guests/build.sh --check)
         run: rustup target add wasm32v1-none --toolchain 1.98.1 && node/vm/guests/build.sh --check
+
+  # The release binary, live: the wallet it serves, a local multi-validator testnet with the SDK
+  # and CLI against it, the programs SDK e2e, and the release runbooks.
+  node:
+    name: Node (Rust tests + local multi-validator testnet)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with: { workspaces: node }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      # The wallet nodes serve at /wallet/ (web/out), built into the binary below as releases are.
+      - run: npm run build:wallet
+      - run: cargo build --release --locked --manifest-path node/Cargo.toml
+      # That binary's /wallet/ on a fresh named chain: passkey onboarding, faucet, a name, a
+      # payment, client-side navigation and the node's CSP (web/e2e/served.spec.ts).
+      - name: Served wallet e2e (the node's /wallet/, Playwright)
+        run: |
+          npx playwright install --with-deps chromium
+          E2E_SERVED=only npm run test:e2e -w @blockula/web
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
       - name: 4 validators + full node + SDK e2e + CLI
         run: bash scripts/local-testnet.sh

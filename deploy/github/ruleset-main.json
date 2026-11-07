@@ -36,6 +36,9 @@
         "do_not_enforce_on_create": false,
         "required_status_checks": [
           { "context": "Node (Rust tests + local multi-validator testnet)", "integration_id": 15368 },
+          { "context": "Node unit tests (Rust)", "integration_id": 15368 },
+          { "context": "Node v1 replay gate (release binary)", "integration_id": 15368 },
+          { "context": "Node engines (p2p handshake, Ghost Mode, programs VM)", "integration_id": 15368 },
           { "context": "Packages + wallet build", "integration_id": 15368 },
           { "context": "Wallet e2e (Playwright, Chromium)", "integration_id": 15368 },
           { "context": "Clippy", "integration_id": 15368 },
