@@ -59,3 +59,34 @@ export const SAFETY = {
   oneBrowserKey: "Only this browser's key opens your wallet.",
   onePasskeyLost: "If you lose it, nothing can get you back in.",
 };
+
+/**
+ * The home checklist (components/Tutorial): its stages, and one short line on why each task is
+ * worth doing. `u` is the chain's unit (its ticker). The tasks themselves are built in Tutorial.
+ */
+export const TUTORIAL = {
+  heading: "Your path",
+  stages: {
+    basics: { title: "Basics", blurb: "Coins, a name, and your first payments." },
+    further: { title: "Go further", blurb: "Protect your account and take part in the chain." },
+    grow: { title: "Grow the chain", blurb: "Bring in friends, validators and agents." },
+    yours: { title: "Make it yours", blurb: "Change the app and put it online." },
+  },
+  why: {
+    fang: (u: string) => `${u} is this chain's native unit.`,
+    name: "A .boo name stands in for your long boo1… address, so friends can pay vlad.boo.",
+    send: "A payment is signed with your post-quantum key and final within seconds.",
+    receive: "Anyone can pay you from a link or QR code, with nothing to copy by hand.",
+    device: "A second passkey or a recovery kit means losing one device doesn't lose your account.",
+    stake: (u: string) => `Staking backs a validator and earns ${u}, but it stays locked until the unbonding period ends.`,
+    vote: "Holders decide the chain's rules: vote on a proposal, or make one.",
+    program: "This chain runs programs: WebAssembly anyone can upload and call.",
+    invite: "This link lets a friend make their first payment, to you, right away.",
+    validator: "Each validator on another machine makes the chain harder to stop.",
+    agent: "A session key lets an AI agent spend from your account, up to a limit you set.",
+    coding: "Give your coding agent its own wallet on this chain and a Hunt to work on.",
+    layout: "The wallet and the explorer are yours to change: ask Claude Code to do it.",
+    deploy: "Put the wallet on a website so friends can use it from anywhere.",
+  },
+  finale: "Every task done. The chain is yours.",
+};

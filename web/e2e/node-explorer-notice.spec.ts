@@ -125,7 +125,8 @@ test("a pool with repositories says how it works and the most a Séance can pay"
 });
 
 test("Learn says who pays for useful work, and that a pool without repositories pays nothing", async ({ page }) => {
-  await open(page, OWN_CHAIN, "#/learn");
+  // Learn tells of Hunts and the pool only on a chain that has some (here, a pool repository).
+  await open(page, OWN_CHAIN, "#/learn", [{ repo: "jackdishman/blockula", weight: 10 }]);
   const app = page.locator("#app");
   await expect(app).toContainText("Useful work can be paid. Hunts are bounties on GitHub issues, paid by whoever posts them. The contribution pool pays for merged pull requests to repositories governance adds, judged by juries of people with Soul; it pays nothing until it has one, and its payments unlock slowly.");
   await expect(app.getByRole("link", { name: "Hunts →" })).toHaveAttribute("href", "#/hunts");

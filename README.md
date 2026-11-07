@@ -57,7 +57,12 @@ Or `blockula launch` and pick **Just this machine**: a chain you keep, that only
 | 🔎 Explorer | Built into every node at `http://<node>:7070`. Install it from Safari: File > Add to Dock (Mac), Share > Add to Home Screen (iPhone, iPad) |
 | 👛 Wallet | `git clone --depth 1 https://github.com/jackdishman/blockula && cd blockula && npm ci && npm run wallet`, then http://localhost:3000: passkey sign-up, the faucet, a `.boo` name, sending and receiving ([web/](web/README.md)) |
 | ⌨️ CLI wallet | `blockula wallet new`, `blockula wallet faucet`, `blockula wallet send alice.boo 1` |
-| 🤖 Agents | `claude mcp add blockula -- npx -y @blockula/mcp`, then the prompt in [AGENTS.md](AGENTS.md) |
+| 🤖 Agents | `claude mcp add blockula -- npx -y @blockula/mcp` (the node on this machine; `-e BLOCKULA_RPC=<node>` for another), then the prompt in [AGENTS.md](AGENTS.md) |
+
+## Make it yours
+
+- **[BUILD-ON-IT.md](docs/BUILD-ON-IT.md):** talk to your chain from Claude, change the explorer and the wallet with Claude Code, extend it with the SDK and programs, put it on HTTPS, and send friends one link to a wallet they can pay with.
+- **[USE-CASES.md](docs/USE-CASES.md):** what friends, a club, a class or a team can do on a chain of their own, with the first commands for each.
 
 ## For developers
 
@@ -84,6 +89,8 @@ In the browser a passkey unlocks the wallet, with no seed phrase: `createPasskey
 | | |
 |---|---|
 | [LAUNCH.md](docs/LAUNCH.md) | Launch a chain, friends join and become validators, apps, costs |
+| [BUILD-ON-IT.md](docs/BUILD-ON-IT.md) | Claude, custom apps, the SDK and programs, HTTPS, a wallet link for friends |
+| [USE-CASES.md](docs/USE-CASES.md) | Eight things to do on a small chain |
 | [RUN-A-NODE.md](docs/RUN-A-NODE.md) | A full node or a validator as a service, and using your own node |
 | [REFERENCE.md](docs/REFERENCE.md) | Chains by hand, public servers, the hardened API, validators, Hunts and the contribution pool |
 | [OPERATIONS.md](docs/OPERATIONS.md) | Running validators: upgrades, restarts, slashing protection, monitoring |
@@ -99,9 +106,9 @@ sdk-ts/   @blockula/sdk: wallets, signing, the client, passkeys
 mcp/      @blockula/mcp: the MCP server for coding agents
 docs/     Guides and design documents
 scripts/  Install, release and test scripts
-deploy/   Ops for the retired public testnet (Fly.io)
+deploy/   Ops for the retired public testnet (Fly.io), kept for reference
 ```
 
 ## Status
 
-**Blockula 1.0** is a kit for running your own ledger. An internal security and product review was completed and its findings fixed; **there's no third-party audit**. The public testnet (`blockula-testnet-2`) ran from October to November 2026 and was retired; CI replays its archived history every night. Contributions are welcome from people and agents: [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
+**Blockula 1.0** is a kit for running your own ledger. An internal security and product review was completed and its findings fixed; **there's no third-party audit**. The public testnet ran in October and November 2026; CI replays its archived history every night. Contributions are welcome from people and agents: [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately: [SECURITY.md](SECURITY.md).

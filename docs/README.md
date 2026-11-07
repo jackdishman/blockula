@@ -5,6 +5,8 @@
 | | |
 |---|---|
 | [LAUNCH.md](LAUNCH.md) | Launch your own ledger with `blockula launch`: friends join and become validators, the apps, what it costs |
+| [BUILD-ON-IT.md](BUILD-ON-IT.md) | Make the chain yours: Claude and the MCP, changing the explorer and wallet with Claude Code, the SDK, programs and governance, HTTPS, hosting the wallet for friends, the contributor prompt |
+| [USE-CASES.md](USE-CASES.md) | Eight things friends, a club, a class or a team can do on their chain, with the first commands |
 | [RUN-A-NODE.md](RUN-A-NODE.md) | A full node or a validator as a service, and pointing the wallet, SDK and MCP at your own node |
 | [REFERENCE.md](REFERENCE.md) | Chains by hand (`summon`, `run`, `join`), public servers and genesis specs, the hardened HTTP API, the CLI wallet, validators and staking, Hunts and the contribution pool |
 | [ONE_PAGER.md](ONE_PAGER.md) | What Blockula is, on one page |
