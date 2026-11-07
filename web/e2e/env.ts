@@ -34,3 +34,8 @@ export const MAINNET_PORT = 3218;
 
 /** A real node serving its built-in wallet (e2e/served-node.sh, e2e/served.spec.ts; E2E_SERVED=1). */
 export const SERVED_PORT = 3219;
+
+/** The project site (NEXT_PUBLIC_SITE=project, e2e/site.spec.ts): with a demo node the specs mock, and without one. */
+export const SITE_PORT = 3220;
+export const SITE_NODEMO_PORT = 3221;
+export const DEMO_NODE = "https://demo.blockula.test";

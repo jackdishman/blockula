@@ -10,12 +10,12 @@ import { DEFAULT_NETWORK, RP_ID, RPC, SERVED, walletUrl } from "@/lib/config";
 import { useNode } from "@/lib/explorer/node";
 import { useWallet } from "@/lib/wallet";
 
-const REPO = "https://github.com/jackdishman/blockula";
-const INSTALL = `curl -fsSL ${REPO}/releases/latest/download/install.sh | sh`;
+export const REPO = "https://github.com/jackdishman/blockula";
+export const INSTALL = `curl -fsSL ${REPO}/releases/latest/download/install.sh | sh`;
 const LAUNCH = "blockula launch";
 const DEV = "blockula dev";
 const BUILD_ON_IT = `${REPO}/blob/main/docs/BUILD-ON-IT.md`;
-const LAUNCH_GUIDE = `${REPO}/blob/main/docs/LAUNCH.md`;
+export const LAUNCH_GUIDE = `${REPO}/blob/main/docs/LAUNCH.md`;
 
 const LOCAL = /^(localhost|127\.0\.0\.1|\[::1\])$/;
 const isLocalUrl = (u: string) => {
@@ -27,11 +27,11 @@ const isLocalUrl = (u: string) => {
 };
 
 /** `code` spans in plain copy, rendered as code. */
-function Text({ children }: { children: string }) {
+export function Text({ children }: { children: string }) {
   return <>{children.split("`").map((part, i) => (i % 2 ? <code key={i}>{part}</code> : part))}</>;
 }
 
-function Command({ text, label }: { text: string; label?: string }) {
+export function Command({ text, label }: { text: string; label?: string }) {
   return (
     <div className="landing-cmd">
       <code>{text}</code>
@@ -40,7 +40,7 @@ function Command({ text, label }: { text: string; label?: string }) {
   );
 }
 
-const USES: { title: string; body: string }[] = [
+export const USES: { title: string; body: string }[] = [
   { title: "A friends' IOU ledger", body: "Pay `sam.boo` back for pizza, with a memo saying why. Everyone sees the same history." },
   { title: "A shared kitty", body: "A multisig account that spends only when, say, 2 of 3 of you approve." },
   { title: "Group decisions", body: "Put a question up as a proposal; holders vote with their coins." },

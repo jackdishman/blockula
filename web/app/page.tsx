@@ -9,9 +9,10 @@ import { Ledger } from "@/components/explorer/Ledger";
 import { Apparition } from "@/components/Haunt";
 import { BalanceBreakdown, NameExpiryBanner, OnePasskeyBanner } from "@/components/HomeNotes";
 import { Landing } from "@/components/Landing";
+import { ProjectSite } from "@/components/site/ProjectSite";
 import { Tutorial, useTutorial } from "@/components/Tutorial";
 import { Copy, ExplorerLink, Spinner } from "@/components/ui";
-import { explorer } from "@/lib/config";
+import { explorer, SITE } from "@/lib/config";
 import { fangParts, shortAddr } from "@/lib/format";
 import type { TxView } from "@/lib/types";
 import { useUnlocked, useWallet } from "@/lib/wallet";
@@ -41,7 +42,12 @@ function useArrivals(txs: TxView[] | undefined, me: string | undefined) {
   return fresh;
 }
 
-export default function HomePage() {
+/** `/`: the wallet (or, on a first visit, the landing page), or on the project site its page. */
+export default function Page() {
+  return SITE ? <ProjectSite /> : <HomePage />;
+}
+
+function HomePage() {
   const { ready, hint } = useWallet();
   // A first visit (no wallet on this device) gets the landing page; the wallet is a click away.
   if (ready && !hint) return <Landing />;

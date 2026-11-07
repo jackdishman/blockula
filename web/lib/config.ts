@@ -8,6 +8,8 @@
  * so a wrong or fake node can't get a testnet signature replayed on mainnet or vice versa.
  */
 
+import { demoNode } from "./site";
+
 /** Mainnet's chain id and address prefix (DEC-7). */
 export const MAINNET_CHAIN_ID = "blockula-1";
 export const MAINNET_PREFIX = "boo";
@@ -90,6 +92,15 @@ export type NetworkKey = KnownKey | "custom" | "served";
  * didn't already. Everything that differs comes from `servedConfig()`.
  */
 export const SERVED = process.env.NEXT_PUBLIC_BLOCKULA_SERVED === "1";
+/**
+ * The project site (`NEXT_PUBLIC_SITE=project`): Blockula's own landing page at `/`
+ * (components/site/), with no wallet of its own. Every other route redirects to `/` (proxy.ts),
+ * and the page talks to one node only, the demo chain's (`DEMO_NODE`, lib/site.ts), to show its
+ * stats. Visitors use a chain through that node's own wallet, `<node>/wallet/`.
+ */
+export const SITE = process.env.NEXT_PUBLIC_SITE === "project";
+/** NEXT_PUBLIC_DEMO_NODE: the site's demo chain, a node's https URL (unset: the demo is resting). */
+export const DEMO_NODE = SITE ? demoNode(process.env.NEXT_PUBLIC_DEMO_NODE) : undefined;
 /** Where the app's routes live under the origin: `/wallet` when served, else the root. */
 export const BASE_PATH = SERVED ? "/wallet" : "";
 

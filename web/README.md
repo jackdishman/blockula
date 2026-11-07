@@ -42,6 +42,21 @@ With none of these set, the wallet starts on a node on this machine (`http://loc
 
 The values come from `~/.blockula/<chain id>/LAUNCH.md` or `curl -s <node>/api/status` (`chain_id`, `genesis_hash`, `address_prefix`).
 
+### The project site
+
+`NEXT_PUBLIC_SITE=project` builds Blockula's own landing page (https://blockula.app) instead of a wallet: `/` is the project's page (`components/site/`), and every other route redirects to it (`proxy.ts`). It has no network picker, no wallet and no chain gate. It shows a live demo chain, opens any node's own wallet (`<node>/wallet/`) from an address a visitor pastes, and has the launch and contributor prompts. It follows the system's light or dark (`app/site.css`, scoped to `html[data-site]`, so the wallet builds look as before).
+
+| Variable | Default | |
+|---|---|---|
+| `NEXT_PUBLIC_SITE` | (unset) | `project` makes the project site. Any other value fails the build, and so does combining it with the served build or `NEXT_PUBLIC_NETWORK=mainnet` |
+| `NEXT_PUBLIC_DEMO_NODE` | (unset) | The demo chain's node: `https://` (plain `http://` only for this machine or a private network, as for the connect field). The page reads its `/api/status` and `/api/blocks` from the browser (nodes send permissive CORS), shows its name, height, validators and newest blocks, links its wallet (`<node>/wallet/`), explorer and invite page, and gives the agent prompt pinned to it. The CSP's `connect-src` allows this origin and nothing else. Unset, or not answering, the demo section says the demo is resting and points at launching your own. A malformed value fails the build |
+
+```sh
+NEXT_PUBLIC_SITE=project NEXT_PUBLIC_DEMO_NODE=https://demo.example npm run build -w @blockula/web
+```
+
+The demo node must serve the wallet over HTTPS on a hostname of its own (passkeys are bound to it): `tailscale funnel 7070`, or a VPS behind Caddy ([docs/BUILD-ON-IT.md, "Put it online"](../docs/BUILD-ON-IT.md#4-put-it-online)). `e2e/site.spec.ts` and `e2e/site-nodemo.spec.ts` test both builds against a mocked demo node.
+
 ### Mainnet build mode (unused)
 
 Left from the mainnet that was planned and dropped in October 2026 ([docs/README.md, "Design history"](../docs/README.md#design-history)). No chain uses it.
@@ -106,6 +121,7 @@ Witness URLs must be `https://` (or `http://localhost` / `http://127.0.0.1` for 
 | `stake.spec.ts` | Delegate, unstake an amount and the rest, withdraw once unbonded (each tx checked by the mock node), no CSP violations, a node lying about the stake's value or shares (the amount is signed), a node without staking |
 | `paylink.spec.ts` | Receive links carry their chain and the canonical amount (a zero-padded one still fits a QR code); an absurd amount is refused without crashing; Send fills a link made for this chain, refuses one made for another chain or instance, refuses a malformed chain or genesis with fixed words, names only networks it knows, and fills an older link with a notice |
 | `governance.spec.ts` | Proposals with tallies, quorum and council votes; voting with conviction and changing the vote; releasing locks; hostile on-chain titles and links rendered inert; a node without governance |
+| `site.spec.ts`, `site-nodemo.spec.ts` | The project site (`NEXT_PUBLIC_SITE=project`, two more builds): the demo chain's live stats and links, a demo that's unreachable, answers garbage or isn't configured, the connect field's checks, wallet routes redirected home, `connect-src` holding the demo node only, phone layout in light and dark |
 | `explorer.spec.ts` | The node's built-in explorer (`node/src/explorer.html`) on a mocked protocol v1 API: validator pools, Governance and proposal pages, parameters, name expiry, escaping, a dropped tx (not final, nothing charged) apart from one that failed in a block (its fee charged) |
 
 ## Manual release test matrix

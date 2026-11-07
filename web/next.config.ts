@@ -33,6 +33,13 @@ if (process.env.NEXT_PUBLIC_NETWORK === "mainnet") {
 const SERVED = process.env.BLOCKULA_SERVED === "1";
 if (SERVED && process.env.NEXT_PUBLIC_NETWORK === "mainnet") throw new Error("The served wallet is for the chain of whichever node serves it; it can't be a mainnet build.");
 
+// The project site (NEXT_PUBLIC_SITE=project, lib/site.ts) is a landing page, not a wallet: Next
+// serves it (its proxy sets the CSP), and lib/config.ts has already refused a malformed
+// NEXT_PUBLIC_DEMO_NODE by the time this runs.
+const site = process.env.NEXT_PUBLIC_SITE;
+if (site && site !== "project") throw new Error(`NEXT_PUBLIC_SITE is ${JSON.stringify(site)}; the only site is "project".`);
+if (site && (SERVED || process.env.NEXT_PUBLIC_NETWORK === "mainnet")) throw new Error("The project site is its own build: not the served wallet, not a mainnet one.");
+
 const served: NextConfig = {
   output: "export",
   basePath: "/wallet",

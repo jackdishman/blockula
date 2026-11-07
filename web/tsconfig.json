@@ -38,7 +38,11 @@
     ".next-e2e/testnet/types/**/*.ts",
     ".next-e2e/testnet/dev/types/**/*.ts",
     ".next-e2e/mainnet/types/**/*.ts",
-    ".next-e2e/mainnet/dev/types/**/*.ts"
+    ".next-e2e/mainnet/dev/types/**/*.ts",
+    ".next-e2e/site/types/**/*.ts",
+    ".next-e2e/site/dev/types/**/*.ts",
+    ".next-e2e/site-nodemo/types/**/*.ts",
+    ".next-e2e/site-nodemo/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

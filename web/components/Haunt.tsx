@@ -3,6 +3,7 @@
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useSyncExternalStore } from "react";
 import { mountHaunt } from "@/lib/ascii/haunt";
+import { SITE } from "@/lib/config";
 import { isExplorerPath } from "@/lib/explorer/routes";
 import { mountProp } from "@/lib/ascii/prop";
 import type { PropKind } from "@/lib/ascii/scenes";
@@ -11,8 +12,9 @@ import { motionOn, onMotionChange, setUserStill, systemStill } from "@/lib/ascii
 /** The ASCII backdrop (moon, fog, jack-o'-lantern, bats) behind every page. */
 export function Haunt() {
   const ref = useRef<HTMLCanvasElement>(null);
-  // Explorer pages use a wider column (app/explorer.css .wide); keep the props in the margins beside it.
-  const wide = isExplorerPath(usePathname());
+  // Explorer pages and the project site use a wider column (app/explorer.css .wide, app/site.css);
+  // keep the props in the margins beside it.
+  const wide = isExplorerPath(usePathname()) || SITE;
   useEffect(() => (ref.current ? mountHaunt(ref.current, { column: wide ? 1080 : 580 }) : undefined), [wide]);
   return <canvas ref={ref} className="haunt" aria-hidden />;
 }

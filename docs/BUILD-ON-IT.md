@@ -258,6 +258,10 @@ The rules behind it:
 
 The same build runs on any Node.js host (`npm run start -w @blockula/web`, behind HTTPS) or on Vercel (Root Directory `web`, the variables above in the project's settings, and the SDK built before the wallet). Set `NEXT_PUBLIC_RP_ID` to your own domain, `NEXT_PUBLIC_BLOCKULA_RPC` to your node's public HTTPS address ([Put it online](#4-put-it-online)), and the chain id, genesis hash and `boo` prefix as above. Passkeys made on a preview deployment's address won't open on the real one.
 
+### The project site
+
+https://blockula.app is a build of the same app with `NEXT_PUBLIC_SITE=project`: Blockula's landing page rather than a wallet. Its "Try the demo" section reads a demo chain (`NEXT_PUBLIC_DEMO_NODE`, a node made with `blockula launch` and put online over HTTPS) and sends visitors to that node's own wallet, `<node>/wallet/`. Its "Connect to any chain" field opens any node's wallet the same way. [web/README.md, "The project site"](../web/README.md#the-project-site) has the variables.
+
 ## 6. Invite friends and validators
 
 [LAUNCH.md](LAUNCH.md) has the steps; send friends the parts they need:
