@@ -189,6 +189,8 @@ jobs:
       - name: MCP network pinning and release checks
         run: npm test -w @blockula/mcp
       - run: npm test -w @blockula/web
+      - name: Chain directory (chains/*.json, listed on blockula.app)
+        run: node scripts/check-chains.mjs
       - name: Explorer backdrop bundle is up to date
         run: npm run build:haunt && git diff --exit-code node/src/haunt.js
 

@@ -4,12 +4,10 @@ import type { ReactNode } from "react";
 import { Apparition } from "@/components/Haunt";
 import { Command, INSTALL, LAUNCH_GUIDE, REPO, Text, USES } from "@/components/Landing";
 import { Ornament, type OrnamentKind } from "@/components/Ornament";
-import { Copy } from "@/components/ui";
-import { CONTRIBUTE_PROMPT } from "@/lib/site";
+import { ChainsSection } from "./Chains";
 import { ConnectSection } from "./Connect";
 import { DemoSection } from "./Demo";
 
-const GOOD_FIRST_ISSUES = `${REPO}/issues?q=is%3Aopen+label%3A%22good+first+issue%22`;
 const USE_CASES = `${REPO}/blob/main/docs/USE-CASES.md`;
 const BUILD_ON_IT = `${REPO}/blob/main/docs/BUILD-ON-IT.md`;
 
@@ -112,23 +110,7 @@ export function ProjectSite() {
         </div>
       </section>
 
-      <section className="site-section" id="contribute" aria-labelledby="contribute-title">
-        <div className="card stack">
-          <div className="row-between site-wrap">
-            <div>
-              <span className="eyebrow">Contribute</span>
-              <h2 id="contribute-title" className="site-h2">Help build it, with your coding agent</h2>
-            </div>
-            <Copy text={CONTRIBUTE_PROMPT} label="Copy prompt" />
-          </div>
-          <p className="dim">Paste this into Claude Code in an empty folder. People and agents are both welcome.</p>
-          <pre className="landing-prompt" data-testid="contribute-prompt">{CONTRIBUTE_PROMPT}</pre>
-          <div className="row-gap">
-            <a className="btn small" href={GOOD_FIRST_ISSUES}>Good first issues</a>
-            <a className="btn small ghost" href={`${REPO}/blob/main/CONTRIBUTING.md`}>Contributing guide</a>
-          </div>
-        </div>
-      </section>
+      <ChainsSection />
     </main>
   );
 }

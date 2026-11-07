@@ -1,0 +1,10 @@
+{
+  "name": "Plain Old Chain",
+  "chain_id": "http-node",
+  "token": "OLD",
+  "description": "Served over plain http.",
+  "rpc": "http://old.chains-fixture.com",
+  "genesis_hash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+  "validators_wanted": false,
+  "contact": "oldchain"
+}

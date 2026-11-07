@@ -74,6 +74,16 @@ blockula validator approve <validator address> --key ~/.blockula/<chain id>/vali
 
 It joins at the next epoch boundary, within 10 minutes, and starts taking turns.
 
+## List your chain
+
+[blockula.app](https://blockula.app) has a directory of chains anyone can open. Each gets a card with its live status, buttons for its wallet and explorer and, if it takes validators, the commands to become one, filled in for your chain. A listing is one file in this repo, `chains/<chain id>.json`, added by a pull request.
+
+- **It needs a public HTTPS node.** On the open internet, put a reverse proxy such as Caddy in front of port 7070 on a DNS name ([BUILD-ON-IT.md, "Put it online"](BUILD-ON-IT.md#4-put-it-online)). On Tailscale, `tailscale funnel --bg 7070` opens the node to the internet.
+- **Validators need the open internet.** A chain reached over the open internet can ask for validators: newcomers dial its p2p port (TCP 30300). Funnel carries HTTPS only, so a tailnet chain is listed for its wallet alone.
+- **`blockula launch` prints the link.** When a chain can be listed, the launch summary and `~/.blockula/<chain id>/LAUNCH.md` have a **List it on blockula.app** link. It opens GitHub's new-file page with your listing filled in. Add your GitHub handle as the contact (newcomers ask you there to be admitted), check the rest, and open the pull request.
+
+[chains/README.md](../chains/README.md) has the fields, what gets accepted and how to delist. `node scripts/check-chains.mjs` checks a listing before you send it.
+
 ## Apps
 
 - **Explorer.** Every node serves one at port 7070, under your chain's name and in its ticker. It installs as an app: on a Mac, open it in Safari and choose **File > Add to Dock**; on an iPhone or iPad, open it in Safari and choose **Share > Add to Home Screen**. It gets the chain's name and a bat icon.

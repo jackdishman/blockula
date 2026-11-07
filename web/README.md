@@ -44,18 +44,21 @@ The values come from `~/.blockula/<chain id>/LAUNCH.md` or `curl -s <node>/api/s
 
 ### The project site
 
-`NEXT_PUBLIC_SITE=project` builds Blockula's own landing page (https://blockula.app) instead of a wallet: `/` is the project's page (`components/site/`), and every other route redirects to it (`proxy.ts`). It has no network picker, no wallet and no chain gate. It shows a live demo chain, opens any node's own wallet (`<node>/wallet/`) from an address a visitor pastes, and has the launch and contributor prompts. It follows the system's light or dark (`app/site.css`, scoped to `html[data-site]`, so the wallet builds look as before).
+`NEXT_PUBLIC_SITE=project` builds Blockula's own landing page (https://blockula.app) instead of a wallet: `/` is the project's page (`components/site/`), and every other route redirects to it (`proxy.ts`). It has no network picker, no wallet and no chain gate. It shows a live demo chain, opens any node's own wallet (`<node>/wallet/`) from an address a visitor pastes, lists the chains in the repo's chain directory ("Join a chain", `components/site/Chains.tsx`), and has the launch and contributor prompts. It follows the system's light or dark (`app/site.css`, scoped to `html[data-site]`, so the wallet builds look as before).
 
 | Variable | Default | |
 |---|---|---|
 | `NEXT_PUBLIC_SITE` | (unset) | `project` makes the project site. Any other value fails the build, and so does combining it with the served build or `NEXT_PUBLIC_NETWORK=mainnet` |
-| `NEXT_PUBLIC_DEMO_NODE` | (unset) | The demo chain's node: `https://` (plain `http://` only for this machine or a private network, as for the connect field). The page reads its `/api/status` and `/api/blocks` from the browser (nodes send permissive CORS), shows its name, height, validators and newest blocks, links its wallet (`<node>/wallet/`), explorer and invite page, and gives the agent prompt pinned to it. The CSP's `connect-src` allows this origin and nothing else. Unset, or not answering, the demo section says the demo is resting and points at launching your own. A malformed value fails the build |
+| `BLOCKULA_CHAINS_DIR` | `../chains` | The chain directory the site lists. `next.config.ts` reads its `<chain id>.json` files at build time, checks them with `lib/chains.ts` (the rules `scripts/check-chains.mjs` runs in CI; a bad listing fails the build) and hands them to the page as `BLOCKULA_SITE_CHAINS`. Each listed `rpc` origin joins the CSP's `connect-src`, so a new listing needs a new deploy. The e2e builds point it at `e2e/fixtures/` |
+| `NEXT_PUBLIC_DEMO_NODE` | (unset) | The demo chain's node: `https://` (plain `http://` only for this machine or a private network, as for the connect field). The page reads its `/api/status` and `/api/blocks` from the browser (nodes send permissive CORS), shows its name, height, validators and newest blocks, links its wallet (`<node>/wallet/`), explorer and invite page, and gives the agent prompt pinned to it. The CSP's `connect-src` allows this origin and the listed chains' nodes, nothing else. Unset, or not answering, the demo section says the demo is resting and points at launching your own. A malformed value fails the build |
 
 ```sh
 NEXT_PUBLIC_SITE=project NEXT_PUBLIC_DEMO_NODE=https://demo.example npm run build -w @blockula/web
 ```
 
 The demo node must serve the wallet over HTTPS on a hostname of its own (passkeys are bound to it): `tailscale funnel 7070`, or a VPS behind Caddy ([docs/BUILD-ON-IT.md, "Put it online"](../docs/BUILD-ON-IT.md#4-put-it-online)). `e2e/site.spec.ts` and `e2e/site-nodemo.spec.ts` test both builds against a mocked demo node.
+
+**The chain directory.** Each card reads its node's `/api/status` and `/api/validators` from the browser every half minute: live, resting (not answering), or refused when the node reports another chain id or genesis hash than its listing (no wallet button then). A chain with `validators_wanted` gets **Become a validator**: the steps of [docs/RUN-A-NODE.md, "Validate someone else's chain"](../docs/RUN-A-NODE.md#validate-someone-elses-chain) with its node, genesis hash and home filled in, and the way in its set needs (admission, approval or stake). With no listings it shows how to launch and list one. Listing rules: [chains/README.md](../chains/README.md). `e2e/site-chains.spec.ts` tests it against the fixture listings in `e2e/fixtures/chains/`.
 
 ### Mainnet build mode (unused)
 
@@ -121,7 +124,7 @@ Witness URLs must be `https://` (or `http://localhost` / `http://127.0.0.1` for 
 | `stake.spec.ts` | Delegate, unstake an amount and the rest, withdraw once unbonded (each tx checked by the mock node), no CSP violations, a node lying about the stake's value or shares (the amount is signed), a node without staking |
 | `paylink.spec.ts` | Receive links carry their chain and the canonical amount (a zero-padded one still fits a QR code); an absurd amount is refused without crashing; Send fills a link made for this chain, refuses one made for another chain or instance, refuses a malformed chain or genesis with fixed words, names only networks it knows, and fills an older link with a notice |
 | `governance.spec.ts` | Proposals with tallies, quorum and council votes; voting with conviction and changing the vote; releasing locks; hostile on-chain titles and links rendered inert; a node without governance |
-| `site.spec.ts`, `site-nodemo.spec.ts` | The project site (`NEXT_PUBLIC_SITE=project`, two more builds): the demo chain's live stats and links, a demo that's unreachable, answers garbage or isn't configured, the connect field's checks, wallet routes redirected home, `connect-src` holding the demo node only, phone layout in light and dark |
+| `site.spec.ts`, `site-chains.spec.ts`, `site-nodemo.spec.ts` | The project site (`NEXT_PUBLIC_SITE=project`, two more builds): the demo chain's live stats and links, a demo that's unreachable, answers garbage or isn't configured, the connect field's checks, wallet routes redirected home, the chain directory's cards (live, resting, another chain), the validator steps and their copy buttons, its empty state, `connect-src` holding the demo node and the listed nodes only, phone layout in light and dark |
 | `explorer.spec.ts` | The node's built-in explorer (`node/src/explorer.html`) on a mocked protocol v1 API: validator pools, Governance and proposal pages, parameters, name expiry, escaping, a dropped tx (not final, nothing charged) apart from one that failed in a block (its fee charged) |
 
 ## Manual release test matrix

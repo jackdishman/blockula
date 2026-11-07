@@ -1,0 +1,12 @@
+{
+  "name": "Pizza Ledger",
+  "chain_id": "pizza-ledger",
+  "token": "SLICE",
+  "description": "Who owes whom a slice, for a few friends in Lisbon.",
+  "rpc": "https://pizza.chains-fixture.com",
+  "genesis_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+  "validators_wanted": true,
+  "p2p": "pizza.chains-fixture.com:30300",
+  "contact": "pizzajack",
+  "listed_at": "2026-11-07"
+}

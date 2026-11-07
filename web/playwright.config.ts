@@ -40,7 +40,7 @@ export default defineConfig({
       ? [
           { name: "testnet", testIgnore: [/mainnet\.spec\.ts/, /served\.spec\.ts/, /site.*\.spec\.ts/], use: { baseURL: `http://localhost:${PORT}` } },
           { name: "mainnet", testMatch: /mainnet\.spec\.ts/, use: { baseURL: `http://localhost:${MAINNET_PORT}` } },
-          { name: "site", testMatch: /site\.spec\.ts/, use: { baseURL: `http://localhost:${SITE_PORT}` } },
+          { name: "site", testMatch: /site(-chains)?\.spec\.ts/, use: { baseURL: `http://localhost:${SITE_PORT}` } },
           { name: "site-nodemo", testMatch: /site-nodemo\.spec\.ts/, use: { baseURL: `http://localhost:${SITE_NODEMO_PORT}` } },
         ]
       : []),
@@ -60,8 +60,9 @@ export default defineConfig({
             NEXT_PUBLIC_MAINNET_RPC: MAINNET_RPC,
             NEXT_PUBLIC_MAINNET_GENESIS_HASH: MAINNET_GENESIS,
           }),
-          server(SITE_PORT, "site", { NEXT_PUBLIC_SITE: "project", NEXT_PUBLIC_DEMO_NODE: DEMO_NODE }, "/"),
-          server(SITE_NODEMO_PORT, "site-nodemo", { NEXT_PUBLIC_SITE: "project" }, "/"),
+          // The chain directory: three fixture listings (mocked nodes), and none at all.
+          server(SITE_PORT, "site", { NEXT_PUBLIC_SITE: "project", NEXT_PUBLIC_DEMO_NODE: DEMO_NODE, BLOCKULA_CHAINS_DIR: "e2e/fixtures/chains" }, "/"),
+          server(SITE_NODEMO_PORT, "site-nodemo", { NEXT_PUBLIC_SITE: "project", BLOCKULA_CHAINS_DIR: "e2e/fixtures/chains-empty" }, "/"),
         ]
       : []),
   ],

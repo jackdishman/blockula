@@ -154,6 +154,40 @@ On a chain someone launched (on your own, `summon` made the validators: [LAUNCH.
 6. **Keep it running** under systemd: [OPERATIONS.md, Running a validator](OPERATIONS.md#running-a-validator). Never run a second copy of `validator.key`.
 7. **Watch for upgrades.** When governance schedules a protocol version your release doesn't run, the node logs a warning every hour: "protocol vN activates at #H (in about …): install a release that supports it". Install it before that height, or the node stops there.
 
+### Validate someone else's chain
+
+The chains listed on [blockula.app](https://blockula.app) with **Wants validators** take validators from outside. Each card's **Become a validator** shows these steps with the chain's node, genesis hash and home filled in. Before you start:
+
+- **Your machine stays on and online.** A validator that sleeps or drops off misses its turns and is jailed.
+- **Two ports are open to the internet:** TCP 30300 (other validators dial it) and 7171 (your full node, which the chain publishes as your validator's HTTP address). Forward them on your router ([Running at home](#running-at-home)).
+- **Only chains on the open internet can take you.** A chain on a tailnet or a home network can't: its validators must reach yours, and yours theirs. Chains listed without **Wants validators** are open for their wallet only.
+
+With `<node>` the chain's listed `https://` node, `<hash>` its genesis hash, `<id>` its chain id and `<your host>` your public IP or DNS name:
+
+```bash
+curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh
+
+# Your own full node of the chain (leave it running): it checks the genesis hash, and serves
+# your validator's public HTTP address on port 7171
+blockula join --genesis <node> --genesis-hash <hash> --home ~/.blockula/<id> --bind 0.0.0.0
+
+# In another terminal: the validator. init prints its address (boo1…)
+blockula validator init --home ~/.blockula/<id>-validator --genesis <node> --genesis-hash <hash> \
+  --public-p2p-addr <your host>:30300 --public-http-addr http://<your host>:7171
+
+# The bond (/api/validators' min_bond), from the faucet if the chain has one; else ask the owner
+blockula wallet faucet --to <your validator address> --rpc <node>
+
+blockula run --home ~/.blockula/<id>-validator --p2p-bind 0.0.0.0
+blockula validator register --home ~/.blockula/<id>-validator --rpc <node>
+```
+
+`register` says how the chain lets you in, which depends on the size of its set:
+
+- **One or two validators:** every one is needed for each block, so a newcomer joins only once the members admit it. Send the owner your validator address (the listing's contact), check it with them, and ask them to run `blockula validator admit <your validator address> --key ~/.blockula/<id>/validator.key --rpc http://localhost:7070`. Your node signals it's ready by itself and joins at the end of that epoch.
+- **Three:** the chain's admin approves you: `blockula validator approve <your validator address> --key ~/.blockula/<id>/validator.key --rpc http://localhost:7070`.
+- **Four or more:** you join by stake at an epoch boundary, a few newcomers an epoch.
+
 **Changing its addresses** (a new IP, a new machine, a loopback address registered by mistake):
 
 ```bash

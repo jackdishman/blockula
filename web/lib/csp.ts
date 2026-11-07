@@ -1,14 +1,15 @@
 // Security headers for every response (WAL-3). The wallet derives keys in page JS, so whoever
 // can run script on this origin can take them: the CSP admits only this origin's nonce'd scripts
 // and lets the page talk only to the nodes it knows.
-import { DEMO_NODE, NETWORKS, SITE } from "./config";
+import { DEMO_NODE, NETWORKS, SITE, SITE_CHAINS } from "./config";
 
 /**
  * Origins the page may fetch from: every configured node, and a local one on 127.0.0.1 too. The
- * project site (SITE) reads its demo chain's node, and nothing else.
+ * project site (SITE) reads its demo chain's node and the listed chains' nodes (known when it's
+ * built: chains/*.json), and nothing else.
  */
 export function nodeOrigins(): string[] {
-  if (SITE) return DEMO_NODE ? [new URL(DEMO_NODE).origin] : [];
+  if (SITE) return [...new Set([...(DEMO_NODE ? [DEMO_NODE] : []), ...SITE_CHAINS.map((c) => c.rpc)].map((u) => new URL(u).origin))];
   const out = new Set<string>(["http://localhost:7070", "http://127.0.0.1:7070"]);
   for (const n of Object.values(NETWORKS)) if (n) for (const u of [n.rpc, ...(n.witnesses ?? [])]) out.add(new URL(u).origin);
   return [...out];

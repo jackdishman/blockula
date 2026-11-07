@@ -8,6 +8,10 @@ import { cspViolations, watchCsp } from "./helpers";
 const GENESIS = "d3".repeat(32);
 const cors = { "access-control-allow-origin": "*" };
 
+// The build lists the fixture chains (e2e/fixtures/chains): their nodes are site-chains.spec.ts's
+// business, so here they never answer (and nothing leaves the machine).
+test.beforeEach(({ page }) => page.route(/^https:\/\/[^/]*(chains-fixture\.com|tail1234\.ts\.net)\/api\//, (r) => r.abort()));
+
 /** A demo node behind routes: its height moves a block on every status read. */
 async function demoChain(page: Page, opts: { wallet?: string | null } = {}) {
   let height = 4210;
@@ -89,10 +93,11 @@ test("the demo chain's live stats, its wallet a click away, and the agent prompt
   expect(await cspViolations(page)).toEqual([]);
 });
 
-test("the page may talk to the demo node only (CSP connect-src)", async ({ page }) => {
+test("the page may talk to the demo node and the listed chains' nodes only (CSP connect-src)", async ({ page }) => {
   const res = await page.goto("/");
   const csp = res?.headers()["content-security-policy"] ?? "";
-  expect(csp).toContain(`connect-src 'self' ${DEMO_NODE};`);
+  // The listed nodes follow (e2e/site-chains.spec.ts checks the whole list).
+  expect(csp).toContain(`connect-src 'self' ${DEMO_NODE} https://`);
   expect(csp).not.toContain("localhost:7070");
 });
 

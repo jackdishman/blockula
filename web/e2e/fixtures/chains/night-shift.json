@@ -1,0 +1,11 @@
+{
+  "name": "Night Shift",
+  "chain_id": "night-shift",
+  "token": "OWL",
+  "description": "A notary log for a hospital night crew.",
+  "rpc": "https://owl.chains-fixture.com",
+  "genesis_hash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+  "validators_wanted": true,
+  "p2p": "203.0.113.10:30300",
+  "contact": "owlnurse"
+}

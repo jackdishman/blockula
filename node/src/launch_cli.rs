@@ -503,10 +503,16 @@ pub fn guide(plan: &Plan, g: &Genesis, home: &Path, genesis_hash: &str, https_ur
     }
     if let Some(u) = plan.shared_url() {
         s += &format!(
-            "## Friends run their own node\n\nThey install Blockula, then run:\n\n```sh\ncurl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh\nblockula join --genesis {u} --genesis-hash {genesis_hash} --home ~/.blockula/{id}\n```\n\nTheir node checks every block, and its explorer is at http://localhost:7171. To make them a validator, follow step 4 of https://github.com/jackdishman/blockula/blob/main/docs/LAUNCH.md and approve them with:\n\n```sh\nblockula validator approve <their validator address> --key {key} --rpc {local}\n```\n\n",
+            "## Friends run their own node\n\nThey install Blockula, then run:\n\n```sh\ncurl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh\nblockula join --genesis {u} --genesis-hash {genesis_hash} --home ~/.blockula/{id}\n```\n\nTheir node checks every block, and its explorer is at http://localhost:7171. To make them a validator, follow step 3 of https://github.com/jackdishman/blockula/blob/main/docs/LAUNCH.md and approve them with:\n\n```sh\nblockula validator approve <their validator address> --key {key} --rpc {local}\n```\n\n",
             id = g.chain_id,
             key = display_home(&home.join("validator.key")),
             local = plan.local_url(),
+        );
+    }
+    if let Some(l) = listing(plan, g, genesis_hash, https_url) {
+        s += &format!(
+            "## List it on blockula.app\n\nAnyone can find it in the chain directory at https://blockula.app {}. This link opens GitHub with its `chains/{}.json` filled in: add your GitHub handle as the contact, check the rest, and open the pull request ({REGISTRY_REPO}/blob/main/chains/README.md says what gets listed).\n\n{}\n\n",
+            l.note, g.chain_id, l.link
         );
     }
     s += &format!(
@@ -515,6 +521,67 @@ pub fn guide(plan: &Plan, g: &Genesis, home: &Path, genesis_hash: &str, https_ur
         wallet = plan.wallet_url(),
     );
     s
+}
+
+/// The repo whose `chains/` directory blockula.app lists (chains/README.md).
+const REGISTRY_REPO: &str = "https://github.com/jackdishman/blockula";
+
+/// How to list a launched chain on blockula.app: GitHub's new-file page with its
+/// `chains/<chain id>.json` filled in, and what to do first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listing {
+    pub link: String,
+    /// What must be true before the pull request (HTTPS, Funnel), and what the listing offers.
+    pub note: String,
+}
+
+/// The listing for a chain the internet can reach, or `None` for one only this machine, a home
+/// network or a tailnet reaches. On the open internet it takes validators (its p2p address is
+/// public), once a DNS name serves its node over HTTPS. A tailnet chain served over HTTPS can be
+/// listed for its wallet only, once Tailscale Funnel opens it: Funnel carries HTTPS, not p2p.
+/// The contact (and a missing description) are left as placeholders the directory's checker
+/// refuses until they're filled in.
+pub fn listing(plan: &Plan, g: &Genesis, genesis_hash: &str, https_url: Option<&str>) -> Option<Listing> {
+    let (rpc, p2p, note) = match (plan.reach, plan.host.as_deref(), https_url) {
+        (Reach::Internet, Some(h), _) => {
+            let named = h.parse::<std::net::IpAddr>().is_err();
+            let rpc = if named { format!("https://{h}") } else { "https://<a DNS name for this machine>".to_string() };
+            let note = format!(
+                "once {} serves this node over HTTPS (a reverse proxy such as Caddy: https://github.com/jackdishman/blockula/blob/main/docs/BUILD-ON-IT.md#4-put-it-online). It lists the chain with validators wanted",
+                if named { rpc.clone() } else { "a DNS name".to_string() }
+            );
+            (rpc, Some(g.validators[0].p2p_addr.clone()), note)
+        }
+        (Reach::Tailscale, _, Some(u)) => (
+            u.trim_end_matches('/').to_string(),
+            None,
+            format!("once `tailscale funnel --bg {}` opens it to the internet. Wallets only: validators can't reach a tailnet from outside", chain::SUMMON_HTTP_PORT),
+        ),
+        _ => return None,
+    };
+    let s = |v: &str| serde_json::to_string(v).expect("a string serializes");
+    let description = if plan.description.is_empty() { "<one sentence about it>" } else { plan.description.as_str() };
+    let mut json = format!(
+        "{{\n  \"name\": {},\n  \"chain_id\": {},\n  \"token\": {},\n  \"description\": {},\n  \"rpc\": {},\n  \"genesis_hash\": {},\n  \"validators_wanted\": {}",
+        s(&plan.name),
+        s(&g.chain_id),
+        s(&plan.token),
+        s(description),
+        s(&rpc),
+        s(genesis_hash),
+        p2p.is_some()
+    );
+    if let Some(p) = &p2p {
+        json += &format!(",\n  \"p2p\": {}", s(p));
+    }
+    json += ",\n  \"contact\": \"<your GitHub handle>\"\n}\n";
+    let link = format!("{REGISTRY_REPO}/new/main?filename={}&value={}", url_encode(&format!("chains/{}.json", g.chain_id)), url_encode(&json));
+    Some(Listing { link, note })
+}
+
+/// Percent-encodes everything but RFC 3986's unreserved characters, for a query value.
+fn url_encode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
 /// `tailscale serve --bg <port>`, then this machine's HTTPS URL on the tailnet.
@@ -593,6 +660,10 @@ pub fn launch(a: &LaunchArgs) -> Result<Launched> {
     }
     if let Some(u) = plan.shared_url() {
         println!("   Their own node: blockula join --genesis {u} --genesis-hash {hash} --home ~/.blockula/{}", plan.chain_id);
+    }
+    if let Some(l) = listing(&plan, &g, &hash, https.as_deref()) {
+        println!("   List it on blockula.app ({}):", l.note);
+        println!("                  {}", l.link);
     }
     println!("   Start again:   {}", plan.run_command(&home));
     println!("   Everything else (apps, adding validators): {}", display_home(&home.join("LAUNCH.md")));
@@ -693,6 +764,85 @@ mod tests {
         assert!(plan_from_flags(&LaunchArgs { name: Some("X Y".into()), reach: Some(Reach::Local), https: true, ..Default::default() }, &m).is_err());
         let local = plan_from_flags(&LaunchArgs { name: Some("X Y".into()), ..Default::default() }, &NO_NET).unwrap();
         assert_eq!((local.reach, local.host), (Reach::Local, None));
+    }
+
+    /// The `value` query parameter of a listing link, decoded.
+    fn listed_json(link: &str) -> serde_json::Value {
+        let v = link.split("&value=").nth(1).unwrap();
+        let bytes = v.as_bytes();
+        let mut out = vec![];
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                out.push(u8::from_str_radix(&v[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    /// A chain the internet reaches gets a "List it on blockula.app" link: with validators on the
+    /// open internet, wallets only on a tailnet served over HTTPS (Funnel), none otherwise.
+    #[test]
+    fn listing_links() {
+        let home = std::env::temp_dir().join(format!("blockula-launch-list-{}-{}", chain::now_ms(), std::process::id()));
+        let plan = Plan {
+            name: "Jack in the Block".into(),
+            description: "Jack's friends' ledger.".into(),
+            token: "JACK".into(),
+            chain_id: "jack-in-the-block".into(),
+            reach: Reach::Internet,
+            host: Some("ledger.example.org".into()),
+            block_time_ms: 5_000,
+            faucet: true,
+            min_bond: None,
+            programs: false,
+            https: false,
+        };
+        Chain::summon(&home, &plan.summon_opts()).unwrap();
+        let g = Genesis::load(&home.join("genesis.json")).unwrap();
+        let hash = hex::encode(crate::consensus::genesis_block(&g).digest_bytes());
+
+        let l = listing(&plan, &g, &hash, None).unwrap();
+        assert!(l.link.starts_with("https://github.com/jackdishman/blockula/new/main?filename=chains%2Fjack-in-the-block.json&value=%7B%0A"), "{}", l.link);
+        assert!(l.note.contains("https://ledger.example.org serves this node over HTTPS") && l.note.contains("validators wanted"), "{}", l.note);
+        let j = listed_json(&l.link);
+        assert_eq!(j, serde_json::json!({
+            "name": "Jack in the Block",
+            "chain_id": "jack-in-the-block",
+            "token": "JACK",
+            "description": "Jack's friends' ledger.",
+            "rpc": "https://ledger.example.org",
+            "genesis_hash": hash,
+            "validators_wanted": true,
+            "p2p": "ledger.example.org:30300",
+            "contact": "<your GitHub handle>",
+        }));
+        assert!(guide(&plan, &g, &home, &hash, None).contains(&format!("## List it on blockula.app\n\nAnyone can find it in the chain directory at https://blockula.app once https://ledger.example.org serves")));
+
+        // An IP address can't be a listing's https name: the rpc is left for a DNS name.
+        let ip = Plan { host: Some("203.0.113.10".into()), description: String::new(), ..plan.clone() };
+        let j = listed_json(&listing(&ip, &g, &hash, None).unwrap().link);
+        assert_eq!((j["rpc"].as_str(), j["description"].as_str()), (Some("https://<a DNS name for this machine>"), Some("<one sentence about it>")));
+
+        // A tailnet: listed for its wallet once Funnel serves it, and only with HTTPS on.
+        let ts = Plan { reach: Reach::Tailscale, host: Some("100.64.0.7".into()), https: true, ..plan.clone() };
+        assert_eq!(listing(&ts, &g, &hash, None), None);
+        let l = listing(&ts, &g, &hash, Some("https://box.tail1234.ts.net")).unwrap();
+        assert!(l.note.contains("tailscale funnel --bg 7070") && l.note.contains("Wallets only"), "{}", l.note);
+        let j = listed_json(&l.link);
+        assert_eq!((j["rpc"].as_str(), j["validators_wanted"].as_bool(), j.get("p2p")), (Some("https://box.tail1234.ts.net"), Some(false), None));
+
+        for (reach, host) in [(Reach::Local, None), (Reach::Home, Some("192.168.1.20".to_string()))] {
+            let p = Plan { reach, host, ..plan.clone() };
+            assert_eq!(listing(&p, &g, &hash, None), None, "{reach:?}");
+            assert!(!guide(&p, &g, &home, &hash, None).contains("blockula.app"));
+        }
+        assert_eq!(url_encode("a b/é\"~"), "a%20b%2F%C3%A9%22~");
+        std::fs::remove_dir_all(home).ok();
     }
 
     /// The plan summons what it says, and the guide names the real genesis hash.

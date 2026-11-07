@@ -1,0 +1,10 @@
+{
+  "name": "Garden Club",
+  "chain_id": "garden-club",
+  "token": "SEED",
+  "description": "Seed swaps and a shared kitty for the allotment.",
+  "rpc": "https://garden.tail1234.ts.net",
+  "genesis_hash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+  "validators_wanted": false,
+  "contact": "https://garden-club.chains-fixture.com/contact"
+}

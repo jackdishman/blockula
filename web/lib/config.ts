@@ -8,6 +8,7 @@
  * so a wrong or fake node can't get a testnet signature replayed on mainnet or vice versa.
  */
 
+import type { ListedChain } from "./chains";
 import { demoNode } from "./site";
 
 /** Mainnet's chain id and address prefix (DEC-7). */
@@ -101,6 +102,11 @@ export const SERVED = process.env.NEXT_PUBLIC_BLOCKULA_SERVED === "1";
 export const SITE = process.env.NEXT_PUBLIC_SITE === "project";
 /** NEXT_PUBLIC_DEMO_NODE: the site's demo chain, a node's https URL (unset: the demo is resting). */
 export const DEMO_NODE = SITE ? demoNode(process.env.NEXT_PUBLIC_DEMO_NODE) : undefined;
+/**
+ * The chains the project site lists (chains/*.json in the repo), read and checked when it's built
+ * (next.config.ts, lib/chains.ts). Empty in every other build.
+ */
+export const SITE_CHAINS: ListedChain[] = SITE ? (JSON.parse(process.env.BLOCKULA_SITE_CHAINS || "[]") as ListedChain[]) : [];
 /** Where the app's routes live under the origin: `/wallet` when served, else the root. */
 export const BASE_PATH = SERVED ? "/wallet" : "";
 

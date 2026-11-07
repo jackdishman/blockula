@@ -29,7 +29,7 @@ blockula launch
    For friends:   blockula join --genesis http://100.64.0.7:7070 --genesis-hash cc5b… --home ~/.blockula/jack-in-the-block
 ```
 
-The whole walk-through, with friends joining and becoming validators: **[docs/LAUNCH.md](docs/LAUNCH.md)**.
+The whole walk-through, with friends joining and becoming validators: **[docs/LAUNCH.md](docs/LAUNCH.md)**. Chains open to everyone can be listed on [blockula.app](https://blockula.app), where others join them or run a validator: [chains/README.md](chains/README.md).
 
 ## What you get
 

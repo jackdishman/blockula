@@ -19,9 +19,9 @@ export function SiteHeader() {
       </a>
       <nav aria-label="Sections">
         <a href="#demo">Demo</a>
-        <a href="#how">How it works</a>
+        <a href="#how" className="site-nav-wide">How it works</a>
         <a href="#launch">Launch</a>
-        <a href="#contribute" className="site-nav-wide">Contribute</a>
+        <a href="#chains">Join a chain</a>
         <a href={REPO}>GitHub</a>
       </nav>
     </header>

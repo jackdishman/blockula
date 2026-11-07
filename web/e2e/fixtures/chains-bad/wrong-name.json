@@ -1,0 +1,11 @@
+{
+  "name": "Tailnet Only",
+  "chain_id": "tailnet-only",
+  "token": "TAIL",
+  "description": "Validators wanted on a tailnet.",
+  "rpc": "https://box.tail1234.ts.net",
+  "genesis_hash": "f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6",
+  "validators_wanted": true,
+  "p2p": "box.tail1234.ts.net:30300",
+  "contact": "tailfan"
+}

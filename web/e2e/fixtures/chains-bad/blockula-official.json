@@ -1,0 +1,10 @@
+{
+  "name": "Blockula Official",
+  "chain_id": "blockula-official",
+  "token": "FANG",
+  "description": "The real one.",
+  "rpc": "https://blockula-app.chains-fixture.com",
+  "genesis_hash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+  "validators_wanted": false,
+  "contact": "notblockula"
+}
