@@ -155,6 +155,21 @@ test("connect to any chain: checks the address, then opens that node's wallet", 
   await expect(page).toHaveTitle("A friend's wallet");
 });
 
+test("connect: \"Use the demo chain\" fills in the demo node, and ?node= fills in a friend's", async ({ page }) => {
+  await page.route(`${DEMO_NODE}/api/**`, (r) => r.abort());
+  await page.goto("/");
+  const input = page.getByTestId("connect-input");
+  await page.getByTestId("connect-demo").click();
+  await expect(input).toHaveValue(DEMO_NODE);
+  await expect(page.getByTestId("connect-note")).toContainText(`Opens ${DEMO_NODE}/wallet/`);
+  await expect(page.getByTestId("connect-demo")).toBeHidden();
+  // A link fills the field and stops there: the visitor opens the wallet themselves.
+  await page.goto("/?node=" + encodeURIComponent("https://jack.tail1234.ts.net"));
+  await expect(input).toHaveValue("https://jack.tail1234.ts.net");
+  await expect(page.getByTestId("connect-note")).toContainText("Opens https://jack.tail1234.ts.net/wallet/");
+  await expect(page).toHaveURL(/\/\?node=/);
+});
+
 test("the wallet's routes go to the landing page", async ({ page }) => {
   await page.route(`${DEMO_NODE}/api/**`, (r) => r.abort());
   for (const path of ["/welcome", "/send?to=sam.boo&amount=1", "/explore", "/tx/abc", "/nope"]) {

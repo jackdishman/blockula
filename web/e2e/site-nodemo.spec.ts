@@ -16,6 +16,7 @@ test("with no demo configured, the demo rests and the page talks to no node", as
   await expect(resting).toContainText("no demo running");
   await expect(page.getByTestId("demo-wallet")).toHaveCount(0);
   await expect(page.getByTestId("connect-input")).toBeVisible();
+  await expect(page.getByTestId("connect-demo")).toHaveCount(0);
   await expect(page.locator("#launch .landing-cmd")).toHaveCount(2);
   await expect(page.getByTestId("contribute-prompt")).toBeVisible();
   await page.waitForTimeout(500);
