@@ -321,11 +321,14 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
         }
     }
 
-    fn choose(&mut self, q: &str, options: &[String], default: usize) -> Result<usize> {
+    fn choose(&mut self, heading: Option<&str>, options: &[String], default: usize) -> Result<usize> {
+        if let Some(h) = heading {
+            writeln!(self.out, "  {h}")?;
+        }
         for (i, o) in options.iter().enumerate() {
             writeln!(self.out, "    {}) {o}", i + 1)?;
         }
-        self.ask(q, Some(&(default + 1).to_string()), |a| a.parse::<usize>().ok().filter(|n| (1..=options.len()).contains(n)).map(|n| n - 1).ok_or_else(|| anyhow!("a number from 1 to {}", options.len())))
+        self.ask(&format!("Pick 1–{}", options.len()), Some(&(default + 1).to_string()), |a| a.parse::<usize>().ok().filter(|n| (1..=options.len()).contains(n)).map(|n| n - 1).ok_or_else(|| anyhow!("a number from 1 to {}", options.len())))
     }
 }
 
@@ -418,7 +421,7 @@ pub fn plan_by_asking<R: BufRead, W: Write>(p: &mut Prompter<R, W>, a: &LaunchAr
                 })
                 .collect();
             let default = if m.tailscale_ip.is_some() { 1 } else { 0 };
-            Reach::ALL[p.choose("Choose", &options, default)?]
+            Reach::ALL[p.choose(None, &options, default)?]
         }
     };
     let host = match (reach, &a.host) {
@@ -432,7 +435,7 @@ pub fn plan_by_asking<R: BufRead, W: Write>(p: &mut Prompter<R, W>, a: &LaunchAr
         Some(ms) => ms.max(1),
         None => {
             let options: Vec<String> = BLOCK_TIMES.iter().map(|(_, l)| l.to_string()).collect();
-            BLOCK_TIMES[p.choose("A block every", &options, 2)?].0
+            BLOCK_TIMES[p.choose(Some("A block every"), &options, 2)?].0
         }
     };
     let faucet = if a.no_faucet { false } else { p.confirm(&format!("Faucet: anyone who reaches the chain gets 100 {token} at a time?"), reach != Reach::Internet)? };
@@ -640,7 +643,7 @@ mod tests {
         let (plan, out) = ask("\n\n\n\n", &a, &NO_NET);
         let plan = plan.unwrap();
         assert_eq!((plan.token.as_str(), plan.host.clone(), plan.block_time_ms, plan.programs, plan.https), ("JACK", None, 2_000, true, false));
-        assert!(!out.contains("Chain name") && !out.contains("A block every") && !out.contains("Choose"), "{out}");
+        assert!(!out.contains("Chain name") && !out.contains("A block every") && !out.contains("Pick 1–"), "{out}");
         assert_eq!(plan.bind(), "127.0.0.1");
         // Run out of answers: an error, not a loop.
         assert!(ask("", &LaunchArgs::default(), &NO_NET).0.unwrap_err().to_string().contains("stdin closed"));

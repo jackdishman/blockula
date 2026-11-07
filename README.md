@@ -21,7 +21,7 @@ blockula launch
     2) Tailscale          friends anywhere, and only your tailnet can reach it (found 100.64.0.7)
     3) One home network   every machine on the same Wi-Fi or LAN (found 192.168.1.20)
     4) The open internet  a public IP or DNS name, TCP 30300 and 7070 forwarded
-  Choose [2]:
+  Pick 1–4 [2]:
   …
 
 🪦 Jack in the Block is summoned (JACK).
