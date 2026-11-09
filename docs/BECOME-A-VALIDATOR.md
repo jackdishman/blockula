@@ -34,7 +34,7 @@ From the chain's listing on [blockula.app](https://blockula.app) (its **Become a
 |---|---|---|
 | **Node URL** | One of the chain's nodes, `https://…` | `https://demo.blockula.app` |
 | **Genesis hash** | 64 hex characters that pin the exact chain, so nobody can swap in a fake one | `e712d937…d0250f705e` |
-| **Contact** | Who to send your validator address to | the listing's `contact` |
+| **Contact** | Who to send your validator address to | the listing's `contact`; for the demo chain, the [node form](https://github.com/jackdishman/blockula/issues/new?template=node-operator.yml) |
 
 Check the hash yourself: `curl -s <node>/api/status` shows `genesis_hash`, and it must match what the chain's operator told you. Only chains on the open internet can take outside validators: one that runs on a home network or a tailnet can't.
 
@@ -262,7 +262,7 @@ Your validator still dials other validators directly from home, so they see your
 
 `register` locks your bond and prints how this chain lets you in. It depends on how many validators the chain has:
 
-- **One to three validators:** every one counts for every block, so the operator lets each newcomer in by hand. Send them your validator address (`boo1…`, which `init` printed) through the listing's contact, and confirm it with them in a second way (a message from an account they know you by). `register` prints the command they run: `blockula validator admit <your address> …` on chains with admission, or `blockula validator approve <your address> …` on others. Your node signals it's ready by itself, and you join at the end of the epoch.
+- **One to three validators:** every one counts for every block, so the operator lets each newcomer in by hand. Send them your validator address (`boo1…`, which `init` printed) through the listing's contact, and confirm it with them in a second way (a message from an account they know you by). `register` prints the command they run: `blockula validator admit <your address> …` on chains with admission, or `blockula validator approve <your address> …` on others. Your node signals it's ready by itself, and you join at the end of the epoch. For the demo chain, ask with the [node form](https://github.com/jackdishman/blockula/issues/new?template=node-operator.yml): it asks for the chain, your address and your node's p2p and HTTP addresses, and it's public, so send nothing secret. A person reads it, so allow a few days.
 - **Four or more:** you join by stake at an epoch boundary, a few newcomers an epoch, ranked by bond plus what others delegate to you.
 
 An epoch is a fixed number of blocks; `curl -s <node>/api/validators | jq .blocks_until_next_epoch` says how long until the next one. Until you're in, your node waits where it caught up to; once you're in, it follows the chain over p2p.
