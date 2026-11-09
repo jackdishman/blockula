@@ -771,9 +771,9 @@ dependencies = [
 
 [[package]]
 name = "commonware-formatting"
-version = "2026.9.0"
+version = "2026.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cdfc3a5a45f024571d9abce2bdb5a52081f9f017e61b80e2bff89856361ceee"
+checksum = "76bc4db389a15178f935b4d2ef4d4d7c5ae9925631bd12c75e7c0f95e24f65d4"
 dependencies = [
  "commonware-macros",
  "const-hex",
@@ -781,9 +781,9 @@ dependencies = [
 
 [[package]]
 name = "commonware-macros"
-version = "2026.9.0"
+version = "2026.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3058bc70420515d6e92d99510ec2b2a2e1d029a6aced44d243c05ce8d60c6493"
+checksum = "b7ee2a1a0f65788f7e00d025933e833959e2a6a7808f74d26029bb6715d51be9"
 dependencies = [
  "commonware-macros-impl",
  "tokio",
@@ -791,9 +791,9 @@ dependencies = [
 
 [[package]]
 name = "commonware-macros-impl"
-version = "2026.9.0"
+version = "2026.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbcf77c39d7486af7394b1d1c4d268d08a5763036b813a2e6aba2ee825b5bd45"
+checksum = "a67b8171d05c6c8dfd691b8ecb263550e820d904dd100369efeb59a3d78be138"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -845,15 +845,16 @@ dependencies = [
 
 [[package]]
 name = "commonware-parallel"
-version = "2026.9.0"
+version = "2026.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10bae95b6d977699c212691a996805e241936d8f958c73a1ebff0190376d1260"
+checksum = "c450e759557e4df7496c2e75a489ccb84f71d24787fdf545a45ac59ba2a6d487"
 dependencies = [
  "cfg-if",
  "commonware-macros",
+ "crossbeam-deque",
+ "crossbeam-utils",
  "dashmap",
  "futures",
- "rayon",
 ]
 
 [[package]]
@@ -1198,9 +1199,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.5"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
+checksum = "261af4dc7a06ea8a527a8717d8cbba3417530d6ea14e1edb3de6b67806be474f"
 dependencies = [
  "cmov",
  "subtle",
@@ -2161,9 +2162,9 @@ dependencies = [
 
 [[package]]
 name = "ml-dsa"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "add6b9d92e496f16f4526d68ff29da1483aba4b119baeab8bed3b9e3544a6f3d"
+checksum = "6f6d49c3f3f0e10e18ca975ffda66f8da0ec36521c1d911adcbc521bf0743f5c"
 dependencies = [
  "const-oid",
  "crypto-common 0.2.2",
@@ -2193,9 +2194,9 @@ dependencies = [
 
 [[package]]
 name = "module-lattice"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c61b87c9683ab7cb1c6871d261ad5479b6b10ceb52c4352aaca3b5d35a8febe"
+checksum = "c4a1e412c8ee83a1c678f427806219c49c96b2511b9f07497514f0e43fb26155"
 dependencies = [
  "ctutils",
  "hybrid-array",
