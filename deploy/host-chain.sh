@@ -17,6 +17,7 @@
 #   ORG, REGION                     Fly org and region (default: personal, iad)
 #   BLOCK_TIME_MS                   default 2000
 #   NO_FAUCET=1                     no faucet: the validator holds the starting supply
+#   PROGRAMS=1                      programs (WebAssembly, experimental) on from block 1
 #   VM_MEMORY                       default 512mb (plus 512 MB of swap)
 #   VOLUME_GB                       default 3 (a validator keeps about two days of blocks)
 #   HOSTED_DIR                      where the chain's genesis and key live on this machine
@@ -67,7 +68,7 @@ if [ ! -f "$HOSTED_DIR/genesis.json" ]; then
   # `create` since v1.0.3; `launch` is its older name.
   sub=create; blockula create --help >/dev/null 2>&1 || sub=launch
   blockula "$sub" --name "$NAME" --token "$TOKEN" --chain-id "$CHAIN_ID" ${DESCRIPTION:+--description "$DESCRIPTION"} \
-    --reach internet --host "$DOMAIN" --block-time-ms "$BLOCK_TIME_MS" ${NO_FAUCET:+--no-faucet} \
+    --reach internet --host "$DOMAIN" --block-time-ms "$BLOCK_TIME_MS" ${NO_FAUCET:+--no-faucet} ${PROGRAMS:+--programs} \
     --home "$HOSTED_DIR/home" --no-start --yes | grep -oE 'genesis-hash [0-9a-f]{64}' | cut -d' ' -f2 > "$HOSTED_DIR/genesis-hash"
   [ -s "$HOSTED_DIR/genesis-hash" ] || die "blockula $sub printed no genesis hash"
   cp "$HOSTED_DIR/home/genesis.json" "$HOSTED_DIR/genesis.json"
