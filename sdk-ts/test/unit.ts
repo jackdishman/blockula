@@ -846,3 +846,17 @@ assert.throws(() => buildDistribution(1, []), /at least one/);
 assert.throws(() => buildDistribution(1, [{ address: "boo1a", amount: 0n }]), /gets 0/);
 assert.ok(!verifyDistributionProof(DV.trees[0].root, 7, DV.trees[0].entries[0].address, 1_000_000_000n, ["zz"]), "malformed proofs don't verify");
 console.log(`✓ ${DV.trees.length} distribution trees (leaves, roots, proofs) match the node`);
+
+// ---- the people directory (`/api/accounts`, `/api/names`) ----
+{
+  const row = { account: { address: BOB, name: "bob.boo", short: "boo1…" }, names: ["bob.boo"], balance: "5000000000", balance_display: "5 FANG", transferable: "5000000000", transferable_display: "5 FANG", last_active: 12, validator: false, program: false, system: null };
+  node.routes["/accounts"] = { sort: "balance", accounts: [row], next: null, total: 1, accounts_total: 3 };
+  node.routes[`/accounts?sort=names&limit=1&after=${VALIDATOR}`] = { sort: "names", accounts: [row], next: BOB, total: 2, accounts_total: 3 };
+  node.routes["/names?sort=alpha&after=amber.boo"] = { sort: "alpha", names: [{ name: "bob.boo", owner: row.account, registered_at: 3, expires_at: 99, grace_until: 120, status: "active" }], next: null, total: 2 };
+  assert.equal((await client.accounts()).accounts[0].names[0], "bob.boo", "no options, no query");
+  const page = await client.accounts({ sort: "names", limit: 1, after: VALIDATOR });
+  assert.equal(page.next, BOB);
+  assert.equal(page.accounts_total, 3);
+  assert.equal((await client.names({ sort: "alpha", after: "amber.boo" })).names[0].owner.address, BOB);
+  console.log("✓ the people directory pages accounts and names");
+}
