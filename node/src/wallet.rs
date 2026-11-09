@@ -57,6 +57,8 @@ pub struct Wallet {
     pages: HashMap<&'static str, Page>,
     /// Directories whose children are a dynamic route's ids (those holding a `_/index.html`).
     dynamic: HashSet<String>,
+    /// The export's `manifest.webmanifest` under the chain's name (`chain_manifest`), if it has one.
+    manifest: Option<Arc<str>>,
 }
 
 fn gunzip(bytes: &[u8]) -> Vec<u8> {
@@ -110,18 +112,20 @@ impl Wallet {
     fn from_files(table: &'static [(&'static str, bool, &'static [u8])], chain_name: &str) -> Self {
         let files: HashMap<_, _> = table.iter().map(|(p, gz, bytes)| (*p, File { gz: *gz, bytes })).collect();
         let title = format!("<title>{} Wallet</title>", html_escape(chain_name));
+        let apple_title = format!("name=\"apple-mobile-web-app-title\" content=\"{}\"", html_escape(&home_screen_name(chain_name)));
         let pages = files
             .iter()
             .filter(|(p, _)| p.ends_with(".html"))
             .map(|(p, f)| {
                 let raw = if f.gz { gunzip(f.bytes) } else { f.bytes.to_vec() };
-                let html = String::from_utf8_lossy(&raw).replacen("<title>Blockula Wallet</title>", &title, 1);
+                let html = String::from_utf8_lossy(&raw).replacen("<title>Blockula Wallet</title>", &title, 1).replacen("name=\"apple-mobile-web-app-title\" content=\"Blockula\"", &apple_title, 1);
                 let csp = page_csp(&html);
                 (*p, Page { html: html.into(), csp: csp.into() })
             })
             .collect();
         let dynamic = files.keys().filter_map(|p| p.strip_suffix(&format!("/{PLACEHOLDER}/index.html"))).map(str::to_string).collect();
-        Self { files, pages, dynamic }
+        let manifest = files.get("manifest.webmanifest").and_then(|f| chain_manifest(&if f.gz { gunzip(f.bytes) } else { f.bytes.to_vec() }, chain_name)).map(Into::into);
+        Self { files, pages, dynamic, manifest }
     }
 
     /// The export file a request path (below `/wallet/`, still percent-encoded) is answered
@@ -179,6 +183,14 @@ impl Wallet {
         if self.pages.contains_key(file) {
             return self.page(file, StatusCode::OK);
         }
+        if let (true, Some(m)) = (file == "manifest.webmanifest", &self.manifest) {
+            let mut res = Response::new(Body::from(m.to_string()));
+            let h = res.headers_mut();
+            h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/manifest+json"));
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            common_headers(h);
+            return res;
+        }
         let f = self.files[file];
         let accepts_gzip = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).is_some_and(|v| v.split(',').any(|e| e.trim().split(';').next() == Some("gzip")));
         let cache = if file.starts_with("_next/static/") { "public, max-age=31536000, immutable" } else if file.ends_with(".txt") { "no-cache" } else { "public, max-age=3600" };
@@ -216,6 +228,23 @@ impl Wallet {
         common_headers(h);
         res
     }
+}
+
+/// The name under the wallet's icon on a home screen: the chain's, when it's short enough to fit
+/// (iOS cuts a label at about 12 characters), else "Blockula".
+fn home_screen_name(chain_name: &str) -> String {
+    if chain_name.chars().count() <= 12 { chain_name.to_string() } else { "Blockula".to_string() }
+}
+
+/// The export's web app manifest (web/app/manifest.ts) named after the chain, as the pages'
+/// titles are: Add to Home Screen then offers "<chain> Wallet". Paths in it are relative to the
+/// manifest, so they already point under `/wallet/`. `None` if it isn't a JSON object.
+fn chain_manifest(raw: &[u8], chain_name: &str) -> Option<String> {
+    let mut m: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let o = m.as_object_mut()?;
+    o.insert("name".into(), format!("{chain_name} Wallet").into());
+    o.insert("short_name".into(), home_screen_name(chain_name).into());
+    serde_json::to_string(&m).ok()
 }
 
 fn common_headers(h: &mut HeaderMap) {
@@ -339,6 +368,8 @@ mod tests {
                 ("tx/_/__next.tx.$d$id.__PAGE__.txt", true, gz("2:segment")),
                 ("programs/index.html", true, gz(INDEX)),
                 ("programs/_/index.html", true, gz(INDEX)),
+                ("manifest.webmanifest", true, gz(r#"{"name":"Blockula Wallet","short_name":"Blockula","start_url":"./","scope":"./","display":"standalone","icons":[{"src":"icon-192.png","sizes":"192x192","type":"image/png"}]}"#)),
+                ("apple-icon.png", false, &b"\x89PNG\r\n\x1a\n"[..]),
             ]
             .into_boxed_slice(),
         )
@@ -450,6 +481,27 @@ mod tests {
         for (p, t) in [("a.css", "text/css; charset=utf-8"), ("i.svg", "image/svg+xml"), ("x.bin", "application/octet-stream"), ("m.webmanifest", "application/manifest+json")] {
             assert_eq!(content_type(p), t);
         }
+    }
+
+    /// Add to Home Screen: the manifest is the chain's, its paths stay relative (under
+    /// `/wallet/`), and the touch icon is a PNG.
+    #[tokio::test]
+    async fn the_manifest_and_touch_icon_are_the_chains() {
+        let w = wallet();
+        let res = w.respond("manifest.webmanifest", &HeaderMap::new());
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "application/manifest+json");
+        let m: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(m["name"], "Jack's <Chain> Wallet", "JSON, not HTML: nothing to escape");
+        assert_eq!(m["short_name"], "Blockula", "too long for a home screen");
+        assert_eq!((m["start_url"].as_str(), m["scope"].as_str(), m["display"].as_str()), (Some("./"), Some("./"), Some("standalone")));
+        assert_eq!(m["icons"][0]["src"], "icon-192.png");
+        let res = w.respond("apple-icon.png", &HeaderMap::new());
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(home_screen_name("DISHNET"), "DISHNET");
+        let page = br#"<head><title>Blockula Wallet</title><meta name="apple-mobile-web-app-title" content="Blockula"/></head>"#;
+        let html = Wallet::from_files(Box::leak(vec![("index.html", false, &page[..])].into_boxed_slice()), "DISHNET").pages["index.html"].html.to_string();
+        assert!(html.contains(r#"<meta name="apple-mobile-web-app-title" content="DISHNET"/>"#), "{html}");
     }
 
     #[tokio::test]

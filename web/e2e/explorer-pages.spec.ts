@@ -47,7 +47,7 @@ const receipt = (p: Page) => p.locator(".receipt .headline");
 test("no explorer page server-renders a style attribute (the CSP would block it)", async ({ request, node }) => {
   test.skip(!!process.env.E2E_DEV, "next dev relaxes the CSP");
   const w = seedWorld(node);
-  const paths = ["/explore", `/tx/${w.ids.sent}`, `/tx/${w.ids.dropped}`, "/account/vlad.boo", "/block/101", "/trace/vlad.boo", "/name/castle", "/name/tomb", "/programs", "/programs/hunts", "/programs/validators", "/programs/pool", "/programs/names", "/programs/accounts", "/hunt/0", "/claim/1", "/seance/2", "/governance", `/program/${PROGRAM}`, `/program/${w.wasm_hash}`, `/tx/${w.ids.programCall}`, `/tx/${w.ids.programFailed}`];
+  const paths = ["/explore", `/tx/${w.ids.sent}`, `/tx/${w.ids.dropped}`, "/account/vlad.boo", "/block/101", "/trace/vlad.boo", "/name/castle", "/name/tomb", "/programs", "/programs/hunts", "/programs/validators", "/programs/pool", "/programs/names", "/programs/accounts", "/people", "/hunt/0", "/claim/1", "/seance/2", "/governance", `/program/${PROGRAM}`, `/program/${w.wasm_hash}`, `/tx/${w.ids.programCall}`, `/tx/${w.ids.programFailed}`];
   for (const path of paths) {
     const res = await request.get(path);
     expect(res.status(), path).toBe(200);
@@ -346,6 +346,45 @@ test.describe("every explorer page", () => {
     expect(await cspViolations(page)).toEqual([]);
     expect(errors).toEqual([]);
   });
+
+  test("people: accounts by name, richest, newest active and alphabetical, with the newest names", async ({ page }) => {
+    // The Pulse's accounts figure opens the directory.
+    await visit(page, "/explore", (p) => p.getByRole("heading", { name: "blockula-testnet, live" }), errors);
+    await page.getByTestId("pulse-people").click();
+    await expect(page).toHaveURL(/\/people\/?$/);
+    await visit(page, "/people", (p) => p.getByRole("heading", { name: "People", exact: true }), errors);
+    const list = page.getByTestId("people-list");
+    await expect(list.locator(".person-name", { hasText: "vlad.boo" })).toBeVisible();
+    await expect(page.getByTestId("recent-names").getByRole("link", { name: "castle.boo" })).toBeVisible();
+    // Richest first: balances never rise down the list.
+    const balances = await list.locator(".person-balance span").evaluateAll((els) => els.map((e) => Number((e.getAttribute("title") ?? "0").split(" ")[0].replace(/,/g, ""))));
+    expect(balances.length).toBeGreaterThan(2);
+    expect(balances).toEqual([...balances].sort((a, b) => b - a));
+    // A named account's row says its name, never its address, as the link.
+    const vladRow = list.getByTestId("person").filter({ has: page.locator(".person-name", { hasText: "vlad.boo" }) });
+    await expect(vladRow.locator(".person-name")).toHaveAttribute("href", /\/account\/vlad\.boo\/?$/);
+    await expect(vladRow.getByTestId("person-send")).toHaveAttribute("href", /\/send\/?\?to=vlad\.boo$/);
+
+    await page.getByTestId("sort-names").click();
+    await expect(page.getByTestId("sort-names")).toHaveAttribute("aria-pressed", "true");
+    // Only named accounts, alphabetically (once the node's answer for this sort is in).
+    await expect
+      .poll(async () => {
+        const names = await list.locator(".person-name").allTextContents();
+        return names.length > 1 && names.every((n) => n.endsWith(".boo")) && names.join() === [...names].sort((a, b) => a.localeCompare(b)).join();
+      })
+      .toBe(true);
+    await page.getByTestId("sort-recent").click();
+    await expect(list.getByTestId("person").first()).toBeVisible();
+
+    await page.getByTestId("sort-balance").click();
+    await page.getByTestId("people-search").fill("mina");
+    await expect(list.locator(".person-name")).toHaveText(["mina.boo"]);
+    await page.getByTestId("people-search").fill("nobodyhere");
+    await expect(page.getByRole("link", { name: "Look up nobodyhere.boo" })).toHaveAttribute("href", /\/account\/nobodyhere\.boo\/?$/);
+    expect(await cspViolations(page)).toEqual([]);
+    expect(errors).toEqual([]);
+  });
 });
 
 test.describe("the explorer from an account holder's side", () => {
@@ -373,6 +412,23 @@ test.describe("the explorer from an account holder's side", () => {
     await expect(page.locator("summary .title", { hasText: "Withdraw the offer" })).toBeVisible();
     await visit(page, "/name/tomb", (p) => p.getByRole("heading", { name: "You own this name" }), errors);
     await expect(page.locator("details[open] summary .title", { hasText: "Renew tomb.boo before it's lost" })).toBeVisible();
+    // Request: a link to a prefilled Send to their name on this wallet's origin, a QR code of it, never a payment.
+    await visit(page, `/account/${me}`, (p) => p.getByText("Your account, as the chain sees it"), errors);
+    await expect(page.getByRole("link", { name: "Receive", exact: true })).toHaveAttribute("href", /\/receive\/?$/);
+    await page.getByTestId("request").click();
+    await page.getByTestId("request-amount").fill("2.5");
+    await page.getByTestId("request-memo").fill("for the pumpkins");
+    const link = new URL((await page.getByTestId("request-link").textContent()) ?? "");
+    // On the wallet's own origin (walletUrl: here the build's passkey domain; on a node, its /wallet).
+    expect(link.pathname).toBe("/send");
+    expect(Object.fromEntries(link.searchParams)).toMatchObject({ to: "vlad.boo", amount: "2.5", memo: "for the pumpkins" });
+    await expect(page.getByRole("img", { name: /^QR code: payment request to/ })).toBeVisible();
+    // (What Send does with such a link, fill the form and say so, is e2e/paylink.spec.ts.)
+    // Their own row in People offers Receive, not Send.
+    await visit(page, "/people", (p) => p.getByRole("heading", { name: "People", exact: true }), errors);
+    const mine = page.getByTestId("person").filter({ has: page.locator(".you") });
+    await expect(mine.getByRole("link", { name: "Receive" })).toBeVisible();
+    await expect(mine.getByTestId("person-send")).toHaveCount(0);
     await visit(page, "/hunt/0", (p) => p.getByRole("heading", { name: "You put this up" }), errors);
     await expect(page.getByText(/You can cancel it and refund its funders once it expires/)).toBeVisible();
     await expect(page.locator("summary .title", { hasText: "Cancel and refund" })).toHaveCount(0);
@@ -390,7 +446,7 @@ test.describe("the explorer from an account holder's side", () => {
     const width = () => page.evaluate(() => document.documentElement.scrollWidth);
     expect(await width()).toBeLessThanOrEqual(390);
     // Nor does anything else long a stranger can write (labels, handles, addresses in what was signed).
-    for (const path of [`/tx/${w.ids.sent}`, `/tx/${w.ids.agent}`, `/account/${me}`, "/explore", "/hunt/0", "/programs/validators"]) {
+    for (const path of [`/tx/${w.ids.sent}`, `/tx/${w.ids.agent}`, `/account/${me}`, "/explore", "/people", "/hunt/0", "/programs/validators"]) {
       await visit(page, path, (p) => p.locator("main h1, main .headline").first(), errors);
       expect(await width(), path).toBeLessThanOrEqual(390);
     }

@@ -4,6 +4,48 @@ import type { KeyView, Label } from "../types";
 
 export type { Label };
 
+/** One row of `/api/accounts` (the people directory). Names are chain text. */
+export interface DirectoryAccount {
+  account: Label;
+  /** Its active names, primary first. */
+  names: string[];
+  balance: string;
+  balance_display: string;
+  transferable: string;
+  transferable_display: string;
+  /** Height of its newest finalized tx this node holds. */
+  last_active: number | null;
+  validator: boolean;
+  program: boolean;
+  /** A system account's role (treasury, …). */
+  system: string | null;
+}
+
+export interface AccountsPage {
+  sort: "balance" | "recent" | "names";
+  accounts: DirectoryAccount[];
+  next: string | null;
+  total: number;
+  accounts_total: number;
+}
+
+/** One row of `/api/names`. */
+export interface DirectoryName {
+  name: string;
+  owner: Label;
+  registered_at: number;
+  expires_at: number;
+  grace_until: number;
+  status: "active" | "grace";
+}
+
+export interface NamesPage {
+  sort: "recent" | "alpha";
+  names: DirectoryName[];
+  next: string | null;
+  total: number;
+}
+
 export interface ChainStatus {
   chain_id: string;
   /** The chain's name (`blockula create`, `summon --name`), when it has one. */
