@@ -73,3 +73,32 @@ export function demoNode(v: string | undefined): string | undefined {
 /** CONTRIBUTING.md's "Start in two minutes" prompt, word for word (lib/site.test.mjs checks it). */
 export const CONTRIBUTE_PROMPT =
   "Contribute to Blockula (https://github.com/jackdishman/blockula). Clone it, read AGENTS.md and CONTRIBUTING.md, run `npm ci && npm run build`, and start a local chain with `blockula dev` (or `node/target/release/blockula dev`). Pick an open issue labeled `good first issue` or `familiar-friendly` (`gh issue list --repo jackdishman/blockula --label familiar-friendly`), or ask me what to work on. Make one focused change with tests, run what CONTRIBUTING.md's \"What to run\" table says for the parts you touched, and open a PR that references the issue and explains how you verified it. One solid PR beats many small ones.";
+
+/** docs/BECOME-A-VALIDATOR.md's "Let your coding agent do it" prompt, word for word with its
+ * placeholders (lib/site.test.mjs checks it); `validatorPrompt` fills in a chain's node and hash. */
+export const VALIDATOR_PROMPT = `Set me up as a validator for a Blockula chain, following docs/BECOME-A-VALIDATOR.md in
+https://github.com/jackdishman/blockula (clone it if it isn't here).
+
+  Node:          <the chain's node URL, https://…>
+  Genesis hash:  <its 64-hex genesis hash>
+  Path:          <A (Fly.io, or a VPS I'll give you SSH to), B (this home machine, port forwarding) or C (this home machine behind a relay VPS over Tailscale)>
+
+Rules:
+- First check that the node's /api/status reports exactly that genesis hash. Stop if it doesn't.
+- Install only a verified release: check its build provenance with \`gh attestation verify\` and its
+  line in checksums.txt (deploy/host-validator.sh does this for Path A on Fly).
+- Never print, paste, upload or move validator.key, and never put it in a commit, a log or a chat.
+  Never start the same key in two places. Tell me where the key's backup is and ask me to keep it
+  offline.
+- Ask me before anything that costs money (a Fly app, a VPS) or changes my network (router port
+  forwards, firewall rules, Tailscale), and wait for my yes.
+- Take the bond from the chain's faucet if it has one; if it doesn't, tell me how much to ask the
+  chain's operator for and wait.
+- Run \`blockula validator register\`, then STOP: give me my validator address (boo1…) and the exact
+  admit or approve command register printed, for me to send to the chain's operator. Don't try to
+  admit or approve yourself.
+- Afterwards, show me how to check it: /api/validators, /api/health and the logs.`;
+
+/** The setup prompt for one chain: its node and genesis hash filled in, the path left to choose. */
+export const validatorPrompt = (node: string, genesisHash: string) =>
+  VALIDATOR_PROMPT.replace("<the chain's node URL, https://…>", node).replace("<its 64-hex genesis hash>", genesisHash);

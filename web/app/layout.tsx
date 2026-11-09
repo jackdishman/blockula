@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from "next";
+import Link from "next/link";
 import { Courier_Prime, EB_Garamond, IM_Fell_English, IM_Fell_English_SC, UnifrakturMaguntia } from "next/font/google";
 import { connection } from "next/server";
 import type { ReactNode } from "react";
@@ -23,8 +24,8 @@ const fraktur = UnifrakturMaguntia({ weight: "400", subsets: ["latin"], variable
 
 export const metadata: Metadata = SITE
   ? {
-      title: "Blockula: your own little blockchain",
-      description: "Launch a small blockchain for you and your friends in a minute. Passkey wallets, .boo names, post-quantum signatures. Free, open source, and its coins have no value.",
+      title: "Blockula: a post-quantum blockchain you run yourself",
+      description: "Make a post-quantum blockchain for you and your friends in a minute: passkey wallets, .boo names, one small node. Free and open source, for education and research; its coins have no value.",
     }
   : {
       title: "Blockula Wallet",
@@ -71,6 +72,9 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
             <span className="caps">Quantum-safe ML-DSA-65 keys · Unlocked by passkeys</span>
             {/* Mainnet builds are for real money (after the audit, WAL-3); test builds say what they are. */}
             <span data-testid="imprint-note">{IS_MAINNET_BUILD ? "Self-custodial: your key is derived on this device and never leaves it." : "Not audited. For test chains only."}</span>
+            <span className="small" data-testid="imprint-terms">
+              For education and research only. <Link href="/terms">Terms</Link> · <Link href="/privacy">Privacy</Link>
+            </span>
             <MotionToggle />
           </footer>
         </WalletProvider>

@@ -7,6 +7,7 @@ import { SAFETY } from "@/lib/onboarding-copy";
 import { shortAddr, chainUnit } from "@/lib/format";
 import { confirmPositions, generateKit, KIT_LABEL, kitText, wordIndex, type Kit } from "@/lib/recovery";
 import type { TxView } from "@/lib/types";
+import { useSpendCheck } from "@/lib/spend";
 import { useUnlocked } from "@/lib/wallet";
 import { ErrorNote, ExplorerLink, Spinner, Tip } from "./ui";
 
@@ -35,6 +36,7 @@ export function RecoveryKitSetup({
   skipLabel?: string;
 }) {
   const { wallet, account, client, status, updateHint, refresh } = useUnlocked();
+  const spendCheck = useSpendCheck();
   const [stage, setStage] = useState<Stage>({ s: "intro" });
   const [answers, setAnswers] = useState(["", ""]);
   const [busy, setBusy] = useState(false);
@@ -73,6 +75,8 @@ export function RecoveryKitSetup({
     setError(null);
     try {
       if (account && BigInt(account.balance) === 0n) throw new Error("insufficient balance: has 0 FANG");
+      // A kit is an owner key, with power over all of the account: the passkey checks it's you first.
+      await spendCheck();
       const tx = (await wallet.addOwnerKey(grant, KIT_LABEL)) as TxView;
       updateHint({ pendingKit: undefined });
       setStage({ s: "done", tx });

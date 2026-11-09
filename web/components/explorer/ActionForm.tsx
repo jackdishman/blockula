@@ -15,7 +15,8 @@ import type { Preflight } from "@/lib/explorer/preflight";
 import { type ActionSpec, type Param, signature, type Values } from "@/lib/explorer/programs";
 import { to } from "@/lib/explorer/routes";
 import { shortAddr, chainUnit } from "@/lib/format";
-import { hintAccount, openLocalKey, unlockPasskey } from "@/lib/keys";
+import { hintAccount, openLocalKey, PasskeyCheckError, unlockPasskey } from "@/lib/keys";
+import { previewer, unsignedOf, useSpendCheck } from "@/lib/spend";
 import { useWallet } from "@/lib/wallet";
 import { Amount, Term } from "./kit";
 import { PreflightView } from "./PreflightView";
@@ -93,6 +94,7 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
   const { wallet, account, client, hint, refresh } = useWallet();
   const router = useRouter();
   const unlock = useInlineUnlock();
+  const check = useSpendCheck();
   const [raw, setRaw] = useState<Record<string, string>>(() => Object.fromEntries(spec.params.map((p) => [p.key, initial[p.key] ?? p.initial ?? ""])));
   const [touched, setTouched] = useState<Record<string, boolean>>({});
   const [preview, setPreview] = useState<Preview | null>(null);
@@ -140,7 +142,8 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
         } else values[p.key] = v;
       }
       let from = 0;
-      const tx = await wallet.build(
+      // Built unsigned: it's signed on "Sign & send", right after a fresh passkey check.
+      const tx = await previewer(wallet).build(
         (height) => {
           from = height;
           return spec.build(values, { height, account: wallet.account });
@@ -162,11 +165,17 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
     setBusy("send");
     setError(null);
     try {
-      const id = await submitTx(preview.tx);
+      // Every transaction signed here pays a fee, and most move FANG: the passkey checks it's you first.
+      setBusy("check");
+      const signer = await check();
+      setBusy("send");
+      const id = await submitTx(signer.sign(unsignedOf(preview.tx)));
       refresh();
       router.push(to.tx(id));
     } catch (e) {
       setError(friendly(e));
+      // Nothing was signed: keep the preview, so they can try again.
+      if (e instanceof PasskeyCheckError) return;
       setPreview(null);
     } finally {
       setBusy(null);
@@ -304,14 +313,14 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
           <PreflightView p={preview.pf} me={wallet.account} blockMs={preview.blockMs} />
           <details className="raw">
             <summary>The exact transaction you&apos;ll sign</summary>
-            <pre>{JSON.stringify({ ...preview.tx, public_key: `${preview.tx.public_key.slice(0, 24)}…`, signature: `${preview.tx.signature.slice(0, 24)}… (${preview.tx.signature.length / 2} bytes)` }, null, 2)}</pre>
+            <pre>{JSON.stringify({ ...preview.tx, public_key: `${preview.tx.public_key.slice(0, 24)}…`, signature: `${preview.tx.signature.length / 2} bytes, made when you sign` }, null, 2)}</pre>
           </details>
           <div className="row-gap">
             <button className="btn" disabled={!!busy} onClick={() => setPreview(null)}>
               ← Edit
             </button>
             <button className={`btn grow ${refused ? "" : "primary"}`} disabled={!!busy} onClick={send}>
-              {busy === "send" ? <Spinner>Sending…</Spinner> : refused ? "Sign & send anyway" : "Sign & send"}
+              {busy === "check" ? <Spinner>Waiting for your passkey…</Spinner> : busy === "send" ? <Spinner>Sending…</Spinner> : refused ? "Sign & send anyway" : "Sign & send"}
             </button>
           </div>
         </div>

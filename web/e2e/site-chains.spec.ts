@@ -115,6 +115,17 @@ test("become a validator: the commands for that chain, with a copy button each",
     await expect(copies.nth(i)).toHaveText("Copied ✓");
     expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(await cmds.nth(i).textContent());
   }
+
+  // The beginner's guide, and the setup prompt for a coding agent with this chain filled in.
+  const guide = steps.getByTestId("validator-guide");
+  await expect(guide.getByRole("link", { name: /step-by-step guide/ })).toHaveAttribute("href", /docs\/BECOME-A-VALIDATOR\.md$/);
+  await guide.getByRole("button", { name: "Copy the setup prompt" }).click();
+  await expect(guide.getByRole("button")).toHaveText("Copied ✓");
+  const prompt = await page.evaluate(() => navigator.clipboard.readText());
+  expect(prompt).toContain(`Node:          ${PIZZA.rpc}\n`);
+  expect(prompt).toContain(`Genesis hash:  ${PIZZA.genesis}\n`);
+  expect(prompt).toContain("then STOP");
+
   await pizza.getByTestId("chain-validate").click();
   await expect(pizza.getByTestId("validator-steps")).toHaveCount(0);
   expect(await cspViolations(page)).toEqual([]);

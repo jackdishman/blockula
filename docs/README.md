@@ -8,6 +8,7 @@
 | [BUILD-ON-IT.md](BUILD-ON-IT.md) | Make the chain yours: Claude and the MCP, changing the explorer and wallet with Claude Code, the SDK, programs and governance, HTTPS, hosting the wallet for friends, the contributor prompt |
 | [USE-CASES.md](USE-CASES.md) | Eight things friends, a club, a class or a team can do on their chain, with the first commands |
 | [RUN-A-NODE.md](RUN-A-NODE.md) | A full node or a validator as a service, and pointing the wallet, SDK and MCP at your own node |
+| [BECOME-A-VALIDATOR.md](BECOME-A-VALIDATOR.md) | Validate someone else's chain, step by step for beginners: in the cloud (Fly.io or a $5 VPS), at home, or at home behind a cheap relay, and a prompt for your coding agent |
 | [REFERENCE.md](REFERENCE.md) | Chains by hand (`summon`, `run`, `join`), public servers and genesis specs, the hardened HTTP API, the CLI wallet, validators and staking, Hunts and the contribution pool |
 | [ONE_PAGER.md](ONE_PAGER.md) | What Blockula is, on one page |
 
@@ -39,7 +40,8 @@ Written while Blockula was headed for a value-bearing mainnet, which was dropped
 |---|---|
 | [PLAN.md](PLAN.md) | Architecture, Proof of Contribution, privacy, the roadmap as it was |
 | [MAINNET-DESIGN.md](MAINNET-DESIGN.md) | The protocol v1 design |
-| [TOKENOMICS.md](TOKENOMICS.md) | Issuance, fees and staking economics, written for the mainnet that was planned |
+| [TOKENOMICS.md](TOKENOMICS.md) | Issuance, fees and staking economics, and the allocation a mainnet would have (revised 2026-11-08: no founder share) |
+| [PUBLIC-CHAIN.md](PUBLIC-CHAIN.md) | The public demo chain: permanent, worth nothing, and how it grows to four or more validators |
 | [GENESIS_CEREMONY.md](GENESIS_CEREMONY.md) | How independent operators would build a public genesis |
 | [PROGRAMS-PLAN.md](PROGRAMS-PLAN.md) | How programs were planned and built |
 | [AUDIT-2026-10.md](AUDIT-2026-10.md), [AUDIT_SCOPE.md](AUDIT_SCOPE.md) | The internal review and what a third-party audit would cover |

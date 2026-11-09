@@ -156,7 +156,7 @@ On a chain someone else made (on your own, `summon` made the validators: [CREATE
 
 ### Validate someone else's chain
 
-The chains listed on [blockula.app](https://blockula.app) with **Wants validators** take validators from outside. Each card's **Become a validator** shows these steps with the chain's node, genesis hash and home filled in. Before you start:
+The chains listed on [blockula.app](https://blockula.app) with **Wants validators** take validators from outside. Each card's **Become a validator** shows these steps with the chain's node, genesis hash and home filled in. New to this? [BECOME-A-VALIDATOR.md](BECOME-A-VALIDATOR.md) walks through it step by step: in the cloud (Fly.io with `deploy/host-validator.sh`, or a $5 VPS), at home, or at home behind a cheap relay that keeps your IP private, with a prompt that lets your coding agent do the setup. Before you start:
 
 - **Your machine stays on and online.** A validator that sleeps or drops off misses its turns and is jailed.
 - **Two ports are open to the internet:** TCP 30300 (other validators dial it) and 7171 (your full node, which the chain publishes as your validator's HTTP address). Forward them on your router ([Running at home](#running-at-home)).

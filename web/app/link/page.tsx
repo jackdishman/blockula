@@ -15,12 +15,15 @@ import { createLocalKey, createPasskey, type AccountChoice } from "@/lib/keys";
 import { checkLinkChain, linkChain } from "@/lib/paylink";
 import type { AccountView } from "@/lib/types";
 import { useWallet } from "@/lib/wallet";
+import { RequireTerms } from "@/components/Terms";
 
 export default function LinkPage() {
   return (
-    <Suspense fallback={<Splash />}>
-      <LinkDevice />
-    </Suspense>
+    <RequireTerms>
+      <Suspense fallback={<Splash />}>
+        <LinkDevice />
+      </Suspense>
+    </RequireTerms>
   );
 }
 

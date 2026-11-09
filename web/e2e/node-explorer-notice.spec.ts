@@ -29,6 +29,15 @@ function api(p: string, chainId: string, repos: { repo: string; weight: number }
   return null;
 }
 
+/** The footer's only links are the project's Terms of Use and Privacy Policy (web/app/terms, web/app/privacy). */
+async function footerLinksAreTheTerms(page: Page) {
+  await expect(page.locator("#terms")).toHaveText("For education and research only · Terms · Privacy");
+  const links = page.locator("footer").getByRole("link");
+  await expect(links).toHaveCount(2);
+  await expect(links.nth(0)).toHaveAttribute("href", "https://blockula.app/terms");
+  await expect(links.nth(1)).toHaveAttribute("href", "https://blockula.app/privacy");
+}
+
 /** Serves the explorer with a node on `chainId`, then opens `hash`. */
 async function open(page: Page, chainId: string, hash = "", repos: { repo: string; weight: number }[] = []) {
   await page.route(`${ORIGIN}/`, (r) => r.fulfill({ contentType: "text/html", body: HTML }));
@@ -49,7 +58,7 @@ test("a chain someone made says it isn't audited and its FANG has no value", asy
   await expect(page.locator("#imprint")).toHaveText("Post-quantum signatures · ML-DSA-65 · Not audited");
   await expect(page.locator("#notice")).toHaveText("This chain's FANG has no value");
   await expect(page.locator("footer")).not.toContainText("test chains only");
-  await expect(page.locator("footer").getByRole("link")).toHaveCount(0);
+  await footerLinksAreTheTerms(page);
 });
 
 test("a chain made with a name and a ticker shows them", async ({ page }) => {
@@ -72,14 +81,15 @@ for (const chain of ["blockula-testnet-2", "blockula-dev"]) {
     await expect(page.locator("#app")).toContainText("#1000");
     await expect(page.locator("#imprint")).toHaveText("Post-quantum signatures · ML-DSA-65 · Not audited, test chains only");
     await expect(page.locator("#notice")).toHaveText("Test FANG has no value");
-    await expect(page.locator("footer").getByRole("link")).toHaveCount(0);
+    await footerLinksAreTheTerms(page);
   });
 }
 
 test("a node that says it's on blockula-1 gets no mainnet footer", async ({ page }) => {
   await open(page, "blockula-1");
   await expect(page.locator("#notice")).toHaveText("This chain's FANG has no value");
-  await expect(page.locator("footer")).not.toContainText(/mainnet|Terms|Risks/i);
+  await expect(page.locator("footer")).not.toContainText(/mainnet|Risks/i);
+  await footerLinksAreTheTerms(page);
 });
 
 test("the glossary's 'burned' makes no price claim, and a Hunt says who pays it", async ({ page }) => {

@@ -559,8 +559,9 @@ test.describe("the explorer from an account holder's side", () => {
     await award.getByRole("button", { name: "Preview" }).click();
     await expect(award.getByTestId("signed-name")).toHaveText("bob.boo");
     await award.getByRole("button", { name: "Sign & send" }).click();
+    // The hunt's own page has a receipt-style plate too, so wait for the tx itself (it's signed after the passkey check).
+    await expect.poll(() => node.submitted.at(-1)?.action).toMatchObject({ type: "award_hunt", hunt_id: 0, to: "bob.boo", pr: 9 });
     await expect(receipt(page)).toBeVisible();
-    expect((node.submitted.at(-1) as Tx).action).toMatchObject({ type: "award_hunt", hunt_id: 0, to: "bob.boo", pr: 9 });
     expect(node.accounts.get(bob)?.balance).toBe(25_000_000_000n);
     expect(node.accounts.get(mallory)?.balance ?? 0n).toBe(0n);
   });

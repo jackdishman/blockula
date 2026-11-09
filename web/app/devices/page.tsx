@@ -15,6 +15,7 @@ import { blocksToHuman, keyCode } from "@/lib/format";
 import { SAFETY } from "@/lib/onboarding-copy";
 import { deviceLink } from "@/lib/paylink";
 import { KIT_LABEL } from "@/lib/recovery";
+import { useSpendCheck } from "@/lib/spend";
 import type { KeyView, TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
 import { Unit } from "@/components/Unit";
@@ -132,6 +133,7 @@ function KeyRow({ k, canRevoke, onRevoked }: { k: KeyView; canRevoke: boolean; o
 /** The account's recovery kits (owner keys kept on paper), a kit waiting for fee money, and making a new one. */
 function RecoverySection({ kits, canRevoke, onRevoked }: { kits: KeyView[]; canRevoke: boolean; onRevoked: (label: string) => void }) {
   const { wallet, account, hint, updateHint, refresh } = useUnlocked();
+  const spendCheck = useSpendCheck();
   const [making, setMaking] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -144,6 +146,7 @@ function RecoverySection({ kits, canRevoke, onRevoked }: { kits: KeyView[]; canR
     try {
       // Kits made before kits carried their grant can't be added without the words: make a new one.
       if (!pending.grant) throw new Error("This kit was made before kits carried their consent to your account, so it can't be added from here. Make a new kit and forget this one.");
+      await spendCheck();
       await wallet.addOwnerKey(pending.grant, KIT_LABEL);
       updateHint({ pendingKit: undefined });
       await refresh();
@@ -195,6 +198,7 @@ function parseGrant(code: string, account: string): { grant: KeyGrant | null; pr
 
 function AddDevice() {
   const { wallet, client, status, refresh } = useUnlocked();
+  const spendCheck = useSpendCheck();
   const [id, setId] = useState("");
   // Labels are written on-chain for good: nothing filled in that could name a person.
   const [label, setLabel] = useState("");
@@ -217,6 +221,7 @@ function AddDevice() {
     setBusy(true);
     setError(null);
     try {
+      await spendCheck();
       const tx = (await wallet.addOwnerKey(grant, label.trim() || "Another device")) as TxView;
       setDone(tx);
       setId("");
@@ -283,6 +288,7 @@ function AddDevice() {
 
 function AddAgent() {
   const { wallet, account, status, refresh } = useUnlocked();
+  const spendCheck = useSpendCheck();
   const [id, setId] = useState("");
   const [label, setLabel] = useState("claude");
   const [limit, setLimit] = useState("10");
@@ -321,6 +327,7 @@ function AddAgent() {
     setBusy(true);
     setError(null);
     try {
+      await spendCheck();
       const tx = (await wallet.addSessionKey(grant, label.trim() || "agent", { limit, periodBlocks: day, expiresInBlocks: nDays * day })) as TxView;
       setDone({ tx, limit, days: nDays });
       setId("");

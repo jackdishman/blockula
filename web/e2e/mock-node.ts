@@ -10,6 +10,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { createHash } from "node:crypto";
 import type { BrowserContext, Page, Route } from "@playwright/test";
 import { bech32m } from "@scure/base";
+import { TERMS_KEY, TERMS_VERSION } from "../lib/legal";
 import { CHAIN_ID, GENESIS, MAINNET_GENESIS, MAINNET_GENESIS_CLOCK, MAINNET_RPC, RPC } from "./env";
 
 type Role = { type: "owner" } | { type: "session"; limit: string; period_blocks: number; expires_at: number };
@@ -163,8 +164,17 @@ export class MockNode {
   }
 
   /** Answer the wallet's RPC calls in this page or browser context. */
-  async install(target: Page | BrowserContext) {
+  /**
+   * Serves this node's API to `target`. Its pages have agreed to the current terms (lib/terms.ts),
+   * so every flow starts where it did before the agreement existed; `{ terms: false }` leaves
+   * them to agree themselves (e2e/terms.spec.ts).
+   */
+  async install(target: Page | BrowserContext, opts: { terms?: boolean } = {}) {
     await target.route(`${this.rpc}/api/**`, (route) => this.handle(route));
+    if (opts.terms !== false)
+      await target.addInitScript(([key, version]) => {
+        if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify({ v: 1, version, at: new Date(0).toISOString() }));
+      }, [TERMS_KEY, TERMS_VERSION]);
   }
 
   acct(address: string): Acct {

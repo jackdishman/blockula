@@ -12,6 +12,7 @@ import { PayLinkNotice } from "@/components/PayLinkNotice";
 import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { explorer, MAINNET_PREFIX, NETWORK } from "@/lib/config";
 import { friendly } from "@/lib/errors";
+import { PasskeyCheckError } from "@/lib/keys";
 import { checkTx } from "@/lib/explorer/check";
 import { movable, type Preflight } from "@/lib/explorer/preflight";
 import type { TxDetail } from "@/lib/explorer/types";
@@ -19,6 +20,7 @@ import { displayFang, fangInput, shortAddr } from "@/lib/format";
 import { lockWords, nameRisks, type LockView, type NameInfo } from "@/lib/money";
 import { PAYMENTS_FINAL } from "@/lib/money-copy";
 import { checkLinkChain, linkChain } from "@/lib/paylink";
+import { previewer, unsignedOf, useSpendCheck } from "@/lib/spend";
 import type { AccountView, TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
 import { Unit } from "@/components/Unit";
@@ -108,7 +110,8 @@ interface Review {
 }
 
 function Send() {
-  const { wallet, account, client, status, refresh } = useUnlocked();
+  const { wallet, hint, account, client, status, refresh } = useUnlocked();
+  const check = useSpendCheck();
   const params = useSearchParams();
   const prefilled = params.has("to") || params.has("amount") || params.has("memo");
   // A payment link says which chain it was made for: a check, never a switch. A .boo name can be
@@ -131,6 +134,7 @@ function Send() {
   const [review, setReview] = useState<Review | null>(null);
   const [sent, setSent] = useState<TxView | null>(null);
   const [busy, setBusy] = useState(false);
+  const [checking, setChecking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recipient = useRecipient(to);
 
@@ -158,13 +162,15 @@ function Send() {
   const canReview = recipient.state === "ok" && drops !== null && !amountErr && !memoErr && !self && !refused && linkCheck?.state !== "pending";
 
   /**
-   * Builds the transfer. With Priority on, it tips the block's proposer one base fee on top (the
-   * same again), well inside the chain's cap (`tip_cap_multiple` × the base fee, 20× by default).
+   * Builds the transfer, unsigned: it's signed only after the passkey check on Confirm. With
+   * Priority on, it tips the block's proposer one base fee on top (the same again), well inside
+   * the chain's cap (`tip_cap_multiple` × the base fee, 20× by default).
    */
   const build = async (to: string, amount: bigint) => {
     const action = { type: "transfer" as const, to, amount: amount.toString() };
-    const plain = await wallet.build(action, memo);
-    return priority ? wallet.build(action, memo, { tip: BigInt(plain.fee) }) : plain;
+    const draft = previewer(wallet);
+    const plain = await draft.build(action, memo);
+    return priority ? draft.build(action, memo, { tip: BigInt(plain.fee) }) : plain;
   };
 
   /** Everything that can move now, less the fee and what opening their account burns (TR-11). */
@@ -191,7 +197,7 @@ function Send() {
     setBusy(true);
     setError(null);
     try {
-      // Build and sign now so the fee shown is exactly what will be paid.
+      // Build it now so the fee shown is exactly what will be paid (it's signed on Confirm).
       const tx = await build(recipient.signed, drops);
       // What it will do and whether the chain will take it, and whether the name is risky to pay
       // by name; the review still works without either.
@@ -220,11 +226,17 @@ function Send() {
     setBusy(true);
     setError(null);
     try {
-      const done = (await client.submit(review.tx, true)) as TxView;
+      // A fresh passkey check (Face ID, Touch ID or PIN) right before signing, even though the
+      // wallet is unlocked; cancel it and nothing is signed. Then the reviewed transaction is signed as is.
+      setChecking(true);
+      const signer = await check().finally(() => setChecking(false));
+      const done = (await client.submit(signer.sign(unsignedOf(review.tx)), true)) as TxView;
       setSent(done);
       refresh();
     } catch (e) {
       setError(friendly(e));
+      // Nothing was signed: keep the review, so they can try again.
+      if (e instanceof PasskeyCheckError) return;
       // Nonce or balance may have moved; send them back to edit.
       setReview(null);
     } finally {
@@ -331,11 +343,12 @@ function Send() {
         </Tip>
         {/* DRAFT copy for counsel (D4): lib/money-copy.ts. */}
         <p className="money-final" data-testid="payments-final">{PAYMENTS_FINAL}</p>
+        {hint.kind === "passkey" && !sure && <p className="dim small" data-testid="check-note">Your passkey asks for Face ID, fingerprint or PIN before this is signed.</p>}
         <div className="row-gap">
           <button className="btn" disabled={busy} onClick={() => setReview(null)}>← Edit</button>
           {!sure && (
             <button className={`btn grow ${refusals ? "" : "primary"}`} disabled={busy} onClick={confirm}>
-              {busy ? <Spinner>Sealing into a block…</Spinner> : refusals ? "Send anyway" : "Confirm & send"}
+              {checking ? <Spinner>Waiting for your passkey…</Spinner> : busy ? <Spinner>Sealing into a block…</Spinner> : refusals ? "Send anyway" : "Confirm & send"}
             </button>
           )}
         </div>

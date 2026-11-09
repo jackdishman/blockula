@@ -2,6 +2,8 @@
 
 **Run your own quantum-safe blockchain in a minute.** Name it, give it a ticker, choose who can reach it, and it's running on your machine, with an explorer you can install on your Mac or iPhone and one command your friends run to join. Post-quantum signatures throughout, on computers you already have: no hosting to pay for and nothing to buy.
 
+> **For education and research only.** Blockula is experimental, unaudited software. Its coins have no value: nobody sells them, and they never turn into money. Using the project's sites, wallet or demo chain means agreeing to the [Terms of Use](https://blockula.app/terms) and [Privacy Policy](https://blockula.app/privacy).
+
 ```bash
 curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh
 blockula create
@@ -93,6 +95,7 @@ In the browser a passkey unlocks the wallet, with no seed phrase: `createPasskey
 | [BUILD-ON-IT.md](docs/BUILD-ON-IT.md) | Claude, custom apps, the SDK and programs, HTTPS, a wallet link for friends |
 | [USE-CASES.md](docs/USE-CASES.md) | Eight things to do on a small chain |
 | [RUN-A-NODE.md](docs/RUN-A-NODE.md) | A full node or a validator as a service, and using your own node |
+| [BECOME-A-VALIDATOR.md](docs/BECOME-A-VALIDATOR.md) | Validate someone else's chain, step by step: cloud, home, or home behind a relay |
 | [REFERENCE.md](docs/REFERENCE.md) | Chains by hand, public servers, the hardened API, validators, Hunts and the contribution pool |
 | [OPERATIONS.md](docs/OPERATIONS.md) | Running validators: upgrades, restarts, slashing protection, monitoring |
 | [AGENTS.md](AGENTS.md) | For coding agents: the copy-paste prompt, the rules and the HTTP API |
