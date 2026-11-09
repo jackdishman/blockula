@@ -7,6 +7,7 @@ import { friendly } from "@/lib/errors";
 import type { NameDetail } from "@/lib/explorer/types";
 import { blocksToHuman, chainUnit } from "@/lib/format";
 import { SAFETY } from "@/lib/onboarding-copy";
+import { useSpendCheck } from "@/lib/spend";
 import { useUnlocked } from "@/lib/wallet";
 import { ErrorNote, Spinner } from "./ui";
 
@@ -22,6 +23,7 @@ export function epitaph(name: string) {
 
 export function NameClaim({ onClaimed, onName, suggestion = "" }: { onClaimed: (name: string) => void; onName?: (name: string) => void; suggestion?: string }) {
   const { client, wallet, account, status, refresh } = useUnlocked();
+  const spendCheck = useSpendCheck();
   const [input, setInput] = useState(suggestion);
   const [check, setCheck] = useState<Check>({ state: "idle" });
   const [busy, setBusy] = useState(false);
@@ -62,6 +64,8 @@ export function NameClaim({ onClaimed, onName, suggestion = "" }: { onClaimed: (
     setBusy(true);
     setError(null);
     try {
+      // A name costs FANG: the passkey checks it's you first.
+      await spendCheck();
       await wallet.registerName(n);
       await refresh();
       onClaimed(`${n}.boo`);

@@ -13,6 +13,7 @@ import { movable } from "@/lib/explorer/preflight";
 import type { TxDetail } from "@/lib/explorer/types";
 import { aboutWhen, blocksToHuman, displayFang, shortAddr } from "@/lib/format";
 import { FOUNDER_RUN, moveRisk, stakeRisk, unstakeRisk } from "@/lib/money-copy";
+import { useSpendCheck } from "@/lib/spend";
 import type { TxView, ValidatorsView, ValidatorView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
 import { Unit } from "@/components/Unit";
@@ -357,6 +358,7 @@ function PoolRow({ d, v, validators, terms, run }: { d: StakeDelegation; v?: Val
 
 function Delegate({ validators, terms, run }: { validators: ValidatorView[]; terms: Terms; run: Run }) {
   const { wallet, account } = useUnlocked();
+  const check = useSpendCheck();
   const [to, setTo] = useState("");
   const [amount, setAmount] = useState("");
   const [reviewing, setReviewing] = useState(false);
@@ -380,7 +382,11 @@ function Delegate({ validators, terms, run }: { validators: ValidatorView[]; ter
   const confirm = async () => {
     if (!v || drops === null) return;
     setBusy(true);
-    const ok = await run(() => wallet.delegate(v.validator.address, drops as bigint));
+    // Staking locks FANG away for the unbonding period: the passkey checks it's you first.
+    const ok = await run(async () => {
+      await check();
+      return wallet.delegate(v.validator.address, drops as bigint);
+    });
     setBusy(false);
     setReviewing(false);
     if (ok) setAmount("");

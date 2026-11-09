@@ -12,6 +12,9 @@ export const unreachableHint = () =>
     ? "Start a local node with `blockula dev`, or pick another network in the menu at the top."
     : "Try again in a minute, or pick another node in the menu at the top.";
 
+/** What the wallet says when the passkey check before a spend is cancelled: not an error, so it's shown calmly. */
+export const CHECK_CANCELLED = "Cancelled. Nothing was signed or sent.";
+
 /** Turn node / WebAuthn / network error strings into something a human can act on. */
 export function friendly(e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e);

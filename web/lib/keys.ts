@@ -4,6 +4,7 @@ import { isAddress, Wallet } from "@blockula/sdk";
 import { createPasskeyWallet, unlockPasskeyWallet } from "@blockula/sdk/passkey";
 import type { PinnedClient } from "./chain";
 import { localKeysAllowed, RP_ID, rpIdProblem } from "./config";
+import { CHECK_CANCELLED } from "./errors";
 import { b64url, fromB64url, type Hint } from "./session";
 import type { AccountView, KeyAccounts } from "./types";
 
@@ -47,6 +48,57 @@ export async function createPasskey(client: PinnedClient, username: string) {
 export async function unlockPasskey(client: PinnedClient, credentialId?: string) {
   const wallet = await unlockPasskeyWallet({ client, rpId: walletRpId(), credentialId: credentialId ? fromB64url(credentialId) : undefined });
   return { wallet, credentialId: wallet.credentialId ? b64url(wallet.credentialId) : credentialId };
+}
+
+/** The PRF salt the SDK's passkey wallets use (sdk-ts/src/passkey.ts `PRF_SALT`): the same salt derives the same key. */
+const PRF_SALT = new TextEncoder().encode("blockula/wallet/v1");
+
+/** Why the passkey check before a spend didn't pass. Nothing was signed. */
+export class PasskeyCheckError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PasskeyCheckError";
+  }
+}
+
+const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+/**
+ * Ask the passkey again right before a spend, even though the wallet is unlocked: a fresh
+ * assertion with user verification required (Face ID, Touch ID or the device PIN), for this
+ * wallet's credential only, over a fresh random challenge. It passes only if the answer comes from
+ * that credential, says the user was verified, and carries a PRF output that derives this very key
+ * again. The last check is the one that can't be faked: only the passkey that unlocked the wallet
+ * produces that output. Returns the re-derived wallet, which signs the spend.
+ */
+export async function reverifyPasskey(wallet: Wallet, hint: Hint): Promise<Wallet> {
+  const id = wallet.credentialId ?? (hint.credentialId ? fromB64url(hint.credentialId) : undefined);
+  let cred: PublicKeyCredential | null;
+  try {
+    cred = (await navigator.credentials.get({
+      publicKey: {
+        rpId: walletRpId(),
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        userVerification: "required",
+        allowCredentials: id ? [{ type: "public-key", id: id as BufferSource }] : [],
+        extensions: { prf: { eval: { first: PRF_SALT } } } as AuthenticationExtensionsClientInputs,
+      },
+    })) as PublicKeyCredential | null;
+  } catch (e) {
+    if (e instanceof Error && (e.name === "NotAllowedError" || e.name === "AbortError")) throw new PasskeyCheckError(CHECK_CANCELLED);
+    throw e;
+  }
+  if (!cred) throw new PasskeyCheckError(CHECK_CANCELLED);
+  if (id && !sameBytes(new Uint8Array(cred.rawId), id)) throw new PasskeyCheckError("That's a different passkey from the one this wallet opened with, so nothing was signed.");
+  // authenticatorData: the rpId hash (32 bytes), then the flags byte, whose bit 2 is "user verified".
+  const data = new Uint8Array((cred.response as AuthenticatorAssertionResponse).authenticatorData);
+  if (data.length < 33 || !(data[32] & 0x04)) throw new PasskeyCheckError("Your device didn't confirm it's you (Face ID, fingerprint or PIN), so nothing was signed.");
+  const prf = (cred.getClientExtensionResults() as { prf?: { results?: { first?: ArrayBuffer } } }).prf?.results?.first;
+  if (!prf) throw new PasskeyCheckError("Your passkey didn't answer the way it did when you unlocked, so nothing was signed.");
+  const fresh = Wallet.fromPasskeyPrf(new Uint8Array(prf), wallet.client);
+  if (fresh.keyId !== wallet.keyId) throw new PasskeyCheckError("That passkey doesn't open this wallet, so nothing was signed.");
+  fresh.credentialId = new Uint8Array(cred.rawId);
+  return fresh;
 }
 
 export function createLocalKey(client: PinnedClient) {

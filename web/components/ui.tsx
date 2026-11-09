@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useState, type ReactNode } from "react";
+import { CHECK_CANCELLED } from "@/lib/errors";
 import { markTutorial } from "@/lib/session";
 import { useTutorialScope } from "@/lib/wallet";
 
@@ -32,6 +33,7 @@ export function Copy({ text, label = "Copy" }: { text: string; label?: string })
 }
 
 export function ErrorNote({ error }: { error: string | null }) {
+  if (error === CHECK_CANCELLED) return <p className="dim" role="status" data-testid="check-cancelled">{error}</p>;
   return error ? <p className="error" role="alert">{error}</p> : null;
 }
 
