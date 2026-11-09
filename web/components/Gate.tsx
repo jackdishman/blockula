@@ -13,6 +13,7 @@ import { useWallet } from "@/lib/wallet";
 import { AccountPicker } from "./AccountPicker";
 import { Apparition } from "./Haunt";
 import { ErrorNote, Spinner } from "./ui";
+import { RequireTerms } from "./Terms";
 
 export function Splash({ text = "Rising from the grave…" }: { text?: string }) {
   return (
@@ -36,7 +37,8 @@ export function RequireWallet({ children }: { children: ReactNode }) {
     else if (wallet && !hint.account) router.replace("/link");
   }, [ready, hint, wallet, router]);
   if (!ready || !hint) return <Splash />;
-  if (!wallet) return <Unlock />;
+  // A wallet made before the terms (or before they changed) agrees before it unlocks again.
+  if (!wallet) return <RequireTerms><Unlock /></RequireTerms>;
   if (!hint.account) return <Splash />;
   return <>{children}</>;
 }

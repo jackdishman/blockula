@@ -20,6 +20,7 @@ import { canAffordName, cheapestName, safeNext, welcomePayment } from "@/lib/onb
 import { BRAND, FIRST_FANG } from "@/lib/onboarding-copy";
 import type { Hint } from "@/lib/session";
 import { useWallet } from "@/lib/wallet";
+import { RequireTerms } from "@/components/Terms";
 
 type Step = 0 | 1 | 2 | "start" | "have" | "prf" | "fund" | "kit" | "name" | "done";
 
@@ -50,9 +51,11 @@ const INTRO: { ornament: PropKind; chapter: string; title: string; body: string 
 
 export default function WelcomePage() {
   return (
-    <Suspense>
-      <Welcome />
-    </Suspense>
+    <RequireTerms>
+      <Suspense>
+        <Welcome />
+      </Suspense>
+    </RequireTerms>
   );
 }
 

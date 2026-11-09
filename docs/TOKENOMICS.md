@@ -1,6 +1,6 @@
 # FANG tokenomics (mainnet design)
 
-> **There's no mainnet** (decided Oct 22, 2026). Blockula is a kit for running your own ledger ([CREATE.md](CREATE.md)), and each chain's FANG has no value: nobody sells it, buys it or is paid in it. This is DEC-5 in [MAINNET-DESIGN.md](MAINNET-DESIGN.md), written out. Its allocation buckets were the mainnet's plan, and so were the founder's share and the legal posture (sections 7 and 9). The issuance schedule applies to every Blockula chain. Nothing here is legal, tax or investment advice, or an offer.
+> **There's no mainnet** (decided Oct 22, 2026). Blockula is a kit for running your own ledger ([CREATE.md](CREATE.md)), and each chain's FANG has no value: nobody sells it, buys it or is paid in it. This is DEC-5 in [MAINNET-DESIGN.md](MAINNET-DESIGN.md), written out. Its allocation buckets are the plan for a mainnet if one is ever made, and so is the legal posture (section 9); the genesis builder enforces them for `blockula-1` (`BUCKETS` in `node/src/genesis_builder.rs`). The issuance schedule applies to every Blockula chain. Revised 2026-11-08 ("What changed", below): no founder allocation and no undefined distribution bucket. Nothing here is legal, tax or investment advice, or an offer.
 
 FANG is the native token of Blockula. It pays transaction fees, bonds validators and delegations, is locked to vote in governance, and registers `.boo` names. 1 FANG = 10⁹ drops. All on-chain amounts are integers in drops, and every formula below is integer math.
 
@@ -10,25 +10,30 @@ FANG is the native token of Blockula. It pays transaction fees, bonds validators
 |---|---|
 | Genesis supply | **1,000,000,000 FANG** (10¹⁸ drops) |
 | Sale | None. No presale, no investors, no exchange or market-maker allocation |
-| Held by keyless system accounts at genesis | 87% (870M FANG), moved only by protocol rules or governance |
-| Founder | 10% (100M), vesting on-chain. There's no foundation allocation: governance may fund a foundation from the treasury once one exists |
+| Held by keyless system accounts at genesis | 97% (970M FANG), moved only by protocol rules or governance |
+| Founder | Nothing. No founder or foundation allocation: the founder earns FANG only as anyone else does, by validating or by contributing work; governance may fund a foundation from the treasury once one exists |
 | Issuance | 6% a year, falling 15% a year to a 1.5% floor (reached in year 10). 70% to staked validator pools, 20% to the contribution pool, 10% to the treasury |
 | Fees | The base fee (per byte) is burned. The tip (at most 20× the base fee, from transferable FANG) goes to the block proposer |
 | Admin keys | None. Every protocol lever is a governance proposal |
+
+## What changed on 2026-11-08
+
+- **No founder allocation.** The founder's 10% went to the treasury (now 40%).
+- **No community-distribution bucket.** Its 32% went to the contribution endowment (now 47%), so FANG reaches people as pay for verified work, judged by juries, not as an airdrop with criteria to be decided later.
+- Unchanged: no sale, the bootstrap delegation, the operators' and auditors' 3%, the issuance schedule, the fee burn, no admin keys, and no faucet on mainnet.
 
 ## 1. Genesis allocation
 
 | Bucket | % | FANG | Held by | Release (enforced on-chain) | Who moves it | Votes? |
 |---|---|---|---|---|---|---|
-| Community distributions | 32% | 320,000,000 | Keyless system account | Nothing at genesis. Who receives distributions, when and on what criteria is decided and announced only after mainnet is running (how the first one executes is open, section 10); later ones need a governance proposal | Governance | No |
-| Community treasury | 30% | 300,000,000 | Keyless `treasury` account | Unlocks linearly over 4 years (75M a year). Holds the 5% once planned for a foundation, which governance may fund from here (section 10). Also receives 10% of issuance, name fees, and the bootstrap delegation as it unwinds | Governance only (`TreasurySpend`; large spends need ⅔) | No |
-| Contribution endowment | 15% | 150,000,000 | Keyless contribution pool | Released into the pool's spendable balance linearly over 10 years (15M a year), on top of 20% of issuance | Séance juries (each Séance draws at most 25% of the pool) | No |
+| Community treasury | 40% | 400,000,000 | Keyless `treasury` account | Unlocks linearly over 4 years (100M a year). Holds the 10% once planned for the founder and the 5% once planned for a foundation, which governance may fund from here (section 10). Also receives 10% of issuance, name fees, and the bootstrap delegation as it unwinds | Governance only (`TreasurySpend`; large spends need ⅔) | No |
+| Contribution endowment | 47% | 470,000,000 | Keyless contribution pool | Released into the pool's spendable balance linearly over 10 years (47M a year), on top of 20% of issuance. Holds the 32% once planned for community distributions: FANG reaches people as pay for verified work, not as a giveaway | Séance juries (each Séance draws at most 25% of the pool) | No |
 | Validator bootstrap delegation | 10% | 100,000,000 | Keyless `bootstrap` account | Delegated by formula at every epoch boundary: equal shares to every member of the next active set (so not jailed) not run by the founder, rebalanced each epoch. Returns to the treasury linearly over years 2–4. Its staking rewards go to the treasury each epoch; operators keep their commission on it, at most `bootstrap_commission_cap_bps` (10%; a validator charging more pays the rest of it to the treasury). Its stake doesn't count toward a validator's rank for a seat, or toward the governance quorum base | The protocol formula (`staking::bootstrap_epoch`) | No |
-| Founder | 10% | 100,000,000 | The founder's own account | 1-year cliff, then linear to 4 years from genesis (section 7) | The founder, within the lock | Vested tokens only, and a pledge not to vote while vesting runs |
 | Genesis operators and security grants | 3% | 30,000,000 | Each recipient's own account, under a signed service agreement (genesis operators, auditors who accept FANG) | 6-month cliff, then linear to 2 years from genesis | The recipient, within the lock | Vested tokens only |
+| Community distributions, founder, foundation | 0% | 0 | | Kept as empty buckets so the testnets' genesis specs still rebuild | | |
 | **Total** | **100%** | **1,000,000,000** | | | | |
 
-The bootstrap formula runs at every epoch boundary, after the next set is chosen: (1) what its stake earned since the last boundary goes to the treasury (it sells shares worth the gain at once; a slash is booked as a loss), and so does whatever commission on it a validator charged above `bootstrap_commission_cap_bps` (10%), paid when the reward is (audit F12: a 100%-commission operator can't take the treasury's yield); (2) it keeps what its lock (below) still holds and returns the rest to the treasury; (3) it splits what it keeps equally over the next set's members whose owner isn't one of the founder's accounts (`bootstrap_excluded` in the genesis: the founder allocation's recipient and the owners of the founder's seats), leaving every other pool at once and moving each delegation to its share (one within 1 FANG of its share is left alone). The protocol moves this stake without unbonding, only at boundaries and only by the formula. It follows the set rather than choosing it: its stake isn't counted when validators are ranked for seats, so it doesn't entrench the genesis operators. A genesis that gave the bootstrap account no lock would send it all to the treasury at the first boundary, so the bucket can't be stranded (audit F12).
+The bootstrap formula runs at every epoch boundary, after the next set is chosen: (1) what its stake earned since the last boundary goes to the treasury (it sells shares worth the gain at once; a slash is booked as a loss), and so does whatever commission on it a validator charged above `bootstrap_commission_cap_bps` (10%), paid when the reward is (audit F12: a 100%-commission operator can't take the treasury's yield); (2) it keeps what its lock (below) still holds and returns the rest to the treasury; (3) it splits what it keeps equally over the next set's members whose owner isn't one of the founder's accounts (`bootstrap_excluded` in the genesis: the owners of the founder's seats), leaving every other pool at once and moving each delegation to its share (one within 1 FANG of its share is left alone). The protocol moves this stake without unbonding, only at boundaries and only by the formula. It follows the set rather than choosing it: its stake isn't counted when validators are ranked for seats, so it doesn't entrench the genesis operators. A genesis that gave the bootstrap account no lock would send it all to the treasury at the first boundary, so the bucket can't be stranded (audit F12).
 
 ### Lock curves
 
@@ -36,7 +41,6 @@ Locks are measured in blocks, not wall-clock time (1 s blocks; a year is 31,557,
 
 | Bucket | Start | Cliff | End |
 |---|---|---|---|
-| Founder | 0 | 31,557,600 (1 year) | 126,230,400 (4 years) |
 | Operators and security grants | 0 | 15,778,800 (6 months) | 63,115,200 (2 years) |
 | Treasury | 0 | none | 126,230,400 (4 years) |
 | Contribution endowment | 0 | none | 315,576,000 (10 years) |
@@ -46,15 +50,15 @@ The treasury's, the endowment's and the bootstrap delegation's curves are vestin
 
 ### Released by the schedule (end of each year, FANG)
 
-Distributions from the 32% bucket aren't on a schedule, so they aren't shown. Treasury funds count as released when they become spendable by governance, not when they're spent.
+Treasury funds count as released when they become spendable by governance, not when they're spent.
 
-| End of year | Founder | Operators, security | Treasury | Endowment to the pool | Bootstrap back to the treasury |
-|---|---|---|---|---|---|
-| 1 | 25M | 15M | 75M | 15M | 0 |
-| 2 | 50M | 30M | 150M | 30M | 33.3M |
-| 3 | 75M | 30M | 225M | 45M | 66.7M |
-| 4 | 100M | 30M | 300M | 60M | 100M |
-| 10 | 100M | 30M | 300M | 150M | 100M |
+| End of year | Operators, security | Treasury | Endowment to the pool | Bootstrap back to the treasury |
+|---|---|---|---|---|
+| 1 | 15M | 100M | 47M | 0 |
+| 2 | 30M | 200M | 94M | 33.3M |
+| 3 | 30M | 300M | 141M | 66.7M |
+| 4 | 30M | 400M | 188M | 100M |
+| 10 | 30M | 400M | 470M | 100M |
 
 The genesis manifest publishes every bucket's address and lock curve next to the genesis hash, and the explorer will show circulating, locked and keyless supply live.
 
@@ -126,13 +130,11 @@ Staking rewards are payment for validating and securing the network. They aren't
 - **Insider seats.** The chain also bounds the seats locked stake can buy, at every epoch boundary: an insider's delegation to someone else's pool earns but doesn't count toward that pool's rank, a newcomer validator owned by an account with a vesting lock joins only if that account then holds no other seat, and the founder's validators (`bootstrap_excluded`) join only while they hold at most 2 seats and fewer than f = ⌊(n−1)/3⌋ of the set, so insiders can't halt the chain or veto its council. Seats held already, such as genesis seats, stay.
 - Unvested tokens don't vote (section 5).
 
-## 7. The founder's allocation
+## 7. No founder allocation
 
-- **10% of genesis supply, 100,000,000 FANG,** to an account whose address the founder supplies at the genesis ceremony. It's published in the genesis manifest with its lock curve.
-- **Vesting on-chain:** nothing for the first year; 25M at the 1-year cliff; then linear until 4 years after genesis. The protocol enforces it; nobody can speed it up.
-- **While locked it can be staked and delegated,** within the 1% per-pool cap, and its rewards are locked on the same curve. It can't be transferred and can't vote.
-- **Share over time.** The founder holds 10% of supply at genesis, and there's no foundation allocation beside it: under the 20% line the CLARITY Act drew for "mature" networks (section 9). Issuance dilutes it: without staking, the founder's 100M is about 8.3% of supply after 4 years.
-- **Pledges** (see "What the founder must not do"): no votes while vesting runs, even with vested tokens; no contribution-pool claims, jury seats or self-awarded Hunts while vesting runs; Soul set to 0 in the genesis ledger; any sale of vested tokens only under a pre-announced plan.
+- **The founder gets nothing at genesis** (changed 2026-11-08; it was 10%, 100M FANG, on a 1-year cliff and 4-year vest). A project whose site says "no investors, nobody is selling you anything" shouldn't hand its maker a tenth of the supply, and a founder's allocation together with the founder's promotion is the pattern regulators read as an investment contract (section 9).
+- **The founder earns as anyone does:** commission as a validator (at most 2 seats, DEC-3, with their owners in `bootstrap_excluded` so the bootstrap delegation passes them over), and contribution-pool rewards judged by juries of other people. The genesis Soul ledger gives the founder 0.
+- **Pledges stay** (see "What the founder must not do"): no votes on proposals that pay the founder or the founder's company, and any sale of FANG the founder earns only under a pre-announced plan.
 
 ## 8. Deliberately absent
 
@@ -141,7 +143,8 @@ Staking rewards are payment for validating and securing the network. They aren't
 - **No allocation to exchanges or market makers,** and no arranged listings.
 - **No admin keys,** no faucet and no emergency or upgrade key on mainnet.
 - **No share of issuance or fees** for the founder, the foundation or any named person, now or by later proposal.
-- **No promised airdrop.** Testnet activity earns no claim to any mainnet allocation.
+- **No promised airdrop,** and no distribution bucket waiting for criteria. Testnet and demo-chain activity earns no claim to any mainnet allocation.
+- **No founder allocation** (section 7).
 
 ## 9. Legal posture
 
@@ -156,13 +159,13 @@ Staking rewards are payment for validating and securing the network. They aren't
   - Self-custodial staking, including delegation to an operator, isn't a securities transaction.
   - A free airdrop is covered when it's announced after the network is functional, for past use of a testing environment. It isn't covered when it's announced during testing to drive engagement, or when tokens are given for services (fixing bugs is the release's example). So Hunts and pool payouts are best read as compensation for work, outside the airdrop guidance.
 - **Regulation Crypto Assets** (Release 33-11434), proposed 2026-08-18, comments due 2026-10-20: exemptions for raises and a safe harbor for projects that have finished their promised efforts. It gives no guidance for projects that never sell. Its disclosure list (supply, lockups, release schedules, related-person holdings, mint and burn) is what this page publishes.
-- **Congress.** The GENIUS Act (payment stablecoins, signed 2025-07-18) doesn't apply to FANG. The CLARITY Act passed the House on 2025-07-17, but Senate cloture failed on 2026-09-15; it must be reintroduced in the next Congress (from January 2027). Its "mature blockchain" test kept affiliated holders under 20% of supply; this design keeps the founder at 10%, with no foundation allocation.
+- **Congress.** The GENIUS Act (payment stablecoins, signed 2025-07-18) doesn't apply to FANG. The CLARITY Act passed the House on 2025-07-17, but Senate cloture failed on 2026-09-15; it must be reintroduced in the next Congress (from January 2027). Its "mature blockchain" test kept affiliated holders under 20% of supply; this design gives the founder nothing at genesis and has no foundation allocation.
 - **Uncertainty.** The release is guidance: a later Commission can withdraw it, courts aren't bound by it, and states and private plaintiffs can still sue. The 2026-11-03 midterms and a 2029 administration change are live risks.
-- **Tax** is separate. Staking rewards are income when received (Rev. Rul. 2023-14), as are airdrops (Rev. Rul. 2019-24). How the founder's locked allocation is taxed is a question for tax counsel.
+- **Tax** is separate. Staking rewards are income when received (Rev. Rul. 2023-14), as are airdrops (Rev. Rul. 2019-24).
 
 **European Union (MiCA, Regulation 2023/1114, Title II applies from 2024-12-30).** The white-paper rules for offers to the public don't apply to crypto-assets offered for free or created automatically as validation rewards (Art. 4(3)). That exemption falls away if the offeror announces an intention to seek admission to trading (Art. 4(4)). An exchange that lists a token on its own initiative must write the white paper itself (Art. 5(2)). Open questions for EU counsel: whether Hunts and pool payouts (given for work) count as "free", and whether linking a GitHub handle is personal data given in exchange.
 
-**Where the real exposure is.** Not the 10% allocation, but operational control: today one person maintains the code, merges the PRs that earn pool rewards, publishes releases, and runs the wallet domain, the RPC and the testnet validators. That has to be handed over before genesis: more maintainers with merge rights, more wallet frontends and RPCs, the domain owned by an entity, and at most 2 validators of the founder's.
+**Where the real exposure is.** Not an allocation (there's none for the founder), but operational control: today one person maintains the code, merges the PRs that earn pool rewards, publishes releases, and runs the wallet domain, the RPC and the testnet validators. That has to be handed over before genesis: more maintainers with merge rights, more wallet frontends and RPCs, the domain owned by an entity, and at most 2 validators of the founder's.
 
 ### What the founder must not do
 
@@ -172,9 +175,9 @@ Staking rewards are payment for validating and securing the network. They aren't
 4. **Keep any admin, upgrade, veto or emergency key** over the protocol, or run more than a quarter of validators through the foundation.
 5. **Announce an airdrop, its criteria or "testnet points"** before mainnet is functional, or describe testnet FANG or Soul as convertible.
 6. **Take any slice of issuance or fees** for himself or the foundation, now or by later proposal.
-7. **Vote while vesting runs,** even with vested tokens, or vote on proposals that pay himself or his company.
-8. **Claim from the contribution pool, sit on juries, or award himself Hunts** while vesting runs.
-9. **Sell vested tokens without a pre-announced plan.** Once vested, sell only under a published schedule or cap, with disclosure, never around announcements.
+7. **Vote on proposals that pay himself or his company.**
+8. **Award himself Hunts, or judge his own contribution claims.**
+9. **Sell FANG he earns without a pre-announced plan:** only under a published schedule or cap, with disclosure, never around announcements.
 10. **Call FANG an investment,** or the project a company whose success holders share.
 11. **Stay the single point of operation:** one maintainer, one wallet domain, one RPC, one explorer.
 
@@ -182,9 +185,9 @@ Staking rewards are payment for validating and securing the network. They aren't
 
 These are open in the design and are settled in the governance and economics work before genesis:
 
-- ✅ **How the first distribution is executed (settled).** The 32% bucket is keyless, and at launch almost nothing can vote: insider tokens are locked and the founder doesn't vote. A distribution that waits for an ordinary governance quorum could wait forever, and one that a single party can trigger makes that party the distributor. So the first community distribution executes through the **bootstrap council**: a `Distribution` proposal (Merkle root, total, claim deadline) passes once ⅔ of the active validator set (22–31 independent operators, the founder at most 2 seats) votes for it and token-weighted Nay doesn't exceed Aye. It then waits out the 2-day timelock, and nothing is distributed before `governance_spend_height` (≈ 6 months). Recipients claim with a Merkle proof (`ClaimDistribution`, `blockula gov claim`), and unclaimed amounts return to the community bucket after the deadline. The criteria stay open: they're published with the proposal, never before mainnet works.
-- **First FANG for fees.** With no sale and no faucet, liquid FANG at launch is little more than validator commission. How new users pay their first fees (for example treasury-sponsored onboarding transactions, as PLAN.md describes) is open.
+- **Distributions (superseded 2026-11-08).** There's no community-distribution bucket any more, so nothing waits for criteria. The `Distribution` machinery (a Merkle root, claims with `ClaimDistribution`) stays in the protocol; governance could fund one from the treasury by proposal, under the treasury's own rules.
+- **First FANG for fees.** With no sale and no faucet, liquid FANG at launch is little more than validator commission. The recommendation: a small onboarding grant from the treasury (a `TreasurySpend` to a multisig that sponsors each new account's creation fee and first fees, capped per account), and validators free to sponsor accounts themselves. The amounts are open.
 - **Governance numbers:** the quorum floor, the length of a conviction lock period, the proposal deposit, and the threshold for a "large" treasury spend.
-- ✅ **No foundation allocation (settled 2026-10-18).** The 5% once planned for a foundation's multisig is the treasury's (30%, on the treasury's 4-year curve, which was the foundation's too), so no foundation has to exist at genesis. The founder's company pays for audits, counsel and infrastructure through launch. Once a foundation is formed, governance may fund it with a `TreasurySpend` to its multisig: from `governance_spend_height` (≈ 6 months), up to what the treasury has unlocked (37.5M at 6 months, plus inflows), in tranches if it likes. A spend above `treasury_large_bps` (1% of the treasury) within 30 days needs ⅔, and in the first year the bootstrap council can pass one too. The chain won't treat a foundation funded this way as an insider: `bootstrap_excluded` is fixed in the genesis and a spend arrives liquid, so the bootstrap delegation would back its validators and the insider seat rules wouldn't count them. Its funding proposal should commit it to running no validators of its own, never voting and publishing quarterly reports. Such a grant is a vote on the treasury's balance, not a standing slice of issuance or fees, which stays ruled out (section 8).
+- ✅ **No foundation allocation (settled 2026-10-18).** The 5% once planned for a foundation's multisig is the treasury's (now 40%, on the treasury's 4-year curve, which was the foundation's too), so no foundation has to exist at genesis. The founder's company pays for audits, counsel and infrastructure through launch. Once a foundation is formed, governance may fund it with a `TreasurySpend` to its multisig: from `governance_spend_height` (≈ 6 months), up to what the treasury has unlocked (50M at 6 months, plus inflows), in tranches if it likes. A spend above `treasury_large_bps` (1% of the treasury) within 30 days needs ⅔, and in the first year the bootstrap council can pass one too. The chain won't treat a foundation funded this way as an insider: `bootstrap_excluded` is fixed in the genesis and a spend arrives liquid, so the bootstrap delegation would back its validators and the insider seat rules wouldn't count them. Its funding proposal should commit it to running no validators of its own, never voting and publishing quarterly reports. Such a grant is a vote on the treasury's balance, not a standing slice of issuance or fees, which stays ruled out (section 8).
 - ✅ **The majority for issuance changes (settled):** a ⅔ token supermajority, never the bootstrap council, within the code-enforced bounds above.
 - **Clawback scope.** The recommendation is that `Clawback` applies to contribution-pool grants only, never to a genesis allocation.

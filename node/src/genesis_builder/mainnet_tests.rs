@@ -93,10 +93,9 @@ fn spec(chain: &str, float: Option<u64>, extra: &str) -> Spec {
          [params]\nproposal_deposit = \"10000000000\"\nvoting_blocks = 259200\ntimelock_blocks = 86400\nbootstrap_end_height = 63072000\ndowntime_window = 1200\ndowntime_max_missed = 600\nbootstrap_commission_cap_bps = 0\n"
     );
     let alloc = |bucket: &str, address: Option<String>, amount: u64| format!("[[allocation]]\nbucket = \"{bucket}\"\n{}amount = \"{amount}\"\n", address.map(|a| format!("address = \"{a}\"\n")).unwrap_or_default());
-    for (b, amount) in [("community", 320_000_000), ("treasury", 300_000_000), ("endowment", 150_000_000), ("bootstrap", 100_000_000)] {
+    for (b, amount) in [("treasury", 400_000_000), ("endowment", 470_000_000), ("bootstrap", 100_000_000)] {
         t += &alloc(b, None, amount);
     }
-    t += &alloc("founder", Some(founder().address_with("boo")), 100_000_000);
     for (seed, ..) in FOUNDER_SEATS {
         t += &alloc("operators", Some(owner(seed).address_with("boo")), 1_000_000);
     }
@@ -195,7 +194,7 @@ fn the_founder_set_builds_strict_with_its_waivers_on_record() {
     assert_eq!(built.waived[3], "WAIVED: country-cap: data-center country us has 2 of the 4 operators; at most 1 may (two US regions (iad, sjc))");
     let g = &built.genesis;
     assert_eq!(g.upgrades, [ScheduledUpgrade { version: 2, activation_height: 1 }]);
-    assert!(g.features.is_empty() && g.bootstrap_excluded == [founder().address_with("boo")], "only the founder's own account is excluded");
+    assert!(g.features.is_empty() && g.bootstrap_excluded.is_empty(), "no founder allocation, and no seat is flagged, so nothing is excluded");
     let liquid: Vec<&Allocation> = g.allocations.iter().filter(|a| a.vesting.is_none() && system_account("boo", &a.address).is_none()).collect();
     assert_eq!(liquid.len(), 4);
     for (a, v) in liquid.iter().zip(&g.validators) {
@@ -279,8 +278,7 @@ fn the_council_upgrades_from_block_1_and_switches_programs_on_under_v3() {
 const PROGRAMS_REFUSAL: &str = "blockula-1 switches programs on by governance only from protocol v3: v2's program rules run there only if its genesis lists them";
 
 /// (b) The freeze the float exists for. Without it, every allocation to an account with a key
-/// vests (DEC-5): the founder's from a 12-month cliff, the operators' and the grants' from a
-/// 6-month one, and the consensus-key accounts get nothing. Unvested tokens neither vote nor pay a
+/// vests (DEC-5): the operators' and the grants' from a 6-month cliff, and the consensus-key accounts get nothing. Unvested tokens neither vote nor pay a
 /// deposit, so at block 1 nobody can propose (the deposit is locked, or there's no FANG at all)
 /// and nothing could vote on a proposal: every account's voting balance, the council's included,
 /// is zero until the operators' cliff (block 15,778,800, about six months in). No upgrade, no
@@ -291,7 +289,7 @@ fn without_the_float_nobody_can_propose_or_vote_until_the_operators_cliff() {
     let mut r = Run::new(&g);
     assert_eq!(crate::governance::unlocked_supply(&r.st, 1), 0, "nothing can vote");
     let keyed: Vec<String> = r.st.accounts.keys().filter(|a| system_account("boo", a).is_none()).cloned().collect();
-    assert_eq!(keyed.len(), 6, "the founder, the four owners and the grants: {keyed:?}");
+    assert_eq!(keyed.len(), 5, "the four owners and the grants: {keyed:?}");
     for a in &keyed {
         assert_eq!((crate::econ::voting_balance(&r.st, a, 1), crate::econ::transferable(&r.st, a, 1)), (0, 0), "{a}");
     }
@@ -301,20 +299,20 @@ fn without_the_float_nobody_can_propose_or_vote_until_the_operators_cliff() {
         let e = r.propose(&k, text()).unwrap_err().to_string();
         assert!(e.contains("insufficient balance for the fee"), "{e}");
     }
-    for k in owners.iter().chain([&founder(), &grants()]) {
+    for k in owners.iter().chain([&grants()]) {
         let e = r.propose(k, text()).unwrap_err().to_string();
         assert!(e.contains("is locked"), "{e}");
     }
     assert_eq!(r.st.governance.next_proposal_id, 0, "no proposal exists");
     // Nor could anyone vote on one, the council included (from a validator's account or its
     // owner's): here's one written into the state.
-    let p = crate::governance::Proposal { id: 0, proposer: founder().address_with("boo"), kind: text(), title: "t".into(), url: String::new(), deposit: 0, created_at: 1, voting_end: 1 + r.st.chain_params.voting_blocks, execute_at: None, status: ProposalStatus::Voting, aye_amount: 0, nay_amount: 0, aye_weight: 0, nay_weight: 0, voters: 0, council: Default::default(), tally: None, outcome: String::new() };
+    let p = crate::governance::Proposal { id: 0, proposer: grants().address_with("boo"), kind: text(), title: "t".into(), url: String::new(), deposit: 0, created_at: 1, voting_end: 1 + r.st.chain_params.voting_blocks, execute_at: None, status: ProposalStatus::Voting, aye_amount: 0, nay_amount: 0, aye_weight: 0, nay_weight: 0, voters: 0, council: Default::default(), tally: None, outcome: String::new() };
     r.st.governance.proposals.insert(0, p);
     for k in council() {
         let e = r.vote(&k, 0).unwrap_err().to_string();
         assert!(e.contains("insufficient balance for the fee"), "{e}");
     }
-    for k in owners.iter().chain([&founder(), &grants()]) {
+    for k in owners.iter().chain([&grants()]) {
         let e = r.vote(k, 0).unwrap_err().to_string();
         assert!(e.contains("you can vote with up to 0 FANG"), "{e}");
     }
@@ -327,7 +325,6 @@ fn without_the_float_nobody_can_propose_or_vote_until_the_operators_cliff() {
         assert_eq!(crate::econ::voting_balance(&r.st, &a, cliff - 1), 0);
         assert!(crate::econ::voting_balance(&r.st, &a, cliff) > 0);
     }
-    assert_eq!(crate::econ::voting_balance(&r.st, &founder().address_with("boo"), cliff), 0, "the founder's cliff is a year");
     // With the float, the same genesis has 400 FANG that vote from block 1.
     assert_eq!(crate::governance::unlocked_supply(&Run::new(&launch(MAIN)).st, 1), 400 * FANG as u128);
     // The refused txs left the state whole.
@@ -541,10 +538,10 @@ fn operator_floats_are_capped_and_inside_the_operators_bucket() {
     extra.total_supply = "1000000400".into();
     let err = refused(&extra, &ops);
     assert!(err.contains("supply is 1000000000 FANG"), "{err}");
-    extra.allocations[0].amount = "319999600".into();
+    extra.allocations[0].amount = "399999600".into();
     extra.total_supply = "1000000000".into();
     let err = refused(&extra, &ops);
-    assert!(err.contains("bucket-shares: bucket community holds") && err.contains("bucket-shares: bucket operators holds 30000400000000000 drops, operator floats included; DEC-5 gives it 30000000000000000 (3% of the supply)"), "{err}");
+    assert!(err.contains("bucket-shares: bucket treasury holds") && err.contains("bucket-shares: bucket operators holds 30000400000000000 drops, operator floats included; DEC-5 gives it 30000000000000000 (3% of the supply)"), "{err}");
     let mut waived = extra.clone();
     waived.waivers.push(SpecWaiver { rule: "bucket-shares".into(), reason: "floats".into() });
     assert!(refused(&waived, &ops).contains("waiver \"bucket-shares\": never waivable"));
@@ -583,7 +580,7 @@ fn seats_that_couldnt_rejoin_or_pay_their_duties_are_findings() {
     // Flagged as the founder's: excluded from the bootstrap delegation, and capped as newcomers.
     let flagged: Vec<OperatorFile> = (0..4).map(|i| seat(DRY_RUN, i, &owner(FOUNDER_SEATS[i].0), "10000", true)).collect();
     let (g, f) = findings(&flagged);
-    assert_eq!(g.bootstrap_excluded.len(), 5);
+    assert_eq!(g.bootstrap_excluded.len(), 4, "the owners of the flagged seats; no founder account");
     assert!(g.validators.iter().all(|v| !rejoins(&g, &v.address)));
     assert_eq!(f.len(), 1, "{f:?}");
     assert!(f[0].starts_with("rejoin-trap: 4 of the 4 seats (Blockula validator ") && f[0].contains("a set of 4 holds at most 0 of them once one is a newcomer (staking.rs excluded_seats_cap): one that leaves the set (jailed for downtime, or for a beacon commitment it didn't reveal) can't rejoin while the others hold theirs, at any set size (at most 2 such seats ever come back). Leave founder-run seats unflagged, each with its own operators-bucket owner"), "{}", f[0]);

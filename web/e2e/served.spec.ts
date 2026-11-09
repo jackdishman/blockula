@@ -32,6 +32,10 @@ async function onboard(page: Page, name?: string) {
   await expect(page.getByRole("combobox", { name: "Network" })).toHaveCount(0);
   await page.getByRole("link", { name: "Make a wallet" }).first().click();
   await expect(page).toHaveURL(/\/wallet\/welcome\/?$/);
+  // The Terms of Use come first (components/Terms.tsx), linked within the served wallet.
+  await expect(page.getByTestId("terms-agreement").getByRole("link", { name: "Terms of Use" })).toHaveAttribute("href", /^\/wallet\/terms\/?$/);
+  await page.getByTestId("terms-checkbox").check();
+  await page.getByRole("button", { name: "I agree" }).click();
   await page.getByRole("button", { name: "Skip intro" }).click();
   await page.getByRole("button", { name: "Create wallet with passkey" }).click();
   await expect(page.getByRole("heading", { name: /landed!$/ })).toBeVisible({ timeout: 30_000 });
