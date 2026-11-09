@@ -173,7 +173,7 @@ function Live({ status, blocks }: { status: DemoStatus; blocks: DemoBlock[] }) {
           <a className="btn small" href={`${node}/`} data-testid="demo-explorer">Explorer</a>
           <a className="btn small" href={`${node}/#/start/invite`} data-testid="demo-invite">Invite page</a>
         </div>
-        <p className="dim small center">Your wallet lives on this device, unlocked by Face ID, Touch ID or your password manager. Demo coins are free and worth nothing, and the demo may be reset.</p>
+        <p className="dim small center">Your wallet lives on this device, unlocked by Face ID, Touch ID or your password manager. Demo coins are free and worth nothing. We keep the demo running and upgrade it in place, but it&apos;s an experiment: it can stop at any time. For education and research only; using it means agreeing to the <a href="/terms">Terms</a> and <a href="/privacy">Privacy Policy</a>.</p>
       </div>
 
       <details className="landing-more site-agent">

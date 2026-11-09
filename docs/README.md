@@ -40,7 +40,8 @@ Written while Blockula was headed for a value-bearing mainnet, which was dropped
 |---|---|
 | [PLAN.md](PLAN.md) | Architecture, Proof of Contribution, privacy, the roadmap as it was |
 | [MAINNET-DESIGN.md](MAINNET-DESIGN.md) | The protocol v1 design |
-| [TOKENOMICS.md](TOKENOMICS.md) | Issuance, fees and staking economics, written for the mainnet that was planned |
+| [TOKENOMICS.md](TOKENOMICS.md) | Issuance, fees and staking economics, and the allocation a mainnet would have (revised 2026-11-08: no founder share) |
+| [PUBLIC-CHAIN.md](PUBLIC-CHAIN.md) | The public demo chain: permanent, worth nothing, and how it grows to four or more validators |
 | [GENESIS_CEREMONY.md](GENESIS_CEREMONY.md) | How independent operators would build a public genesis |
 | [PROGRAMS-PLAN.md](PROGRAMS-PLAN.md) | How programs were planned and built |
 | [AUDIT-2026-10.md](AUDIT-2026-10.md), [AUDIT_SCOPE.md](AUDIT_SCOPE.md) | The internal review and what a third-party audit would cover |
