@@ -18,6 +18,10 @@
 #   BLOCK_TIME_MS                   default 2000
 #   NO_FAUCET=1                     no faucet: the validator holds the starting supply
 #   PROGRAMS=1                      programs (WebAssembly, experimental) on from block 1
+#   PEER_HTTP                       the chain's other validators' HTTP APIs (space-separated URLs).
+#                                   Set it once the chain has more than this one: after a restart
+#                                   the node asks them where the network stands before it signs,
+#                                   and with no one to ask a two-validator chain stays stopped
 #   VM_MEMORY                       default 512mb (plus 512 MB of swap)
 #   VOLUME_GB                       default 3 (a validator keeps about two days of blocks)
 #   HOSTED_DIR                      where the chain's genesis and key live on this machine
@@ -98,6 +102,7 @@ if [ ! -f "$HOSTED_DIR/key-on-volume" ]; then
     | fly secrets import -a "$APP" --stage >/dev/null
 fi
 
+peer_http_env=${PEER_HTTP:+"  PEER_HTTP = \"$PEER_HTTP\""}
 cat > "$work/fly.toml" <<TOML
 app = "$APP"
 primary_region = "$REGION"
@@ -112,6 +117,7 @@ swap_size_mb = 512
   P2P_PRESET = "public-nat"
   CLIENT_IP_HEADER = "fly-client-ip"
   BLOCKULA_LOG = "warn,blockula=info"
+$peer_http_env
 [mounts]
   source = "data"
   destination = "/data"
