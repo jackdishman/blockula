@@ -67,9 +67,10 @@ Borrowed from the explorers worth borrowing from, without copying any of them:
 | Route | What |
 |---|---|
 | `/explore` | The pulse: live block ribbon, cadence, proposer share, chain figures, latest transactions, mempool |
+| `/people` | Everyone on the chain by `.boo` name (`/api/accounts`, `/api/names`): richest, newest active or alphabetical, a search box, the newest names, and Send on each row |
 | `/block/{height}` | A block in context: neighbors on a ribbon, proposer, hashes, certificate, transactions |
 | `/tx/{id}` | The receipt: summary, lifecycle trace, balance changes, signer key, details, raw |
-| `/account/{name\|address}` | Balance, money flows by counterparty, keys and agent budgets, activity filterable by key and direction (and exportable as CSV), watch |
+| `/account/{name\|address}` | Balance, money flows by counterparty, keys and agent budgets, activity filterable by key and direction (and exportable as CSV), watch; Pay on someone else's, and Send, Receive and Request (a prefilled Send link with a QR code, which the payer reviews and signs) on your own |
 | `/trace/{name\|address}?follow=` | The money graph around an account; `follow` lists accounts expanded a hop further, so a trace is a shareable link |
 | `/name/{name}` | Status (active; expired, in its grace period, when only its owner can renew it; reserved; free), owner, expiry, a pending offer, and the owner's renew, offer and release actions (or the recipient's accept); or the price and a register button |
 | `/programs` | The chain's built-in modules, each with its state, its calls and its actions |
