@@ -102,8 +102,8 @@ export default function ExplorePage() {
         <div className="figures">
           <Stat v={<Fang display={s?.supply_display} short />} k="total supply" />
           <Stat v={<Fang display={s?.burned_display} />} k={<Term k="burned" />} />
-          <Stat v={s?.accounts?.toLocaleString("en-US") ?? "—"} k="accounts" />
-          <Stat v={s?.names?.toLocaleString("en-US") ?? "—"} k={<Term k="name">.boo names</Term>} />
+          <Stat v={s?.accounts?.toLocaleString("en-US") ?? "—"} k={<Link href={to.people()} data-testid="pulse-people">accounts</Link>} />
+          <Stat v={s?.names?.toLocaleString("en-US") ?? "—"} k={<Link href={to.people()}>.boo names</Link>} />
           <Stat v={mempool.data?.count ?? s?.mempool ?? 0} k={<Term k="mempool">waiting</Term>} />
         </div>
         <div className="row-between small dim pad-row">

@@ -244,6 +244,26 @@ struct Memo {
     hunts: OnceLock<HuntsMemo>,
     souls: OnceLock<Vec<(u64, String)>>,
     claims: OnceLock<ClaimsMemo>,
+    people: OnceLock<PeopleMemo>,
+}
+
+/// Above this many accounts, `/api/accounts?sort=recent` isn't offered: it reads each account's
+/// newest history row once per block, which stays cheap only while the chain is small.
+pub const PEOPLE_RECENT_MAX_ACCOUNTS: usize = 20_000;
+
+/// The explorer's people directory (`/api/accounts`, `/api/names`), ranked once per block.
+pub struct PeopleMemo {
+    /// Accounts by balance, richest first (ties by address).
+    pub by_balance: Vec<String>,
+    /// Accounts with an active name, alphabetically by that (primary) name.
+    pub by_name: Vec<String>,
+    /// Accounts by their newest finalized tx's height, newest first (accounts with none this node
+    /// holds are left out); `None` past `PEOPLE_RECENT_MAX_ACCOUNTS`.
+    pub by_recent: Option<Vec<String>>,
+    /// Each of those accounts' newest finalized tx's height (empty past the cap).
+    pub last_active: HashMap<String, u64>,
+    /// Registered names (active, or in their grace), newest registration first (ties by name).
+    pub names_recent: Vec<String>,
 }
 
 /// Hunts by bounty (biggest first, then by id), overall and per displayed status.
@@ -531,6 +551,29 @@ impl ReadView {
             let mut list: Vec<(u64, String)> = self.state.poc.souls.keys().map(|a| (self.state.soul_of(a, self.height), a.clone())).filter(|(s, _)| *s > 0).collect();
             list.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
             list
+        })
+    }
+
+    /// The people directory, ranked once per block view (`PeopleMemo`).
+    pub fn people(&self) -> &PeopleMemo {
+        self.memo.people.get_or_init(|| {
+            let st = &self.state;
+            let now = crate::econ::now(st);
+            let mut ranked: Vec<(u64, &String)> = st.accounts.iter().map(|(a, acct)| (acct.balance, a)).collect();
+            ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+            let by_balance: Vec<String> = ranked.into_iter().map(|(_, a)| a.clone()).collect();
+            let mut named: Vec<(String, String)> = by_balance.iter().filter_map(|a| Some((self.primary_name(a)?, a.clone()))).collect();
+            named.sort();
+            let mut last_active = HashMap::new();
+            let by_recent = (by_balance.len() <= PEOPLE_RECENT_MAX_ACCOUNTS).then(|| {
+                let mut rows: Vec<(u64, &String)> = by_balance.iter().filter_map(|a| Some((self.history(a, 1).first()?.0, a))).collect();
+                rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+                last_active = rows.iter().map(|(h, a)| ((*a).clone(), *h)).collect();
+                rows.into_iter().map(|(_, a)| a.clone()).collect()
+            });
+            let mut names: Vec<(u64, &String)> = st.names.iter().filter(|(_, r)| now <= crate::econ::grace_until(st, r)).map(|(n, r)| (r.registered_at, n)).collect();
+            names.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+            PeopleMemo { by_balance, by_name: named.into_iter().map(|(_, a)| a).collect(), by_recent, last_active, names_recent: names.into_iter().map(|(_, n)| n.clone()).collect() }
         })
     }
 
