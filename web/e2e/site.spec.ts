@@ -88,6 +88,9 @@ test("the demo chain's live stats, its wallet a click away, and the agent prompt
   await expect(page.getByTestId("contribute-prompt")).toContainText("Contribute to Blockula (https://github.com/jackdishman/blockula). Clone it");
   await expect(page.getByRole("link", { name: "Good first issues" })).toHaveAttribute("href", "https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3A%22good+first+issue%22");
   await expect(page.getByTestId("imprint-note")).toContainText("The coins have no value");
+  await expect(page.getByTestId("imprint-note")).toContainText("for education and research only");
+  await expect(page.getByTestId("imprint-terms").getByRole("link", { name: "Terms of Use" })).toHaveAttribute("href", "/terms");
+  await expect(page.getByTestId("imprint-terms").getByRole("link", { name: "Privacy Policy" })).toHaveAttribute("href", "/privacy");
 
   // No wallet chrome, and nothing the project never says.
   await expect(page.getByTestId("network-badge")).toHaveCount(0);
@@ -191,3 +194,15 @@ for (const scheme of ["light", "dark"] as const)
     const bg = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--paper").trim());
     expect(bg).toBe(scheme === "dark" ? "#16110e" : "#ece3cd");
   });
+
+test("the site serves its Terms of Use and Privacy Policy, and sends wallet routes home", async ({ page }) => {
+  await watchCsp(page);
+  await page.goto("/terms");
+  await expect(page.getByRole("heading", { name: "Terms of Use", level: 1 })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Sections" }).getByRole("link", { name: "Demo" })).toHaveAttribute("href", "/#demo");
+  await page.goto("/privacy");
+  await expect(page.getByRole("heading", { name: "Privacy Policy", level: 1 })).toBeVisible();
+  await page.goto("/send");
+  await expect(page).toHaveURL(/\/$/);
+  expect(await cspViolations(page)).toEqual([]);
+});
