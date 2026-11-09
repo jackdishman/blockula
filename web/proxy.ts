@@ -2,13 +2,16 @@ import { NextResponse, type NextRequest } from "next/server";
 import { RPC_COOKIE, SITE } from "./lib/config";
 import { contentSecurityPolicy, customOrigin } from "./lib/csp";
 
+/** The project site's pages. */
+const SITE_PATHS = new Set(["/", "/terms", "/privacy"]);
+
 /**
  * A fresh CSP nonce per request. Next.js reads it from the request's CSP header and puts it on
  * every script it renders; the same policy goes out on the response.
  */
 export function proxy(request: NextRequest) {
-  // The project site is one page: the wallet's routes aren't for this origin, so they go home.
-  if (SITE && request.nextUrl.pathname !== "/") return NextResponse.redirect(new URL("/", request.url), 307);
+  // The project site is one page and its legal pages: the wallet's routes aren't for this origin, so they go home.
+  if (SITE && !SITE_PATHS.has(request.nextUrl.pathname)) return NextResponse.redirect(new URL("/", request.url), 307);
   const nonce = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(18))));
   const csp = contentSecurityPolicy(nonce, {
     custom: SITE ? null : customOrigin(request.cookies.get(RPC_COOKIE)?.value),

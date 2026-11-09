@@ -93,21 +93,21 @@ bootstrap_commission_cap_bps = 0
 # (in blocks at block_time_ms) and, for keyless buckets, their system account. Each bucket must
 # hold exactly its share (the operator floats count toward the operators bucket).
 
-# 32%: community distributions (keyless; criteria announced only after mainnet works).
-[[allocation]]
-bucket = "community"
-amount = "320000000"
+# The community and founder buckets hold 0% (since 2026-11-08: no founder allocation, no
+# undefined distribution), so they have no allocations.
 
-# 30%: the treasury (keyless; unlocks over 4 years; only TreasurySpend moves it). It holds the 5%
-# once meant for a foundation: governance funds one from here once one exists (TOKENOMICS.md).
+# 40%: the treasury (keyless; unlocks over 4 years; only TreasurySpend moves it). It holds the 5%
+# once meant for a foundation and the 10% once meant for the founder: governance funds a
+# foundation from here once one exists (TOKENOMICS.md).
 [[allocation]]
 bucket = "treasury"
-amount = "300000000"
+amount = "400000000"
 
-# 15%: the contribution endowment (keyless; streams into the pool over 10 years).
+# 47%: the contribution endowment (keyless; streams into the pool over 10 years; tokens go out
+# only as pay for verified work).
 [[allocation]]
 bucket = "endowment"
-amount = "150000000"
+amount = "470000000"
 
 # 10%: the validator bootstrap delegation (keyless; each epoch delegated equally to the set's
 # members, its rewards to the treasury; returns to the treasury linearly over years 2–4). It
@@ -117,13 +117,6 @@ amount = "150000000"
 [[allocation]]
 bucket = "bootstrap"
 amount = "100000000"
-
-# 10%: the founder (1-year cliff, 4-year vest). PLACEHOLDER: the founder's account.
-[[allocation]]
-bucket = "founder"
-address = "tboo10une7t3u48xlwqpcskt47gsm5mzvcxennfwnf856perxhv5pvchqww54jr"
-amount = "100000000"
-label = "founder"
 
 # 3%: genesis operators, the operator floats and security grants (6-month cliff, 2-year vest; the
 # floats are liquid). Each operator's self-bond comes out of its own allocation (locked tokens

@@ -74,12 +74,18 @@ pub struct Bucket {
 /// its 5% is the treasury's, for governance to fund a foundation from once one exists
 /// (TOKENOMICS.md). The bucket stays so the launched testnets' specs, which gave it 5%, still
 /// rebuild byte for byte (with a finding; `blockula-1`, always strict, refuses any).
+///
+/// 2026-11-08: no founder allocation and no undefined distribution bucket. The founder's 10% is
+/// the treasury's (now 40%) and the community's 32% is the contribution endowment's (now 47%):
+/// tokens go out only as pay for verified work. The `community` and `founder` buckets stay at 0,
+/// like `foundation`, so older specs that used them still rebuild (with a finding). The founder
+/// may still run seats (`MAX_FOUNDER_SEATS`) and stays excluded from the bootstrap delegation.
 pub const BUCKETS: &[Bucket] = &[
-    Bucket { name: "community", bps: 3_200, system: Some(community), vesting: None },
-    Bucket { name: "treasury", bps: 3_000, system: Some(treasury), vesting: Some((0, 0, 48)) },
-    Bucket { name: "endowment", bps: 1_500, system: Some(endowment), vesting: Some((0, 0, 120)) },
+    Bucket { name: "community", bps: 0, system: Some(community), vesting: None },
+    Bucket { name: "treasury", bps: 4_000, system: Some(treasury), vesting: Some((0, 0, 48)) },
+    Bucket { name: "endowment", bps: 4_700, system: Some(endowment), vesting: Some((0, 0, 120)) },
     Bucket { name: "bootstrap", bps: 1_000, system: Some(bootstrap_delegation), vesting: Some((12, 12, 48)) },
-    Bucket { name: "founder", bps: 1_000, system: None, vesting: Some((0, 12, 48)) },
+    Bucket { name: "founder", bps: 0, system: None, vesting: Some((0, 12, 48)) },
     Bucket { name: "foundation", bps: 0, system: None, vesting: Some((0, 0, 48)) },
     Bucket { name: "operators", bps: 300, system: None, vesting: Some((0, 6, 24)) },
 ];
@@ -1070,13 +1076,12 @@ mod tests {
         let total: u64 = g.allocations.iter().map(|x| x.amount).sum();
         assert_eq!(total, MAX_SUPPLY);
         let held = |addr: &str| g.allocations.iter().filter(|x| x.address == addr).map(|x| x.amount).sum::<u64>();
-        assert_eq!((held(&community("tboo")), held(&treasury("tboo")), held(&endowment("tboo")), held(&bootstrap_delegation("tboo"))), (320_000_000 * FANG, 300_000_000 * FANG, 150_000_000 * FANG, 100_000_000 * FANG));
+        assert_eq!((held(&community("tboo")), held(&treasury("tboo")), held(&endowment("tboo")), held(&bootstrap_delegation("tboo"))), (0, 400_000_000 * FANG, 470_000_000 * FANG, 100_000_000 * FANG));
         let curve = |label: &str| g.allocations.iter().find(|x| x.label.as_deref() == Some(label)).unwrap().vesting.clone();
-        assert_eq!(curve("founder"), Some(Vesting { start: 0, cliff: 31_557_600, end: 126_230_400 }));
         assert_eq!(curve("security grants"), Some(Vesting { start: 0, cliff: 15_778_800, end: 63_115_200 }));
         assert_eq!(curve("treasury"), Some(Vesting { start: 0, cliff: 0, end: 126_230_400 }));
         assert_eq!(curve("endowment"), Some(Vesting { start: 0, cliff: 0, end: 315_576_000 }));
-        assert_eq!(curve("community"), None);
+        assert!(g.allocations.iter().all(|x| x.label.as_deref() != Some("founder") && x.label.as_deref() != Some("community")), "the community and founder buckets hold nothing");
         assert_eq!(curve("bootstrap"), Some(Vesting { start: 31_557_600, cliff: 31_557_600, end: 126_230_400 }), "returns to the treasury over years 2–4");
         // The operators bucket: four owners, the grants and four 100 FANG floats, liquid, on the
         // validators' consensus-key accounts.
@@ -1090,9 +1095,9 @@ mod tests {
         assert_eq!((cp.proposal_deposit, cp.voting_blocks, cp.timelock_blocks, cp.bootstrap_end_height, cp.downtime_window, cp.downtime_max_missed), (10 * FANG, 259_200, 86_400, 63_072_000, 1_200, 600));
         cp.check_governance_floors(&g.params()).unwrap();
         assert_eq!(cp.bootstrap_commission_cap_bps, 0, "the bootstrap delegation pays the founder's seats no commission, whatever they charge");
-        // Unflagged founder-run seats, an owner each, commission 0: only the founder's own account
-        // is passed over by the bootstrap delegation.
-        assert_eq!(g.bootstrap_excluded, [g.allocations.iter().find(|x| x.label.as_deref() == Some("founder")).unwrap().address.clone()]);
+        // Unflagged founder-run seats, an owner each, commission 0, and no founder allocation:
+        // the bootstrap delegation passes over no one.
+        assert!(g.bootstrap_excluded.is_empty());
         assert!(g.operators.iter().all(|o| o.commission_bps == 0) && g.operators.iter().map(|o| &o.owner).collect::<BTreeSet<_>>().len() == 4);
         assert!(!g.faucet && g.validator_admins.is_empty() && g.validators.len() == 4 && g.operators.len() == 4);
         assert!(g.validators.windows(2).all(|w| w[0].address < w[1].address), "validators in canonical order");
@@ -1158,10 +1163,9 @@ mod tests {
     fn spec_for(chain_id: &str, prefix: &str, ops: &[OperatorFile], extra: &str) -> Spec {
         let mut t = format!("chain_id = \"{chain_id}\"\naddress_prefix = \"{prefix}\"\ngenesis_time_ms = 1798761600000\nblock_time_ms = 1000\nepoch_blocks = 3600\ntotal_supply = \"1000000000\"\n{extra}\n");
         let alloc = |bucket: &str, address: Option<&str>, amount: u64| format!("[[allocation]]\nbucket = \"{bucket}\"\n{}amount = \"{amount}\"\n", address.map(|a| format!("address = \"{a}\"\n")).unwrap_or_default());
-        for (b, amount) in [("community", 320_000_000), ("treasury", 300_000_000), ("endowment", 150_000_000), ("bootstrap", 100_000_000)] {
+        for (b, amount) in [("treasury", 400_000_000), ("endowment", 470_000_000), ("bootstrap", 100_000_000)] {
             t += &alloc(b, None, amount);
         }
-        t += &alloc("founder", Some(&Keys::from_seed([0x30; 32]).address_with(prefix)), 100_000_000);
         for o in ops {
             t += &alloc("operators", Some(&o.keys.owner), 1_000_000);
         }
@@ -1203,13 +1207,13 @@ mod tests {
         let pool = "[contribution]\nopening_balance = \"100000\"\nseance_blocks = 259200\nclaim_maturity_blocks = 259200\n[[contribution.repo]]\nrepo = \"JackDishman/Blockula\"\nweight = 10\n";
         let with = |extra: &str, endowment: u64| {
             let mut spec: Spec = toml::from_str(&format!("{}{souls}{extra}", toml_of(&spec_for("blockula-testnet-9", "tboo", &ops, "")))).unwrap();
-            spec.allocations[2].amount = endowment.to_string();
+            spec.allocations[1].amount = endowment.to_string();
             spec
         };
-        let spec = with(pool, 149_900_000);
+        let spec = with(pool, 469_900_000);
         let a = build_from(&spec, &ops, false).unwrap();
         assert_eq!(a.json, build_from(&spec, &ops, false).unwrap().json, "byte-identical");
-        assert_eq!(a.warnings, vec!["opening-balance: the contribution pool opens with 100000 FANG out of the endowment, which DEC-5 releases linearly from zero (docs/TOKENOMICS.md, section 1)".to_string()], "the endowment bucket still holds its 15%");
+        assert_eq!(a.warnings, vec!["opening-balance: the contribution pool opens with 100000 FANG out of the endowment, which DEC-5 releases linearly from zero (docs/TOKENOMICS.md, section 1)".to_string()], "the endowment bucket still holds its 47%");
         let g = &a.genesis;
         assert_eq!(g.pool_repos, BTreeMap::from([("jackdishman/blockula".to_string(), 10)]));
         let times = g.contribution.clone().unwrap();
@@ -1223,7 +1227,7 @@ mod tests {
         let pool_addr = crate::poc::pool_address("tboo");
         assert_eq!((st.account(&pool_addr).balance, crate::econ::transferable(&st, &pool_addr, 0)), (100_000 * FANG, 100_000 * FANG));
         let endow = g.allocations.iter().find(|x| x.address == endowment("tboo")).unwrap();
-        assert_eq!((endow.amount, endow.vesting.clone()), (149_900_000 * FANG, Some(Vesting { start: 0, cliff: 0, end: 315_576_000 })));
+        assert_eq!((endow.amount, endow.vesting.clone()), (469_900_000 * FANG, Some(Vesting { start: 0, cliff: 0, end: 315_576_000 })));
         assert_eq!(g.allocations.iter().find(|x| x.address == pool_addr).unwrap().label.as_deref(), Some(POOL_OPENING_LABEL));
         for j in &jurors {
             assert!(st.soul_of(j, 0) >= crate::poc::JUROR_MIN_SOUL && st.soul_of(j, 0) >= crate::poc::VOUCH_MIN_SOUL, "a founding juror can sit and vouch");
@@ -1243,19 +1247,22 @@ mod tests {
             let err = format!("{:#}", build_from(spec, &ops, false).err().unwrap_or_else(|| panic!("expected {why:?}")));
             assert!(err.contains(why), "expected {why:?}, got: {err}");
         };
-        refuse(&with(pool, 150_000_000), "allocations add up to");
-        refuse(&with(&pool.replace("weight = 10", "weight = 0"), 149_900_000), "needs a weight of 1–100");
-        refuse(&with(&pool.replace("weight = 10", "weight = 101"), 149_900_000), "needs a weight of 1–100");
-        refuse(&with(&pool.replace("JackDishman/Blockula", "not a repo"), 149_900_000), "pool_repos");
-        refuse(&with(&format!("{pool}[[contribution.repo]]\nrepo = \"jackdishman/blockula\"\nweight = 3\n"), 149_900_000), "listed twice");
-        refuse(&with(&pool.replace("\"100000\"", "\"0\""), 150_000_000), "opening_balance must be more than 0");
-        refuse(&with(&pool.replace("seance_blocks = 259200", "seance_blocks = 2"), 149_900_000), "seance_blocks ≥ 3");
+        refuse(&with(pool, 470_000_000), "allocations add up to");
+        refuse(&with(&pool.replace("weight = 10", "weight = 0"), 469_900_000), "needs a weight of 1–100");
+        refuse(&with(&pool.replace("weight = 10", "weight = 101"), 469_900_000), "needs a weight of 1–100");
+        refuse(&with(&pool.replace("JackDishman/Blockula", "not a repo"), 469_900_000), "pool_repos");
+        refuse(&with(&format!("{pool}[[contribution.repo]]\nrepo = \"jackdishman/blockula\"\nweight = 3\n"), 469_900_000), "listed twice");
+        refuse(&with(&pool.replace("\"100000\"", "\"0\""), 470_000_000), "opening_balance must be more than 0");
+        refuse(&with(&pool.replace("seance_blocks = 259200", "seance_blocks = 2"), 469_900_000), "seance_blocks ≥ 3");
         assert!(toml::from_str::<Spec>(&format!("{}[contribution]\nwarp = 1\n", toml_of(&spec_for("x", "tboo", &ops, "")))).is_err(), "unknown fields are refused");
-        // The founder's account starts with no Soul (TOKENOMICS: no jury seats while vesting
-        // runs), so it's never a founding juror.
+        // The owner of a seat flagged as the founder's starts with no Soul (TOKENOMICS: no jury
+        // seats while the founder's tokens vest), so it's never a founding juror.
+        let mut flagged = ops.clone();
+        flagged[0].independence.founder_or_foundation = true;
         let mut with = spec.clone();
-        with.soul_ledger.push(SpecSoul { account: Keys::from_seed([0x30; 32]).address_with("tboo"), soul: "5".into(), reason: "juror".into() });
-        refuse(&with, "is the founder's");
+        with.soul_ledger.push(SpecSoul { account: flagged[0].keys.owner.clone(), soul: "5".into(), reason: "juror".into() });
+        let err = format!("{:#}", build_from(&with, &flagged, false).err().expect("a flagged seat's owner can't be a founding juror"));
+        assert!(err.contains("is the founder's"), "{err}");
     }
 
     /// A public network's genesis never starts on a preview version (P7): a spec has no
@@ -1308,29 +1315,44 @@ mod tests {
         };
         // Supply and buckets.
         let mut s = spec_for("blockula-1", "boo", &ops, "");
-        s.allocations[0].amount = "319999999".into();
+        s.allocations[0].amount = "399999999".into();
         refuse(&s, &ops, "allocations add up to");
         let mut s = spec_for("blockula-1", "boo", &ops, "");
-        s.allocations[0].amount = "319999999".into();
-        s.allocations[1].amount = "300000001".into();
-        refuse(&s, &ops, "bucket community holds");
+        s.allocations[0].amount = "399999999".into();
+        s.allocations[1].amount = "470000001".into();
+        refuse(&s, &ops, "bucket treasury holds");
+        // DEC-5: the community and founder buckets get 0% (since 2026-11-08), though specs may
+        // still name them.
+        let mut s = spec_for("blockula-1", "boo", &ops, "");
+        s.allocations[1].amount = "370000000".into();
+        s.allocations.insert(2, s.allocations[1].clone());
+        s.allocations[2].amount = "100000000".into();
+        s.allocations[2].bucket = "community".into();
+        refuse(&s, &ops, "bucket community holds 100000000000000000 drops; DEC-5 gives it 0 (0% of the supply)");
+        let mut s = spec_for("blockula-1", "boo", &ops, "");
+        s.allocations[0].amount = "100000000".into();
+        s.allocations.insert(1, s.allocations[0].clone());
+        s.allocations[1].amount = "300000000".into();
+        (s.allocations[1].bucket, s.allocations[1].address) = ("founder".into(), Some(Keys::from_seed([0x30; 32]).address_with("boo")));
+        refuse(&s, &ops, "bucket founder holds 300000000000000000 drops; DEC-5 gives it 0 (0% of the supply)");
         let mut s = spec_for("blockula-1", "boo", &ops, "");
         s.allocations[0].bucket = "friends".into();
         refuse(&s, &ops, "unknown bucket");
         // DEC-5: the foundation gets 0%; its 5% is the treasury's.
         let mut s = spec_for("blockula-1", "boo", &ops, "");
-        s.allocations[4].amount = "50000000".into();
-        s.allocations.insert(5, s.allocations[4].clone());
-        (s.allocations[5].bucket, s.allocations[5].address) = ("foundation".into(), Some(Keys::from_seed([0x31; 32]).address_with("boo")));
+        s.allocations[0].amount = "350000000".into();
+        s.allocations.insert(1, s.allocations[0].clone());
+        s.allocations[1].amount = "50000000".into();
+        (s.allocations[1].bucket, s.allocations[1].address) = ("foundation".into(), Some(Keys::from_seed([0x31; 32]).address_with("boo")));
         refuse(&s, &ops, "bucket foundation holds 50000000000000000 drops; DEC-5 gives it 0 (0% of the supply)");
         let mut s = spec_for("blockula-1", "boo", &ops, "");
         s.allocations[0].address = Some(Keys::from_seed([1; 32]).address());
         refuse(&s, &ops, "keyless");
         let mut s = spec_for("blockula-1", "boo", &ops, "");
-        s.allocations[4].address = None;
+        s.allocations[3].address = None;
         refuse(&s, &ops, "needs an `address`");
         let mut s = spec_for("blockula-1", "boo", &ops, "");
-        s.allocations[4].address = Some(Keys::from_seed([0x30; 32]).address_with("tboo"));
+        s.allocations[3].address = Some(Keys::from_seed([0x30; 32]).address_with("tboo"));
         refuse(&s, &ops, "isn't a boo1");
         let mut s = spec_for("blockula-1", "boo", &ops, "");
         s.total_supply = "999999999".into();

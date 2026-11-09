@@ -15,6 +15,7 @@ import { KIT_LABEL, KIT_WORDS, phraseProblem, splitWords, wipeWallet, wordsToSee
 import type { Hint } from "@/lib/session";
 import type { TxView } from "@/lib/types";
 import { useWallet } from "@/lib/wallet";
+import { RequireTerms } from "@/components/Terms";
 
 type Stage =
   | { s: "enter" }
@@ -28,6 +29,14 @@ type Stage =
  * over (revoking the lost device, ideally replacing the kit).
  */
 export default function RecoverPage() {
+  return (
+    <RequireTerms>
+      <Recover />
+    </RequireTerms>
+  );
+}
+
+function Recover() {
   const { client, unlocked } = useWallet();
   const router = useRouter();
   const [stage, setStage] = useState<Stage>({ s: "enter" });

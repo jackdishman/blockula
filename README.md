@@ -2,6 +2,8 @@
 
 **Run your own quantum-safe blockchain in a minute.** Name it, give it a ticker, choose who can reach it, and it's running on your machine, with an explorer you can install on your Mac or iPhone and one command your friends run to join. Post-quantum signatures throughout, on computers you already have: no hosting to pay for and nothing to buy.
 
+> **For education and research only.** Blockula is experimental, unaudited software. Its coins have no value: nobody sells them, and they never turn into money. Using the project's sites, wallet or demo chain means agreeing to the [Terms of Use](https://blockula.app/terms) and [Privacy Policy](https://blockula.app/privacy).
+
 ```bash
 curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh
 blockula create
