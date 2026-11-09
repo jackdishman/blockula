@@ -1,5 +1,5 @@
 name: 🖥️ Run a node or validator
-description: Tell us about a node you run, or ask for help running one.
+description: Tell us about a node you run, ask for help running one, or ask to join the demo chain's validators.
 title: "Node: "
 labels: [node-operator]
 body:
@@ -7,6 +7,8 @@ body:
     attributes:
       value: |
         Running a node is a real contribution. The how-to is [docs/RUN-A-NODE.md](https://github.com/jackdishman/blockula/blob/main/docs/RUN-A-NODE.md), and the operator's reference is [docs/OPERATIONS.md](https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md). Creating a chain of your own: [docs/CREATE.md](https://github.com/jackdishman/blockula/blob/main/docs/CREATE.md).
+
+        **Asking to join a chain's validators?** Follow [docs/BECOME-A-VALIDATOR.md](https://github.com/jackdishman/blockula/blob/main/docs/BECOME-A-VALIDATOR.md) through `register` first, then fill in the chain, your validator address and your node's addresses below. This form reaches the Blockula project, which runs the demo chain at demo.blockula.app. For anyone else's chain, write to the contact in its listing on [blockula.app](https://blockula.app): only that chain's owner can let you in.
 
         **This issue is public.** Put nothing secret here: no key files, no recovery words, no private IPs you'd rather not share. A validator's p2p address is public on-chain anyway.
   - type: dropdown
@@ -26,22 +28,35 @@ body:
       label: What you need
       options:
         - Help getting it running
+        - To be let into the demo chain's validators (I ran register)
         - Nothing, just letting you know it runs
         - Something else
     validations:
       required: true
   - type: input
+    id: chain
+    attributes:
+      label: Chain
+      description: Its name or chain id (`chain_id` in your node's `/api/status`).
+      placeholder: blockula-demo-2
+  - type: input
     id: address
     attributes:
       label: Validator or account address
-      description: The `tboo1…` or `boo1…` address `blockula validator init` printed, if it helps.
-      placeholder: tboo1…
+      description: The `boo1…` address `blockula validator init` printed. Needed to let a validator in.
+      placeholder: boo1…
+  - type: input
+    id: addresses
+    attributes:
+      label: Your node's p2p and HTTP addresses
+      description: What you gave `register`, for a validator that wants in. Both must answer from the internet.
+      placeholder: "203.0.113.7:30300 and http://203.0.113.7:7171"
   - type: input
     id: version
     attributes:
       label: Version
       description: "`blockula --version`, or `version` from your node's `/api/status`."
-      placeholder: "blockula 0.5.2"
+      placeholder: "blockula 1.0.4"
   - type: input
     id: hosting
     attributes:
