@@ -2330,6 +2330,68 @@ function canonicalNodeUrl(u: string): string {
   }
 }
 
+/** An account as the node labels it: its primary `.boo` name when it has one (chain text). */
+export interface AccountLabel {
+  address: string;
+  name: string | null;
+  short: string;
+}
+
+/** One row of `/api/accounts`. */
+export interface DirectoryAccount {
+  account: AccountLabel;
+  /** Its active names, primary first. */
+  names: string[];
+  balance: string;
+  balance_display: string;
+  transferable: string;
+  transferable_display: string;
+  /** The height of its newest finalized tx this node holds, or null. */
+  last_active: number | null;
+  validator: boolean;
+  program: boolean;
+  /** A system account's role (treasury, community, …), or null. */
+  system: string | null;
+}
+
+/** A page of `/api/accounts`. */
+export interface AccountsPage {
+  sort: "balance" | "recent" | "names";
+  accounts: DirectoryAccount[];
+  /** The next page's `after`, or null at the end. */
+  next: string | null;
+  /** Rows in this listing (named accounts only for `names`). */
+  total: number;
+  accounts_total: number;
+}
+
+/** One row of `/api/names`. */
+export interface DirectoryName {
+  name: string;
+  owner: AccountLabel;
+  registered_at: number;
+  expires_at: number;
+  grace_until: number;
+  status: "active" | "grace";
+}
+
+/** A page of `/api/names`. */
+export interface NamesPage {
+  sort: "recent" | "alpha";
+  names: DirectoryName[];
+  next: string | null;
+  total: number;
+}
+
+/** `?sort=&limit=&after=` from the options that are set. */
+function pageQuery(opts: { sort?: string; limit?: number; after?: string }): string {
+  const q = new URLSearchParams();
+  if (opts.sort) q.set("sort", opts.sort);
+  if (opts.limit !== undefined) q.set("limit", String(opts.limit));
+  if (opts.after) q.set("after", opts.after);
+  return q.size ? `?${q}` : "";
+}
+
 export class Client {
   /** The chain's address prefix: given, learned from `/api/status`, or `boo` until then. */
   prefix: string;
@@ -2565,6 +2627,18 @@ export class Client {
     return this.call(`/key/${keyIdHex}${q.size ? `?${q}` : ""}`);
   }
   search(q: string) { return this.call(`/search/${encodeURIComponent(q)}`); }
+  /**
+   * The people directory: accounts richest first (`balance`), by their newest tx (`recent`; not
+   * offered on very large chains) or by name (`names`: named accounts only), a page at a time
+   * (pass the previous page's `next` as `after`; at most 100). Names are chain text: show them as text.
+   */
+  accounts(opts: { sort?: "balance" | "recent" | "names"; limit?: number; after?: string } = {}): Promise<AccountsPage> {
+    return this.call(`/accounts${pageQuery(opts)}`);
+  }
+  /** Registered names (active, or in their grace), newest registration first (`recent`) or alphabetically (`alpha`), a page at a time. */
+  names(opts: { sort?: "recent" | "alpha"; limit?: number; after?: string } = {}): Promise<NamesPage> {
+    return this.call(`/names${pageQuery(opts)}`);
+  }
   /** The validator set: `active` this epoch, `next_epoch` (with `joining`/`leaving`), `candidates`, `jailed`, `tombstoned` and `removed`, each with stake, self-bond, commission, jail and liveness; epoch timing; the churn limit and slashing parameters. */
   validators() { return this.call("/validators"); }
   /** Hunts (bounties on GitHub issues), biggest first. */
