@@ -225,6 +225,6 @@ case ":$PATH:" in
   *":$DIR:"*) ;;
   *) echo "  Add it to your PATH:  echo 'export PATH=\"$DIR:\$PATH\"' >> ~/.zshrc  (or ~/.bashrc)" ;;
 esac
-echo "  Next: blockula launch     (name your own chain, choose who can reach it, and start it)"
+echo "  Next: blockula create     (name your own chain, choose who can reach it, and start it)"
 echo "        blockula dev        (or a throwaway local chain, explorer at http://localhost:7070)"
-echo "  Blockula is experimental, MIT-licensed software, provided as is, without warranty. Launch your own chain: https://github.com/jackdishman/blockula/blob/main/docs/LAUNCH.md"
+echo "  Blockula is experimental, MIT-licensed software, provided as is, without warranty. Create your own chain: https://github.com/jackdishman/blockula/blob/main/docs/CREATE.md"

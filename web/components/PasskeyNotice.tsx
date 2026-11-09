@@ -36,7 +36,7 @@ export function PasskeyNotice({ problem, onLocalKey }: { problem: NonNullable<Re
       </p>
       {problem !== "unsupported" && (
         <p className="dim">
-          <b>For a passkey,</b> open the wallet at its HTTPS address. Whoever runs this node can give it one: on Tailscale, <code>tailscale serve --bg {port}</code> serves it at <code>https://&lt;machine&gt;.&lt;tailnet&gt;.ts.net/wallet/</code> (<code>blockula launch</code> offers this: Tailscale, then HTTPS).
+          <b>For a passkey,</b> open the wallet at its HTTPS address. Whoever runs this node can give it one: on Tailscale, <code>tailscale serve --bg {port}</code> serves it at <code>https://&lt;machine&gt;.&lt;tailnet&gt;.ts.net/wallet/</code> (<code>blockula create</code> offers this: Tailscale, then HTTPS).
         </p>
       )}
       {onLocalKey && (

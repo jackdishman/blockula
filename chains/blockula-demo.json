@@ -1,0 +1,12 @@
+{
+  "name": "Blockula",
+  "chain_id": "blockula-demo",
+  "token": "FANG",
+  "description": "Blockula's demo chain: make a wallet with Face ID, take coins from the faucet, send some to a friend.",
+  "rpc": "https://demo.blockula.app",
+  "genesis_hash": "22f2d89a59d7e00963dfc80ed377ca2d454cd01bfceee2b00c958f7de9b9f546",
+  "validators_wanted": true,
+  "p2p": "demo.blockula.app:30300",
+  "contact": "jackdishman",
+  "listed_at": "2026-11-09"
+}

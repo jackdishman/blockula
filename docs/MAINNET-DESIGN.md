@@ -1,6 +1,6 @@
 # Blockula mainnet design (protocol v1)
 
-> **There's no mainnet** (decided Oct 22, 2026). Blockula is a kit for running your own ledger ([LAUNCH.md](LAUNCH.md)). This document describes the protocol every Blockula chain runs. Ids like SF-13, CV-3, OPS-7 or SEC-1, here and in code comments, are items of the mainnet readiness list, MAINNET.md, which was removed with the plan (`git show a7288977:docs/MAINNET.md` shows it).
+> **There's no mainnet** (decided Oct 22, 2026). Blockula is a kit for running your own ledger ([CREATE.md](CREATE.md)). This document describes the protocol every Blockula chain runs. Ids like SF-13, CV-3, OPS-7 or SEC-1, here and in code comments, are items of the mainnet readiness list, MAINNET.md, which was removed with the plan (`git show a7288977:docs/MAINNET.md` shows it).
 
 This is the contract for closing the blockers in MAINNET.md. It records the decisions, specifies every consensus-format change, and splits the work into packages. Where it and older docs disagree, this file wins; PLAN.md and MAINNET.md are updated as packages land.
 

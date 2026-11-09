@@ -1,6 +1,6 @@
 # Genesis ceremony
 
-> **There's no mainnet** (decided Oct 22, 2026). Blockula is a kit for running your own ledger ([LAUNCH.md](LAUNCH.md)), where `blockula summon` makes a chain's genesis. This ceremony was `blockula-1`'s plan; its builder and the rules it checks are what any chain built from a reviewed spec uses. MAINNET.md, the mainnet readiness list it cites, was removed with the plan (`git show a7288977:docs/MAINNET.md` shows it).
+> **There's no mainnet** (decided Oct 22, 2026). Blockula is a kit for running your own ledger ([CREATE.md](CREATE.md)), where `blockula summon` makes a chain's genesis. This ceremony was `blockula-1`'s plan; its builder and the rules it checks are what any chain built from a reviewed spec uses. MAINNET.md, the mainnet readiness list it cites, was removed with the plan (`git show a7288977:docs/MAINNET.md` shows it).
 
 How mainnet (`blockula-1`, prefix `boo`) gets its first validator set and its `genesis.json`. Closes the process side of OPS-1 (key ceremony, operator independence) and OPS-2 (a genesis built from reviewed inputs and reproduced by several parties) in MAINNET.md. The rules come from [MAINNET-DESIGN.md](MAINNET-DESIGN.md): DEC-3 (21–32 independent operators), DEC-7 (chain id and prefix), DEC-10 (no admin keys, no faucet), DEC-14 (hosting limits) and 3.7 (the deterministic builder). Operator requirements are in [OPERATIONS.md](OPERATIONS.md).
 

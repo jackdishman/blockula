@@ -141,11 +141,12 @@ struct Net {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Launch your own chain: name it, choose who can reach it and how it runs, and start it. It
+    /// Create your own chain: name it, choose who can reach it and how it runs, and start it. It
     /// asks a step at a time, or takes every answer as a flag with --yes
-    Launch {
+    #[command(alias = "launch")]
+    Create {
         #[command(flatten)]
-        args: launch_cli::LaunchArgs,
+        args: launch_cli::CreateArgs,
     },
     /// Start a local single-validator dev chain with a faucet and the built-in explorer
     Dev {
@@ -172,7 +173,7 @@ enum Cmd {
         #[arg(long)]
         no_faucet: bool,
         /// Milliseconds between blocks. 5 seconds keeps an idle validator's traffic and a node's
-        /// disk growth to about a fifth of 1-second blocks (docs/LAUNCH.md); 1000 for faster blocks
+        /// disk growth to about a fifth of 1-second blocks (docs/CREATE.md); 1000 for faster blocks
         #[arg(long, default_value = "5000")]
         block_time_ms: u64,
         /// Number of genesis validators. With N > 1, `home/v0 … home/vN-1` are created.
@@ -409,16 +410,16 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     match Cli::parse().cmd {
-        Cmd::Launch { args } => {
-            let launched = launch_cli::launch(&args)?;
+        Cmd::Create { args } => {
+            let created = launch_cli::create(&args)?;
             if args.no_start {
                 return Ok(());
             }
             println!("\n▶  Starting it. Ctrl-C stops it; the command above starts it again.\n");
             // The defaults of `blockula run`, listening where the others reach it.
-            let mut net = <Net as clap::FromArgMatches>::from_arg_matches(&Net::augment_args(clap::Command::new("launch")).get_matches_from(["launch"]))?;
-            net.bind = launched.plan.bind().into();
-            node::run_validator(launched.home, net_opts(net, None, None, false))
+            let mut net = <Net as clap::FromArgMatches>::from_arg_matches(&Net::augment_args(clap::Command::new("create")).get_matches_from(["create"]))?;
+            net.bind = created.plan.bind().into();
+            node::run_validator(created.home, net_opts(net, None, None, false))
         }
         Cmd::Dev { port, reset, programs, net } => {
             let home = blockula_dir().join("dev");
@@ -504,8 +505,8 @@ fn main() -> Result<()> {
                 println!("   dev durations: unbonding {} blocks · voting {} · timelock {} · deposit {}", cp.unbonding_blocks, cp.voting_blocks, cp.timelock_blocks, types::fmt_fang(cp.proposal_deposit));
             }
             match &host {
-                Some(_) => println!("   others join with: blockula join --genesis {} --home ~/.blockula/{chain_id}   (docs/LAUNCH.md)", chain::http_url(&g.validators[0].http_addr)),
-                None => println!("   (These validators are published at 127.0.0.1, so other machines can't reach them: to run a chain with others, summon it with --host <this machine's IP or DNS name>. docs/LAUNCH.md)"),
+                Some(_) => println!("   others join with: blockula join --genesis {} --home ~/.blockula/{chain_id}   (docs/CREATE.md)", chain::http_url(&g.validators[0].http_addr)),
+                None => println!("   (These validators are published at 127.0.0.1, so other machines can't reach them: to run a chain with others, summon it with --host <this machine's IP or DNS name>. docs/CREATE.md)"),
             }
             Ok(())
         }
@@ -620,8 +621,23 @@ mod cli_tests {
         assert!(crate::node::socket("localhost", 1).unwrap_err().to_string().contains("--http-bind"));
     }
 
-    /// Chains people launch default to 5-second blocks and about 10-minute epochs, lighter on home
-    /// connections and disks (docs/LAUNCH.md); every one of them can still be set.
+    /// Chains people create default to 5-second blocks and about 10-minute epochs, lighter on home
+    /// connections and disks (docs/CREATE.md); every one of them can still be set.
+    /// `blockula create` makes a chain; `launch`, its old name, still parses to the same command
+    /// but isn't listed in the help.
+    #[test]
+    fn create_and_its_old_name() {
+        use clap::{CommandFactory, Parser};
+        for name in ["create", "launch"] {
+            match super::Cli::try_parse_from(["blockula", name, "--name", "Jack in the Block", "--yes"]).unwrap().cmd {
+                super::Cmd::Create { args } => assert_eq!(args.name.as_deref(), Some("Jack in the Block")),
+                _ => panic!("{name} isn't create"),
+            }
+        }
+        let help = super::Cli::command().render_help().to_string();
+        assert!(help.contains("create") && !help.contains("launch"), "{help}");
+    }
+
     #[test]
     fn summoned_chains_default_to_light_blocks() {
         use clap::Parser;

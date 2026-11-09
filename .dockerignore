@@ -10,5 +10,6 @@ mcp
 # Never in an image build context: private working material and fuzz findings (SECURITY.md),
 # which stay on the maintainer's machine. The node image doesn't build node/fuzz.
 .context
+.claude
 **/private
 node/fuzz

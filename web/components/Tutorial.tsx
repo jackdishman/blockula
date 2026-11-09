@@ -16,7 +16,7 @@ import { Unit } from "./Unit";
 
 const ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"];
 const BUILD_ON_IT = "https://github.com/jackdishman/blockula/blob/main/docs/BUILD-ON-IT.md";
-const LAUNCH_VALIDATORS = "https://github.com/jackdishman/blockula/blob/main/docs/LAUNCH.md#3-friends-become-validators";
+const VALIDATORS_GUIDE = "https://github.com/jackdishman/blockula/blob/main/docs/CREATE.md#3-friends-become-validators";
 const REPO = "https://github.com/jackdishman/blockula";
 
 interface Task {
@@ -276,7 +276,7 @@ function buildStages(c: Ctx): Stage[] {
   const genesisHash = c.pin.genesisHash ?? status?.genesis_hash;
   const hash = genesisHash ?? "<genesis hash>";
   const home = `~/.blockula/${chainId ?? "<chain id>"}`;
-  // A friend can't reach this machine's localhost: they put in an address they can reach it at (docs/LAUNCH.md "Reaching each other").
+  // A friend can't reach this machine's localhost: they put in an address they can reach it at (docs/CREATE.md "Reaching each other").
   const localNode = isLoopback(c.rpc);
   const reach = localNode ? c.rpc.replace(/\/\/[^/:]+/, "//<your address>") : c.rpc.replace(/\/+$/, "");
   const localWallet = !!c.origin && isLoopback(c.origin);
@@ -389,7 +389,7 @@ function buildStages(c: Ctx): Stage[] {
               <Snippet text={invite} label="Copy link" testId="invite-link" />
               {localWallet && SERVED && (
                 <p className="dim small" data-testid="invite-local">
-                  This link points at <code>localhost</code>, so it opens on this computer only. Put your node online and the same link works on any phone or laptop: on Tailscale, <code>tailscale serve --bg {new URL(c.rpc).port || "7070"}</code> serves it at <code>https://&lt;this machine&gt;.&lt;your tailnet&gt;.ts.net/wallet/</code> (<code>blockula launch</code> offers it). Open the wallet there, and copy the link again. Or your friend runs their own node:
+                  This link points at <code>localhost</code>, so it opens on this computer only. Put your node online and the same link works on any phone or laptop: on Tailscale, <code>tailscale serve --bg {new URL(c.rpc).port || "7070"}</code> serves it at <code>https://&lt;this machine&gt;.&lt;your tailnet&gt;.ts.net/wallet/</code> (<code>blockula create</code> offers it). Open the wallet there, and copy the link again. Or your friend runs their own node:
                 </p>
               )}
               {localWallet && !SERVED && (
@@ -421,9 +421,9 @@ function buildStages(c: Ctx): Stage[] {
                   `blockula validator register --home ${home}-validator --rpc ${reach}`,
                 ].join("\n")}
               />
-              <span className="dim small">Then approve it on the machine that launched the chain:</span>
+              <span className="dim small">Then approve it on the machine that started the chain:</span>
               <Snippet text={`blockula validator approve <validator address> --key ${home}/validator.key --rpc http://localhost:7070`} />
-              <a className="small" href={LAUNCH_VALIDATORS} target="_blank" rel="noreferrer">The full guide</a>
+              <a className="small" href={VALIDATORS_GUIDE} target="_blank" rel="noreferrer">The full guide</a>
             </>
           ),
         },

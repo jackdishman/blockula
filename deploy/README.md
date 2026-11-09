@@ -1,4 +1,28 @@
-# Deploying a Blockula testnet (Fly.io)
+# Hosting Blockula chains (Fly.io)
+
+## One hosted chain: `deploy/host-chain.sh`
+
+`deploy/host-chain.sh` hosts one chain on Fly.io: a single validator that serves the chain's explorer and passkey wallet over HTTPS at a domain of your own, and takes outside validators on its p2p port. It's how the project runs its demo chain, **Blockula** at [demo.blockula.app](https://demo.blockula.app), and the way to host a chain for another project.
+
+```bash
+NAME=Blockula TOKEN=FANG CHAIN_ID=blockula-demo DOMAIN=demo.blockula.app \
+  DESCRIPTION="Blockula's demo chain: make a wallet with Face ID, take coins from the faucet, send some to a friend." \
+  deploy/host-chain.sh
+```
+
+What it sets up, each step skipped once done (re-run it to upgrade to a newer release):
+
+1. **The release, verified.** It checks the release archive's build provenance (`gh attestation verify`) and its line in `checksums.txt`, and the image build (`deploy/hosted/Dockerfile`) refuses any other bytes. The image runs the published binary, wallet included; the build context is two files, never the working tree.
+2. **The chain, made once.** `blockula create --reach internet --host DOMAIN --no-start` writes `genesis.json` and `validator.key` to `~/.config/blockula/hosted/<chain id>` (mode 700). It never makes a second genesis or key for a chain id.
+3. **One app on Fly:** one `shared-cpu-1x` machine (512 MB plus 512 MB swap), a 3 GB volume, a dedicated IPv4 (p2p is raw TCP, which Fly's shared IPv4 doesn't carry) and an IPv6. HTTPS on 443, plain HTTP on 7070 (the address the genesis publishes for nodes that sync from it), p2p on 30300. Rate limits read `Fly-Client-IP`.
+4. **The key leaves Fly's secrets.** It's staged as `VALIDATOR_KEY_B64` for the first boot, written onto the volume by `deploy/entrypoint.sh`, and the secret is deleted once the node answers for the genesis. A cloned or replacement machine with an empty volume refuses to start instead of double-signing; the local copy is your backup.
+5. **The domain.** It asks Fly for the domain's certificate and prints the `A` and `AAAA` records to add, and the chain's listing for blockula.app (`chains/<chain id>.json`).
+
+**Cost:** about $5 a month (the machine, the volume and the $2 IPv4). **Settings:** the script's header lists them (`VERSION`, `APP`, `REGION`, `BLOCK_TIME_MS`, `NO_FAUCET`, `VM_MEMORY`, `VOLUME_GB`). **Logs:** `fly logs -a <app>`. A chain at a subdomain of blockula.app is marked **Run by the Blockula project** in the chain directory: only the project can serve those names.
+
+A single validator means the chain stops if its machine does, and the first outside validators join only once you admit them (`blockula validator admit`, from the key in `~/.config/blockula/hosted/<chain id>/home`): with 2 or 3 validators every one must be online, so admit people you expect to stay up.
+
+## A multi-validator testnet: `deploy/launch.sh`
 
 `deploy/launch.sh` launches a protocol v1 testnet on Fly.io. It launched `blockula-testnet-2`, the public testnet from October 2026 until it was retired in November 2026 (its history is archived: [REPLAY.md](../docs/REPLAY.md)). This page is the reference for launching a chain of your own the same way; for a chain on your own machines, see [LAUNCH.md](../docs/LAUNCH.md). Where it names `blockula-testnet-2`, its apps or its URL, read your own `CHAIN_ID`, `PREFIX` and `RPC_APP`.
 

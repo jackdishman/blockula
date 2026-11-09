@@ -847,7 +847,7 @@ pub enum WalletCmd {
         #[command(flatten)]
         pin: ChainPin,
     },
-    /// Get 100 coins from the chain's faucet (chains launched with one)
+    /// Get 100 coins from the chain's faucet (chains made with one)
     Faucet {
         #[arg(long, default_value = "http://localhost:7070")]
         rpc: String,
@@ -1157,7 +1157,7 @@ mod tests {
         (root, homes, chain, rt, url)
     }
 
-    /// The launch guide's funding steps (docs/LAUNCH.md): `wallet faucet --to` pays another address
+    /// The guide's funding steps (docs/CREATE.md): `wallet faucet --to` pays another address
     /// (a new validator's own account) with no wallet, and returns only once the payment is final,
     /// so a `register` right after it can spend it; `wallet send --key` pays from a key file's
     /// account (a summoned chain's units sit on its validators' accounts).

@@ -1,5 +1,5 @@
 // The node's built-in explorer (node/src/explorer.html), served as the node serves it, against a mocked
-// freshly launched chain: Start (#/start) is a task list filled in with this node's origin and the
+// freshly made chain: Start (#/start) is a task list filled in with this node's origin and the
 // chain's id and genesis hash, ticks are kept per chain, steps the chain shows done tick themselves,
 // a friend's invite link opens a welcome, and Learn draws the chain's tokenomics from its parameters.
 import { readFileSync } from "node:fs";
@@ -14,7 +14,7 @@ const TREASURY = "boo1wgpg29zsxm82xmrtqs3g286hdx36c2zsy8zpfhgtsd7k67nxz34qzv3qn5
 
 type World = { name?: string; faucet?: boolean; validators?: number; programs?: boolean; txs?: boolean; hunts?: number };
 
-/** A chain made with `blockula launch --name "Jack in the Block" --token JACK`, a block in. */
+/** A chain made with `blockula create --name "Jack in the Block" --token JACK`, a block in. */
 function api(p: string, w: World): unknown {
   if (p === "/status") return { name: w.name ?? "Jack in the Block", token: "JACK", chain_id: "jack-in-the-block", genesis_hash: HASH, faucet: w.faucet ?? true, height: 3, block_time_ms: 5000, epoch: 0, active_validators: w.validators ?? 1, mempool: 0, supply: "1100000000000000000", supply_display: "1100000000 JACK", burned: "65200", burned_display: "0.0000652 JACK", accounts: w.txs ? 3 : 2, names: 0, head_age_ms: 500, history_from: 1, validators: [{ address: VALIDATOR, name: "🧛 validator", short: "boo1qrwpfn…4vps32" }] };
   if (p === "/genesis") return { chain_id: "jack-in-the-block", allocations: [{ address: VALIDATOR, amount: "1000000000000000000" }, { address: TREASURY, amount: "100000000000000000", label: "treasury" }], validators: [{ address: VALIDATOR }] };
@@ -58,7 +58,7 @@ test("Start is a task list with this node's commands, and hides what a fresh cha
   await expect(task(page, "Connect Claude")).toContainText(`claude mcp add blockula -e BLOCKULA_RPC=${ORIGIN} -e BLOCKULA_CHAIN_ID=jack-in-the-block -e BLOCKULA_GENESIS_HASH=${HASH} -- npx -y @blockula/mcp`);
   // Programs are off: no checkbox, and how a chain gets them.
   const programs = task(page, "Programs are off on this chain");
-  await expect(programs).toContainText("blockula launch --programs");
+  await expect(programs).toContainText("blockula create --programs");
   await expect(programs.locator("input")).toHaveCount(0);
   await expect(task(page, "Make it yours").getByRole("link", { name: "Change anything with Claude Code →" })).toHaveAttribute("href", "https://github.com/jackdishman/blockula/blob/main/docs/BUILD-ON-IT.md");
   // The invite link, and the paste-in prompt for a coding agent.

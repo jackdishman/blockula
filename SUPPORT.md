@@ -7,7 +7,7 @@ Blockula is an open-source project with one maintainer today. Help is best effor
 | If you're | Start with |
 |---|---|
 | Using the wallet | The wallet's own tutorial, then [README.md](README.md) |
-| Launching your own ledger | [docs/LAUNCH.md](docs/LAUNCH.md) |
+| Creating your own chain | [docs/CREATE.md](docs/CREATE.md) |
 | Building an app | [sdk-ts/README.md](sdk-ts/README.md), then [docs/INTEGRATION.md](docs/INTEGRATION.md) for payment flows |
 | Giving an agent a wallet | [AGENTS.md](AGENTS.md) and [mcp/README.md](mcp/README.md) |
 | Running a node or validator | [docs/RUN-A-NODE.md](docs/RUN-A-NODE.md), then [docs/OPERATIONS.md](docs/OPERATIONS.md) |

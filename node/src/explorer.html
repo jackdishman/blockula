@@ -894,7 +894,7 @@ function startSteps(s, ctx) {
     fuel
       ? { id: "program", title: "Run a program", auto: Number(fuel.state_bytes) > 0, body: `<p class="dim">In a <a href="${REPO}">clone of Blockula</a>, upload the example counter, create it from the hashes upload prints, and call it:</p>${cmd(
         `blockula program upload node/vm/tests/programs/counter.wasm --interface node/vm/tests/programs/counter.iface.json --rpc ${o}\nblockula program create <wasm hash> <interface hash> --rpc ${o}\nblockula program call <program address> increment --storage-limit 1 --rpc ${o}`)}` }
-      : { id: "program", title: "Programs are off on this chain", off: true, body: `<p class="dim">A new chain gets them with <span class="mono">blockula launch --programs</span>; this one only by a governance vote (an <span class="mono">ActivateFeature</span> <a href="#/governance">proposal</a>).</p>` },
+      : { id: "program", title: "Programs are off on this chain", off: true, body: `<p class="dim">A new chain gets them with <span class="mono">blockula create --programs</span>; this one only by a governance vote (an <span class="mono">ActivateFeature</span> <a href="#/governance">proposal</a>).</p>` },
     { id: "yours", title: "Make it yours", body: `<p><a href="${REPO}/blob/main/docs/BUILD-ON-IT.md">Change anything with Claude Code →</a></p>` },
   ];
   return steps;
@@ -947,7 +947,7 @@ function startPage(s, ctx, invited) {
     </ol>`, "invite") : "";
   const port = location.port || (location.protocol === "https:" ? "443" : "80");
   const online = loopback()
-    ? `<p class="err">This page is open at ${esc(location.host)}, which only this machine reaches. Put your node online, then copy the link from the address your friends reach. On Tailscale, <span class="mono">tailscale serve --bg ${esc(port)}</span> serves it at <span class="mono">https://&lt;this machine&gt;.&lt;your tailnet&gt;.ts.net</span> (<span class="mono">blockula launch</span> offers it).</p>`
+    ? `<p class="err">This page is open at ${esc(location.host)}, which only this machine reaches. Put your node online, then copy the link from the address your friends reach. On Tailscale, <span class="mono">tailscale serve --bg ${esc(port)}</span> serves it at <span class="mono">https://&lt;this machine&gt;.&lt;your tailnet&gt;.ts.net</span> (<span class="mono">blockula create</span> offers it).</p>`
     : plainHttp && wallet ? `<p class="dim">This is plain http, so their browser won't make a passkey (it can keep a browser-only key for testing). For passkeys, serve the node over HTTPS: on Tailscale, <span class="mono">tailscale serve --bg ${esc(port)}</span>.</p>` : "";
   const inviteCard = wallet
     ? card(`<h2>Invite a friend</h2><p>Send this link. They open it on a phone or laptop, make a wallet with a passkey${s.faucet ? `, get ${esc(UNIT)} from the faucet` : ""} and can pay right away.</p>${cmd(wallet)}
@@ -1119,9 +1119,9 @@ $("#search").addEventListener("submit", async (e) => {
   try { const h = await api("/search/" + encodeURIComponent($("#q").value)); location.hash = `#/${h.type}/${h.id}`; }
   catch (err) { $("#app").innerHTML = card(`<span class="eyebrow">Nothing found</span><p class="err">${esc(err.message)}</p>`); }
 });
-// The chain's own name and ticker (`blockula launch`), in the header and the footer. A public
+// The chain's own name and ticker (`blockula create`), in the header and the footer. A public
 // testnet or a dev chain keeps the page's own footer (test FANG has no value); any other chain is
-// one someone launched, and its unit has no value either.
+// one someone made, and its unit has no value either.
 const STATUS = api("/status").then((s) => {
   if (/^[A-Z][A-Z0-9]{1,7}$/.test(s.token || "")) UNIT = s.token;
   if (s.name) {

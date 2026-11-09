@@ -2,9 +2,9 @@
 
 ## Copy-paste prompt (for users)
 
-> Add Blockula to this project. Install the MCP server with `claude mcp add blockula -- npx -y @blockula/mcp` (it uses a local `blockula dev` chain at http://localhost:7070: `install_node` and `start_dev_node` set one up; `BLOCKULA_RPC=<a node>` for a chain you launched), then call `create_wallet` and `faucet`. Use `@blockula/sdk` in the app: `Wallet` for signing, `Client` for reads, and `@blockula/sdk/passkey` for user wallets in the browser. Show balances and recipients by `.boo` name, never raw addresses.
+> Add Blockula to this project. Install the MCP server with `claude mcp add blockula -- npx -y @blockula/mcp` (it uses a local `blockula dev` chain at http://localhost:7070: `install_node` and `start_dev_node` set one up; `BLOCKULA_RPC=<a node>` for a chain you made), then call `create_wallet` and `faucet`. Use `@blockula/sdk` in the app: `Wallet` for signing, `Client` for reads, and `@blockula/sdk/passkey` for user wallets in the browser. Show balances and recipients by `.boo` name, never raw addresses.
 
-**To make a chain of your own:** `blockula launch --name "<name>" --token <TICKER> --reach local --yes` makes and starts one (the MCP's `summon_chain` makes one too, with `name` and `token`). A person runs plain `blockula launch` and answers its questions ([docs/LAUNCH.md](docs/LAUNCH.md)).
+**To make a chain of your own:** `blockula create --name "<name>" --token <TICKER> --reach local --yes` makes and starts one (the MCP's `summon_chain` makes one too, with `name` and `token`). A person runs plain `blockula create` and answers its questions ([docs/CREATE.md](docs/CREATE.md)).
 
 ## Rules of the road
 

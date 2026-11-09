@@ -56,6 +56,23 @@ function folded(s: string): string {
     .replace(/[^a-z]/g, "");
 }
 
+/**
+ * The project's own domain. A chain whose node is at one of its subdomains is run by the project
+ * (deploy/host-chain.sh hosts them, like the demo chain at dishnet.blockula.app): only the
+ * project can serve a name under it, so such a host can't be an impersonation.
+ */
+export const PROJECT_DOMAIN = "blockula.app";
+
+/** Whether `rpc` (a listing's node, an https origin) is a subdomain of the project's domain. */
+export function projectRun(rpc: string): boolean {
+  try {
+    const u = new URL(rpc);
+    return u.protocol === "https:" && u.hostname.endsWith(`.${PROJECT_DOMAIN}`) && !u.port;
+  } catch {
+    return false;
+  }
+}
+
 /** Whether `s` reads as Blockula itself, or as official: the project lists chains, it doesn't run them. */
 export function soundsOfficial(s: string): boolean {
   return /bl+o+c*k+u+l+a/.test(folded(s)) || /\bofficial\b/i.test(s);
@@ -110,7 +127,7 @@ function isDate(s: string): boolean {
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s && d.getUTCFullYear() >= 2026;
 }
 
-/** A chain id as `blockula launch` makes them (node/src/launch_cli.rs `check_chain_id`). */
+/** A chain id as `blockula create` makes them (node/src/launch_cli.rs `check_chain_id`). */
 export const CHAIN_ID = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 function text(errors: string[], field: string, v: unknown, max: number, bytes = false): v is string {
@@ -132,6 +149,8 @@ export function checkChain(file: string, raw: unknown): string[] {
   const errors: string[] = [];
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return ["isn't a JSON object"];
   const c = raw as Record<string, unknown>;
+  // The project's own chains (at a subdomain of its domain) may carry its name.
+  const ours = typeof c.rpc === "string" && projectRun(c.rpc);
   const known = new Set<string>([...REQUIRED_FIELDS, ...OPTIONAL_FIELDS]);
   for (const k of Object.keys(c)) if (!known.has(k)) errors.push(`has a field this directory doesn't take: ${k}`);
   for (const k of REQUIRED_FIELDS) if (!(k in c)) errors.push(`is missing ${k}`);
@@ -139,11 +158,11 @@ export function checkChain(file: string, raw: unknown): string[] {
   if (typeof c.chain_id !== "string" || c.chain_id.length < 2 || c.chain_id.length > 40 || !CHAIN_ID.test(c.chain_id)) errors.push("chain_id must be 2–40 of a–z, 0–9 and single dashes (like jack-in-the-block)");
   else {
     if (file !== `${c.chain_id}.json`) errors.push(`the file must be named ${c.chain_id}.json, after its chain_id`);
-    if (soundsOfficial(c.chain_id)) errors.push("chain_id reads as Blockula's own: pick one of your chain's");
+    if (!ours && soundsOfficial(c.chain_id)) errors.push("chain_id reads as Blockula's own: pick one of your chain's");
   }
-  if (text(errors, "name", c.name, MAX_NAME_BYTES, true) && soundsOfficial(c.name)) errors.push("name reads as Blockula itself, or as official: the directory lists chains people run, not the project's");
+  if (text(errors, "name", c.name, MAX_NAME_BYTES, true) && !ours && soundsOfficial(c.name)) errors.push("name reads as Blockula itself, or as official: the directory lists chains people run, not the project's");
   if (typeof c.token !== "string" || !/^[A-Z][A-Z0-9]{1,7}$/.test(c.token)) errors.push("token must be 2–8 of A–Z and 0–9, starting with a letter (like JACK)");
-  if (text(errors, "description", c.description, MAX_DESCRIPTION) && soundsOfficial(c.description)) errors.push("description reads as Blockula itself, or as official");
+  if (text(errors, "description", c.description, MAX_DESCRIPTION) && !ours && soundsOfficial(c.description)) errors.push("description reads as Blockula itself, or as official");
   if (typeof c.genesis_hash !== "string" || !/^[0-9a-f]{64}$/.test(c.genesis_hash)) errors.push("genesis_hash must be 64 lowercase hex characters (`/api/status`'s genesis_hash)");
   if (typeof c.validators_wanted !== "boolean") errors.push("validators_wanted must be true or false");
 
@@ -161,7 +180,7 @@ export function checkChain(file: string, raw: unknown): string[] {
       else if (`${u.origin}` !== c.rpc) errors.push(`rpc must be the node's origin alone, with no path, query or trailing slash (like ${u.origin})`);
       const why = publicNameProblem(u.hostname);
       if (why) errors.push(`rpc's host ${u.hostname} ${why}`);
-      else if (soundsOfficial(u.hostname.replace(/\.ts\.net$/, ""))) errors.push("rpc's host reads as Blockula's own");
+      else if (!projectRun(c.rpc) && soundsOfficial(u.hostname.replace(/\.ts\.net$/, ""))) errors.push("rpc's host reads as Blockula's own");
     }
   }
 

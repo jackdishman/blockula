@@ -22,7 +22,7 @@ const agentGrantCode = encodeKeyGrant(await agent.keyGrant(wallet.account));
 await wallet.addSessionKey(agentGrantCode, "claude", { limit: "10", periodBlocks: 86_400, expiresInBlocks: 30 * 86_400 });
 ```
 
-For a chain you launched (`blockula summon`), pass its node: `new Client("https://<your node>", { chainId, genesisHash })`.
+For a chain you made (`blockula summon`), pass its node: `new Client("https://<your node>", { chainId, genesisHash })`.
 
 ## Which network?
 

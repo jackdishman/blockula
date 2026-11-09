@@ -22,10 +22,10 @@ async function demoChain(page: Page, opts: { wallet?: string | null } = {}) {
     return r.fulfill({
       headers: cors,
       json: {
-        chain_id: "jack-in-the-block",
-        name: "Jack in the Block",
+        chain_id: "blockula-demo",
+        name: "Blockula",
         description: "Friends' chain for pizza debts.",
-        token: "JACK",
+        token: "FANG",
         height,
         block_time_ms: 1000,
         active_validators: 4,
@@ -50,13 +50,13 @@ test("the demo chain's live stats, its wallet a click away, and the agent prompt
   await watchCsp(page);
   const reads = await demoChain(page);
   await page.goto("/");
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Your own little blockchain, for you and your friends");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("A post-quantum blockchain you run yourself");
   await expect(page.getByRole("link", { name: "Try the demo" })).toHaveAttribute("href", "#demo");
-  await expect(page.getByRole("link", { name: "Launch your own" }).first()).toHaveAttribute("href", "#launch");
+  await expect(page.getByRole("link", { name: "Start your own" }).first()).toHaveAttribute("href", "#start");
 
   const demo = page.getByTestId("demo-live");
-  await expect(page.getByTestId("demo-name")).toHaveText("Jack in the Block");
-  await expect(page.getByTestId("demo-token")).toHaveText("JACK");
+  await expect(page.getByTestId("demo-name")).toHaveText("Blockula");
+  await expect(page.getByTestId("demo-token")).toHaveText("FANG");
   await expect(page.getByTestId("demo-validators")).toHaveText("4");
   await expect(page.getByTestId("demo-accounts")).toHaveText("1,234");
   await expect(page.getByTestId("demo-names")).toHaveText("56");
@@ -76,20 +76,25 @@ test("the demo chain's live stats, its wallet a click away, and the agent prompt
 
   await demo.getByText("Bring Claude Code to the demo").click();
   const prompt = page.getByTestId("demo-agent-prompt");
-  await expect(prompt).toContainText(`claude mcp add blockula -e BLOCKULA_RPC=${DEMO_NODE} -e BLOCKULA_CHAIN_ID=jack-in-the-block -e BLOCKULA_GENESIS_HASH=${GENESIS} -- npx -y @blockula/mcp`);
-  await expect(prompt).toContainText("Join Jack in the Block");
+  await expect(prompt).toContainText(`claude mcp add blockula -e BLOCKULA_RPC=${DEMO_NODE} -e BLOCKULA_CHAIN_ID=blockula-demo -e BLOCKULA_GENESIS_HASH=${GENESIS} -- npx -y @blockula/mcp`);
+  await expect(prompt).toContainText("Join Blockula");
 
-  // Launch, contribute, and the honesty line.
-  await expect(page.locator("#launch .landing-cmd code")).toHaveText(["curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh", "blockula launch"]);
-  await expect(page.getByRole("link", { name: "The launch guide" })).toHaveAttribute("href", "https://github.com/jackdishman/blockula/blob/main/docs/LAUNCH.md");
+  // Why it's different, how it compares, starting your own, contributing, and the honesty lines.
+  await expect(page.locator("#why .site-tile h3")).toContainText(["Ready for quantum computers", "Final in about two seconds", "Runs on what you already own", "Yours to host", "No seed phrases", "Nobody to get rich"]);
+  await expect(page.getByTestId("compare").locator("thead th")).toHaveText(["Question", "Blockula", "Bitcoin", "Ethereum"]);
+  await expect(page.locator("#compare")).toContainText("haven't been independently audited");
+  await expect(page.locator("#start .landing-cmd code")).toHaveText(["curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh", "blockula create"]);
+  await expect(page.getByRole("link", { name: "The guide", exact: true })).toHaveAttribute("href", "https://github.com/jackdishman/blockula/blob/main/docs/CREATE.md");
   await expect(page.getByTestId("contribute-prompt")).toContainText("Contribute to Blockula (https://github.com/jackdishman/blockula). Clone it");
   await expect(page.getByRole("link", { name: "Good first issues" })).toHaveAttribute("href", "https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3A%22good+first+issue%22");
-  await expect(page.getByTestId("imprint-note")).toContainText("the coins have no value");
+  await expect(page.getByTestId("imprint-note")).toContainText("The coins have no value");
 
   // No wallet chrome, and nothing the project never says.
   await expect(page.getByTestId("network-badge")).toHaveCount(0);
   await expect(page.getByRole("combobox", { name: "Network" })).toHaveCount(0);
-  await expect(page.locator("body")).not.toContainText(/mainnet|\bcontracts?\b|token sale|\bAPR\b|\byield\b|airdrop|invest/i);
+  // Money words appear only to say there's none of it ("no investors, no VC, no token sale").
+  const body = (await page.locator("body").innerText()).replace(/\bno (investors|VC|token sale)\b/gi, "");
+  expect(body).not.toMatch(/mainnet|\bcontracts?\b|token sale|\bAPR\b|\byield\b|airdrop|invest|launch|to the moon/i);
   expect(await cspViolations(page)).toEqual([]);
 });
 
@@ -117,10 +122,10 @@ test("an unreachable demo rests, and the page still works", async ({ page }) => 
   const resting = page.getByTestId("demo-resting");
   await expect(resting).toContainText("The demo chain is resting");
   await expect(resting).toContainText("isn't answering");
-  await expect(resting.getByRole("link", { name: "Launch your own" })).toHaveAttribute("href", "#launch");
+  await expect(resting.getByRole("link", { name: "Start your own" })).toHaveAttribute("href", "#start");
   await expect(page.getByTestId("demo-wallet")).toHaveCount(0);
   await expect(page.getByTestId("connect-input")).toBeVisible();
-  await expect(page.locator("#launch .landing-cmd")).toHaveCount(2);
+  await expect(page.locator("#start .landing-cmd")).toHaveCount(2);
   expect(await cspViolations(page)).toEqual([]);
 });
 

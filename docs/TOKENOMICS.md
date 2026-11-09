@@ -1,6 +1,6 @@
 # FANG tokenomics (mainnet design)
 
-> **There's no mainnet** (decided Oct 22, 2026). Blockula is a kit for running your own ledger ([LAUNCH.md](LAUNCH.md)), and each chain's FANG has no value: nobody sells it, buys it or is paid in it. This is DEC-5 in [MAINNET-DESIGN.md](MAINNET-DESIGN.md), written out. Its allocation buckets were the mainnet's plan, and so were the founder's share and the legal posture (sections 7 and 9). The issuance schedule applies to every Blockula chain. Nothing here is legal, tax or investment advice, or an offer.
+> **There's no mainnet** (decided Oct 22, 2026). Blockula is a kit for running your own ledger ([CREATE.md](CREATE.md)), and each chain's FANG has no value: nobody sells it, buys it or is paid in it. This is DEC-5 in [MAINNET-DESIGN.md](MAINNET-DESIGN.md), written out. Its allocation buckets were the mainnet's plan, and so were the founder's share and the legal posture (sections 7 and 9). The issuance schedule applies to every Blockula chain. Nothing here is legal, tax or investment advice, or an offer.
 
 FANG is the native token of Blockula. It pays transaction fees, bonds validators and delegations, is locked to vote in governance, and registers `.boo` names. 1 FANG = 10⁹ drops. All on-chain amounts are integers in drops, and every formula below is integer math.
 

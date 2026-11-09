@@ -1,6 +1,6 @@
 # Reference
 
-Everything beyond [launching a chain](LAUNCH.md): making one by hand, public servers, how the HTTP API is hardened, the CLI wallet, validators, and Hunts and the contribution pool. These sections used to be the README.
+Everything beyond [making a chain](CREATE.md): making one by hand, public servers, how the HTTP API is hardened, the CLI wallet, validators, and Hunts and the contribution pool. These sections used to be the README.
 
 ## Run your own chain by hand
 
@@ -9,7 +9,7 @@ Everything beyond [launching a chain](LAUNCH.md): making one by hand, public ser
 same binary runs a 1-validator chain or a multi-validator network. Validators can be added and
 removed on-chain without a new genesis; the set changes at **epoch** boundaries.
 
-**To run a chain with friends on their own computers, follow [LAUNCH.md](LAUNCH.md):** start it with `--host <your address>` (a Tailscale address works), and they join, become validators and get approved in a few commands. A summoned chain makes a block every 5 seconds by default, which keeps an idle validator's traffic to about a fifth of 1-second blocks; `--block-time-ms 1000` makes it faster. Small WebAssembly programs on the chain are optional and off by default: `blockula summon mychain --programs` starts a chain with them ([docs/LAUNCH.md](LAUNCH.md#programs-experimental-off-by-default)).
+**To run a chain with friends on their own computers, follow [CREATE.md](CREATE.md):** start it with `--host <your address>` (a Tailscale address works), and they join, become validators and get approved in a few commands. A summoned chain makes a block every 5 seconds by default, which keeps an idle validator's traffic to about a fifth of 1-second blocks; `--block-time-ms 1000` makes it faster. Small WebAssembly programs on the chain are optional and off by default: `blockula summon mychain --programs` starts a chain with them ([docs/CREATE.md](CREATE.md#programs-experimental-off-by-default)).
 
 ```bash
 # one validator (HTTP on 7070), for this machine only

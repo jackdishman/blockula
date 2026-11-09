@@ -4,7 +4,7 @@
 
 ```bash
 claude mcp add blockula -- npx -y @blockula/mcp                                   # a `blockula dev` chain on this machine
-claude mcp add blockula -e BLOCKULA_RPC=https://<your node> -- npx -y @blockula/mcp   # a chain you launched (`blockula summon`)
+claude mcp add blockula -e BLOCKULA_RPC=https://<your node> -- npx -y @blockula/mcp   # a chain you made (`blockula summon`)
 ```
 
 With no configuration it connects to a `blockula dev` node on this machine (`http://localhost:7070`). The public testnet (`blockula-testnet-2`) was retired in November 2026 and has no public node, so nothing public is built in: for any other chain, set `BLOCKULA_RPC` to a node of it. Call `status` to see which network and chain you're on.
@@ -17,7 +17,7 @@ The network is chosen by the user, once, in the MCP's configuration, and nothing
 
 - `--network` (or `BLOCKULA_NETWORK`): `local` (default, `http://localhost:7070`), `testnet` or `custom`.
 - `BLOCKULA_RPC` picks the node: required for `testnet` (its public node was retired: without one the MCP refuses to start and says so) and `custom`. Plain `http://` only on this machine or a private network, and no query or fragment. A node written two ways (`Node.Example`, `:443`, a trailing `/.`) is one node: it's never its own witness.
-- The testnet pins its chain id (`blockula-testnet-2`, with the `tboo` address prefix), and every network pins a genesis hash where one is known (`KNOWN_GENESIS` in `src/network.ts`: a release pins a launched chain's). `BLOCKULA_CHAIN_ID` and `BLOCKULA_GENESIS_HASH` pin them for any node. Whatever isn't pinned is pinned from the first status the node reports and remembered in `~/.blockula/known-chains.json` (except for local dev chains, which `--reset` replaces).
+- The testnet pins its chain id (`blockula-testnet-2`, with the `tboo` address prefix), and every network pins a genesis hash where one is known (`KNOWN_GENESIS` in `src/network.ts`: a release pins a public chain's). `BLOCKULA_CHAIN_ID` and `BLOCKULA_GENESIS_HASH` pin them for any node. Whatever isn't pinned is pinned from the first status the node reports and remembered in `~/.blockula/known-chains.json` (except for local dev chains, which `--reset` replaces).
 - A node reporting another chain id, genesis hash or address prefix is refused, before anything is signed, at startup or mid-session. So is one whose chain id isn't 1 to 64 letters, digits, `-`, `_` or `.` (the chain id names files and ledger entries here) or whose genesis hash isn't 64 hex characters. If a network was relaunched on purpose under the same chain id, the user removes its entry from `known-chains.json` or sets `BLOCKULA_GENESIS_HASH`. (A relaunch takes a new chain id, as the testnet's did: an entry remembered for the old `blockula-testnet` isn't held against `blockula-testnet-2`.) A node that says it's on `blockula-1` is refused too, unless the user set `BLOCKULA_CHAIN_ID=blockula-1`: it's never pinned on first use, so a configuration that didn't name that chain can't land there.
 
 `start_dev_node` starts a local chain, but the MCP only uses it when it was configured with `--network local`.
@@ -82,7 +82,7 @@ Session keys can only send transfers: staking, voting and name renewals need an 
 
 ## Your own node
 
-Point the MCP at a node of a chain you launched (`blockula summon`, docs/LAUNCH.md) or joined (`blockula join`):
+Point the MCP at a node of a chain you made (`blockula summon`, docs/CREATE.md) or joined (`blockula join`):
 
 ```bash
 claude mcp add blockula -e BLOCKULA_RPC=http://127.0.0.1:7171 -- npx -y @blockula/mcp

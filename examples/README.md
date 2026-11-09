@@ -40,4 +40,4 @@ Then try the rest:
 
 ## Other networks
 
-On a chain of your own ([docs/LAUNCH.md](../docs/LAUNCH.md)), pass one of its nodes with `--rpc`.
+On a chain of your own ([docs/CREATE.md](../docs/CREATE.md)), pass one of its nodes with `--rpc`.

@@ -1,12 +1,12 @@
 // The chain directory's rules (lib/chains.ts, chains/README.md) and its checker
 // (scripts/check-chains.mjs): what a listing must look like, what's refused, and the links the
-// site and `blockula launch` build from one. Run with `npm test -w @blockula/web`.
+// site and `blockula create` build from one. Run with `npm test -w @blockula/web`.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { checkChain, checkChains, contactUrl, listingJson, listingLink, publicNameProblem, soundsOfficial, units } from "./chains.ts";
+import { checkChain, checkChains, contactUrl, listingJson, listingLink, projectRun, publicNameProblem, soundsOfficial, units } from "./chains.ts";
 
 const GOOD = {
   name: "Jack in the Block",
@@ -31,6 +31,17 @@ test("a good listing, and the optional fields", () => {
   assert.deepEqual(errs({ rpc: "https://chain.example.org:8443" }), []);
   assert.deepEqual(errs({ p2p: "203.0.113.10:30300" }), []);
   assert.deepEqual(errs({ contact: "https://forum.example.org/u/jack" }), []);
+});
+
+test("the project's own subdomains may say Blockula; look-alikes may not", () => {
+  assert.deepEqual(errs({ rpc: "https://dishnet.blockula.app", p2p: "dishnet.blockula.app:30300" }), []);
+  assert.ok(projectRun("https://dishnet.blockula.app"));
+  for (const rpc of ["https://blockula.app.example.org", "https://myblockula.app", "https://dishnet.blockula.app:8443", "http://dishnet.blockula.app", "https://blockula-chain.example.org"]) {
+    assert.ok(!projectRun(rpc), rpc);
+  }
+  assert.ok(errs({ rpc: "https://blockula.app.example.org" }).some((e) => /reads as Blockula/.test(e)));
+  assert.deepEqual(errs({ rpc: "https://demo.blockula.app", p2p: "demo.blockula.app:30300", name: "Blockula", chain_id: "blockula-demo", description: "Blockula's demo chain." }, "blockula-demo.json"), [], "the project's own chain may carry its name");
+  assert.ok(errs({ name: "Blockula" }).some((e) => /name reads as Blockula/.test(e)), "anyone else's may not");
 });
 
 test("refuses bad shapes", () => {
@@ -79,7 +90,6 @@ test("rpc: public https origins only", () => {
     ["https://router.home.arpa", /local or reserved/],
     ["https://chain.test", /local or reserved/],
     ["https://blockula.app", /Blockula's own/],
-    ["https://demo.blockula.app", /Blockula's own/],
     ["https://bl0ckula-wallet.example.org", /Blockula's own/],
     ["not a url", /isn't a URL/],
     [`https://${"a".repeat(100)}.org`, /at most 100/],

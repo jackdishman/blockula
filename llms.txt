@@ -1,19 +1,19 @@
 # Blockula
 
-> A kit for launching your own quantum-safe ledger (ML-DSA-65 signatures, BLAKE3), with passkey wallets, .boo names, and an MCP server for agents. Each chain's unit is FANG (9 decimals), and it has no value.
+> A kit for running your own quantum-safe blockchain (ML-DSA-65 signatures, BLAKE3), with passkey wallets, .boo names, and an MCP server for agents. Each chain's unit is FANG (9 decimals), and it has no value.
 
 - [Agent guide](AGENTS.md): copy-paste prompt, rules, HTTP API
 - [README](README.md): quickstart, SDK examples, run your own chain
-- [Launch your own ledger](docs/LAUNCH.md): `blockula launch` names and starts a chain, friends join, validators get approved
+- [Create your own chain](docs/CREATE.md): `blockula create` names and starts a chain, friends join, validators get approved
 - [Reference](docs/REFERENCE.md): chains by hand, public servers, the CLI wallet, validators, Hunts
 - [Run a node](docs/RUN-A-NODE.md): a full node or a validator, and using your own node
 - [Plan](docs/PLAN.md): architecture, privacy (Ghost Mode), tokenomics, roadmap
 - [Security](SECURITY.md): how to report vulnerabilities
 
-One-pager: docs/ONE_PAGER.md · No public chain: `blockula launch` makes your own (`blockula dev` for a throwaway one) (the public testnet was retired in November 2026)
+One-pager: docs/ONE_PAGER.md · No public chain: `blockula create` makes your own (`blockula dev` for a throwaway one) (the public testnet was retired in November 2026)
 
 ## Fastest path
-1. `claude mcp add blockula -- npx -y @blockula/mcp` (a local `blockula dev` chain at http://localhost:7070; `BLOCKULA_RPC=<a node>` for a chain you launched). The network is pinned (chain id + genesis hash) and never switches on its own.
+1. `claude mcp add blockula -- npx -y @blockula/mcp` (a local `blockula dev` chain at http://localhost:7070; `BLOCKULA_RPC=<a node>` for a chain you made). The network is pinned (chain id + genesis hash) and never switches on its own.
 2. MCP: create_wallet → faucet → register_name / send; stake / unstake / my_stake; list_proposals / vote; renew_name (start_dev_node for a local chain, needs the node binary from install_node)
 3. App code: `import { Wallet, Client } from "@blockula/sdk"`; browser users: `import { createPasskeyWallet } from "@blockula/sdk/passkey"`. Helpers for every protocol v1 action (staking, governance, multisig, names); `client.provenAccount` / `provenName` check Merkle proofs against independent nodes.
 4. Contribute: MCP list_hunts → implement → PR merges → submit_contribution (on a chain that runs a contribution pool, judged by Séance juries; see AGENTS.md). FANG, Hunts and Soul have no value.

@@ -144,7 +144,7 @@ test("growing the chain: a friend's pay link, a validator's commands, and a codi
   await task(page, "invite").getByRole("button", { name: "Mark done" }).click();
 
   await expect(task(page, "validator")).not.toHaveClass(/done/);
-  // The validator task's commands, filled in for this chain (docs/LAUNCH.md section 3).
+  // The validator task's commands, filled in for this chain (docs/CREATE.md section 3).
   await task(page, "validator").getByRole("button", { name: /Help a friend become a validator/ }).click();
   await expect(page.getByTestId("validator-cli")).toContainText(`blockula validator init --home ~/.blockula/${CHAIN_ID}-validator --genesis ${RPC} --genesis-hash ${GENESIS}`);
 

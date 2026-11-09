@@ -68,7 +68,9 @@ test("a card per listed chain: live or resting, with its wallet and explorer", a
   await expect(owl.getByTestId("chain-explorer")).toHaveAttribute("href", `${OWL.rpc}/`);
 
   await expect(page.getByTestId("chains-empty")).toHaveCount(0);
-  await expect(page.locator("body")).not.toContainText(/\bcontracts?\b|token sale|\bAPR\b|\byield\b|airdrop|invest/i);
+  // Money words appear only to say there's none of it ("no investors, no VC, no token sale").
+  const body = (await page.locator("body").innerText()).replace(/\bno (investors|VC|token sale)\b/gi, "");
+  expect(body).not.toMatch(/\bcontracts?\b|token sale|\bAPR\b|\byield\b|airdrop|invest/i);
   expect(await cspViolations(page)).toEqual([]);
 });
 

@@ -20,7 +20,7 @@
 > and no promise attached. For the people who run it, see
 > [OPERATIONS.md](OPERATIONS.md#programs-optional-off-by-default) (limits, incident response, the
 > pause), [GOVERNANCE.md](GOVERNANCE.md#programs-optional-off-by-default) (the `program_*` keys) and
-> [LAUNCH.md](LAUNCH.md#programs-experimental-off-by-default); for an auditor,
+> [CREATE.md](CREATE.md#programs-experimental-off-by-default); for an auditor,
 > [AUDIT_SCOPE.md](AUDIT_SCOPE.md#programs-optional-off-by-default).
 
 Status: revision 3, 2026-10-29. Revision 2 (2026-10-20) was written after two adversarial reviews,

@@ -13,7 +13,7 @@
 // another tx with a nonce it already used today (which is what happens after a real refusal: the
 // node's next nonce didn't move), the slot counts the larger of the two, not their sum.
 //
-// Each chain has its own daily total (AGENT-13): a dev chain and a chain someone launched share
+// Each chain has its own daily total (AGENT-13): a dev chain and a chain someone made share
 // the `boo` prefix, so the same key has the same address on both, and spending on one mustn't use
 // up the other's budget. The file stays readable by 0.5.1, which knew one total: `spent` is still
 // the sum over every chain, and `chains` holds each chain's part. What `spent` holds beyond the

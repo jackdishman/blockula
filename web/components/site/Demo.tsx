@@ -118,8 +118,8 @@ function Resting({ state }: { state: "off" | "waking" | "down" }) {
   return (
     <div className="card plate site-demo center stack" data-testid="demo-resting">
       <h3 className="site-h3">The demo chain is resting</h3>
-      <p className="dim">{state === "down" ? "It isn't answering just now." : "There's no demo running at the moment."} You can launch your own in a minute, on your own computer.</p>
-      <a className="btn primary" href="#launch">Launch your own</a>
+      <p className="dim">{state === "down" ? "It isn't answering just now." : "There's no demo running at the moment."} You can start your own in a minute, on your own computer.</p>
+      <a className="btn primary" href="#start">Start your own</a>
     </div>
   );
 }

@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Running a node is a real contribution. The how-to is [docs/RUN-A-NODE.md](https://github.com/jackdishman/blockula/blob/main/docs/RUN-A-NODE.md), and the operator's reference is [docs/OPERATIONS.md](https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md). Launching a chain of your own: [docs/LAUNCH.md](https://github.com/jackdishman/blockula/blob/main/docs/LAUNCH.md).
+        Running a node is a real contribution. The how-to is [docs/RUN-A-NODE.md](https://github.com/jackdishman/blockula/blob/main/docs/RUN-A-NODE.md), and the operator's reference is [docs/OPERATIONS.md](https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md). Creating a chain of your own: [docs/CREATE.md](https://github.com/jackdishman/blockula/blob/main/docs/CREATE.md).
 
         **This issue is public.** Put nothing secret here: no key files, no recovery words, no private IPs you'd rather not share. A validator's p2p address is public on-chain anyway.
   - type: dropdown
@@ -16,7 +16,7 @@ body:
       options:
         - A full node (blockula join)
         - A public RPC node
-        - A validator on a chain someone launched
+        - A validator on a chain someone else made
         - A chain of my own (blockula summon)
     validations:
       required: true

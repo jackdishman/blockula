@@ -105,7 +105,7 @@ const PUBLIC_RPCS: Record<string, string[]> = {};
  * The witnesses a node of `chainId` gets when BLOCKULA_WITNESSES is unset: the chain's public RPCs,
  * unless the node is one of them. So your own node's answers about names and heights are checked
  * against the public ones (OPERATOR-6). None for chains without public RPCs (dev chains, and the
- * chains people launch themselves: there, BLOCKULA_WITNESSES lists other nodes).
+ * chains people make themselves: there, BLOCKULA_WITNESSES lists other nodes).
  */
 export function defaultWitnesses(chainId: string | undefined, rpc: string): string[] {
   const rpcs = ((chainId && PUBLIC_RPCS[chainId]) || []).map(canonicalUrl);

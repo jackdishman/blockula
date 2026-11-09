@@ -20,7 +20,7 @@ Then pick an issue (`good first issue`, `familiar-friendly`, or anything in [the
 
 ## On-chain rewards (on chains that run them)
 
-FANG, Hunts and Soul have no value. Hunts and the contribution pool are chain features: any chain can run them for its own repos ([docs/BUILD-ON-IT.md](docs/BUILD-ON-IT.md#7-contributors-paste-this-into-your-coding-agent) has the prompt for a chain someone launched). Blockula's own repo isn't paid on any chain right now (the public testnet that ran them, `blockula-testnet-2`, was retired in November 2026), so its PRs are reviewed and merged as usual.
+FANG, Hunts and Soul have no value. Hunts and the contribution pool are chain features: any chain can run them for its own repos ([docs/BUILD-ON-IT.md](docs/BUILD-ON-IT.md#7-contributors-paste-this-into-your-coding-agent) has the prompt for a chain someone else runs). Blockula's own repo isn't paid on any chain right now (the public testnet that ran them, `blockula-testnet-2`, was retired in November 2026), so its PRs are reviewed and merged as usual.
 
 ### Hunts: bounties with acceptance criteria
 - Open Hunts are GitHub issues labeled [`hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt). Each has objective acceptance criteria, and a FANG bounty escrowed on a chain that runs Hunts.
@@ -38,7 +38,7 @@ People with Soul can serve on juries (`blockula contrib join-jury`), which earns
 
 ## Other ways to help
 - **Bug reports** with a repro, through the [bug form](https://github.com/jackdishman/blockula/issues/new?template=bug.yml).
-- **Run a node.** Launch a chain with friends ([docs/LAUNCH.md](docs/LAUNCH.md)), or join one someone launched: a full node takes one command (`blockula join`), and a validator a few more ([docs/RUN-A-NODE.md](docs/RUN-A-NODE.md)). Report what breaks with the [node form](https://github.com/jackdishman/blockula/issues/new?template=node-operator.yml).
+- **Run a node.** Create a chain with friends ([docs/CREATE.md](docs/CREATE.md)), or join one someone else runs: a full node takes one command (`blockula join`), and a validator a few more ([docs/RUN-A-NODE.md](docs/RUN-A-NODE.md)). Report what breaks with the [node form](https://github.com/jackdishman/blockula/issues/new?template=node-operator.yml).
 - **Fuzzing.** Report crashes privately ([SECURITY.md](SECURITY.md#fuzzing-findings)).
 
 ## What to run

@@ -1,6 +1,7 @@
-//! `blockula launch`: a new chain in a minute. It asks what the chain is called, who can reach
+//! `blockula create` (`launch`, its old name, still works): a new chain in a minute. It asks what
+//! the chain is called, who can reach
 //! it and how it runs (or takes the answers as flags, with `--yes`), summons it, writes a short
-//! guide into its home (`LAUNCH.md`: how to start it again, what friends run to join, the apps),
+//! guide into its home (`README.md`: how to start it again, what friends run to join, the apps),
 //! optionally serves it over HTTPS on a tailnet (`tailscale serve`), and starts it.
 //!
 //! Everything it does, `blockula summon` and `blockula run` can do by hand; this only asks the
@@ -12,7 +13,7 @@ use anyhow::{anyhow, bail, ensure, Result};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-/// How the validators reach each other (docs/LAUNCH.md, step 1).
+/// How the validators reach each other (docs/CREATE.md, step 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Reach {
     /// This machine only: a chain to try out
@@ -45,10 +46,10 @@ impl Reach {
     }
 }
 
-/// The answers, as flags (`blockula launch --help`). Anything left out is asked, or with `--yes`
+/// The answers, as flags (`blockula create --help`). Anything left out is asked, or with `--yes`
 /// takes its default.
 #[derive(clap::Args, Debug, Default, Clone)]
-pub struct LaunchArgs {
+pub struct CreateArgs {
     /// The chain's name, as wallets and explorers show it ("Jack in the Block")
     #[arg(long)]
     pub name: Option<String>,
@@ -93,7 +94,7 @@ pub struct LaunchArgs {
     pub no_start: bool,
 }
 
-/// What `launch` will make.
+/// What `create` will make.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
     pub name: String,
@@ -112,6 +113,26 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// How to serve this chain's wallet over HTTPS, for the summary line: Tailscale's own HTTPS on a
+    /// tailnet, a reverse proxy anywhere else.
+    pub fn https_hint(&self) -> String {
+        match self.reach {
+            Reach::Tailscale => format!("serve it over HTTPS with `tailscale serve --bg {}`", chain::SUMMON_HTTP_PORT),
+            _ => format!("serve it over HTTPS on a DNS name with a reverse proxy: {REGISTRY_REPO}/blob/main/docs/BUILD-ON-IT.md#4-put-it-online"),
+        }
+    }
+
+    /// The same, at length, for the chain's README.md.
+    pub fn https_hint_long(&self) -> String {
+        match self.reach {
+            Reach::Tailscale => format!(
+                "serve it over HTTPS: `tailscale serve --bg {}` (turn on HTTPS certificates in the Tailscale admin console first), then send https://<this machine>.<your tailnet>.ts.net/wallet/",
+                chain::SUMMON_HTTP_PORT
+            ),
+            _ => format!("serve it over HTTPS on a DNS name, with a reverse proxy such as Caddy in front of port {} ({REGISTRY_REPO}/blob/main/docs/BUILD-ON-IT.md#4-put-it-online), then send https://<that name>/wallet/", chain::SUMMON_HTTP_PORT),
+        }
+    }
+
     pub fn summon_opts(&self) -> SummonOpts {
         let o = SummonOpts {
             faucet: self.faucet,
@@ -363,8 +384,8 @@ fn check_host(h: &str) -> Result<String> {
 const BLOCK_TIMES: [(u64, &str); 4] = [(1_000, "1 second   snappy; about 5× the upload of the default"), (2_000, "2 seconds"), (5_000, "5 seconds  the default: light enough for home connections"), (10_000, "10 seconds lightest")];
 
 /// The plan from the flags alone (`--yes`, or no terminal to ask on).
-pub fn plan_from_flags(a: &LaunchArgs, m: &Machine) -> Result<Plan> {
-    let name = check_name(a.name.as_deref().ok_or_else(|| anyhow!("--name is needed with --yes (or run `blockula launch` in a terminal to be asked)"))?)?;
+pub fn plan_from_flags(a: &CreateArgs, m: &Machine) -> Result<Plan> {
+    let name = check_name(a.name.as_deref().ok_or_else(|| anyhow!("--name is needed with --yes (or run `blockula create` in a terminal to be asked)"))?)?;
     let token = check_token(&a.token.clone().unwrap_or_else(|| suggest_token(&name)))?;
     let description = check_description(a.description.as_deref().unwrap_or_default())?;
     let chain_id = a.chain_id.clone().unwrap_or_else(|| slugify(&name));
@@ -391,8 +412,8 @@ pub fn plan_from_flags(a: &LaunchArgs, m: &Machine) -> Result<Plan> {
 }
 
 /// The plan, asked a step at a time. A flag that was given is taken without asking.
-pub fn plan_by_asking<R: BufRead, W: Write>(p: &mut Prompter<R, W>, a: &LaunchArgs, m: &Machine) -> Result<Plan> {
-    writeln!(p.out, "\n🦇 Launch your own ledger. Press Enter to keep a [default].\n")?;
+pub fn plan_by_asking<R: BufRead, W: Write>(p: &mut Prompter<R, W>, a: &CreateArgs, m: &Machine) -> Result<Plan> {
+    writeln!(p.out, "\n🦇 Create your own chain. Press Enter to keep a [default].\n")?;
 
     writeln!(p.out, "1/4  Name it")?;
     let name = match &a.name {
@@ -468,13 +489,13 @@ pub fn plan_by_asking<R: BufRead, W: Write>(p: &mut Prompter<R, W>, a: &LaunchAr
     Ok(Plan { name, description, token, chain_id, reach, host, block_time_ms, faucet, min_bond, programs, https })
 }
 
-/// `<home>/LAUNCH.md`: what to keep after the launch.
+/// `<home>/README.md`: what to keep once the chain is made.
 pub fn guide(plan: &Plan, g: &Genesis, home: &Path, genesis_hash: &str, https_url: Option<&str>) -> String {
     let mut s = format!("# {}\n\n", plan.name);
     if !plan.description.is_empty() {
         s += &format!("{}\n\n", plan.description);
     }
-    s += &format!("Made with `blockula launch`. Ticker {}, chain id `{}`.\n\n", plan.token, g.chain_id);
+    s += &format!("Made with `blockula create`. Ticker {}, chain id `{}`.\n\n", plan.token, g.chain_id);
     s += &format!("- Genesis hash: `{genesis_hash}`\n- Explorer: {}", plan.local_url());
     if let Some(u) = plan.shared_url() {
         s += &format!(" (others: {u})");
@@ -496,14 +517,14 @@ pub fn guide(plan: &Plan, g: &Genesis, home: &Path, genesis_hash: &str, https_ur
     match (https_url, plan.shared_url()) {
         (Some(u), _) => s += &format!("Send them {u}/wallet/. They open it on a phone or laptop, make a wallet with a passkey{} and can pay right away. Nothing to install.\n\n", if plan.faucet { ", take coins from the faucet" } else { "" }),
         (None, Some(u)) => s += &format!(
-            "Send them {u}/wallet/. It opens in any browser, but over plain http browsers won't make passkeys (it offers a browser-only key for testing). For passkeys, serve it over HTTPS: on Tailscale, `tailscale serve --bg {port}` (turn on HTTPS certificates in the Tailscale admin console first), then send https://<this machine>.<your tailnet>.ts.net/wallet/.\n\n",
-            port = chain::SUMMON_HTTP_PORT
+            "Send them {u}/wallet/. It opens in any browser, but over plain http browsers won't make passkeys (it offers a browser-only key for testing). For passkeys, {}.\n\n",
+            plan.https_hint_long()
         ),
-        (None, None) => s += &format!("The wallet is at {}, on this machine only: this chain is reached from this machine alone. Launch one with `--reach tailscale` (or `home`) to share it.\n\n", plan.wallet_url()),
+        (None, None) => s += &format!("The wallet is at {}, on this machine only: this chain is reached from this machine alone. Create one with `--reach tailscale` (or `home`) to share it.\n\n", plan.wallet_url()),
     }
     if let Some(u) = plan.shared_url() {
         s += &format!(
-            "## Friends run their own node\n\nThey install Blockula, then run:\n\n```sh\ncurl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh\nblockula join --genesis {u} --genesis-hash {genesis_hash} --home ~/.blockula/{id}\n```\n\nTheir node checks every block, and its explorer is at http://localhost:7171. To make them a validator, follow step 3 of https://github.com/jackdishman/blockula/blob/main/docs/LAUNCH.md and approve them with:\n\n```sh\nblockula validator approve <their validator address> --key {key} --rpc {local}\n```\n\n",
+            "## Friends run their own node\n\nThey install Blockula, then run:\n\n```sh\ncurl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh\nblockula join --genesis {u} --genesis-hash {genesis_hash} --home ~/.blockula/{id}\n```\n\nTheir node checks every block, and its explorer is at http://localhost:7171. To make them a validator, follow step 3 of https://github.com/jackdishman/blockula/blob/main/docs/CREATE.md and approve them with:\n\n```sh\nblockula validator approve <their validator address> --key {key} --rpc {local}\n```\n\n",
             id = g.chain_id,
             key = display_home(&home.join("validator.key")),
             local = plan.local_url(),
@@ -526,7 +547,7 @@ pub fn guide(plan: &Plan, g: &Genesis, home: &Path, genesis_hash: &str, https_ur
 /// The repo whose `chains/` directory blockula.app lists (chains/README.md).
 const REGISTRY_REPO: &str = "https://github.com/jackdishman/blockula";
 
-/// How to list a launched chain on blockula.app: GitHub's new-file page with its
+/// How to list a chain on blockula.app: GitHub's new-file page with its
 /// `chains/<chain id>.json` filled in, and what to do first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Listing {
@@ -594,15 +615,15 @@ pub fn tailscale_serve(port: u16) -> Result<String> {
     Ok(format!("https://{dns}"))
 }
 
-/// What `launch` made.
-pub struct Launched {
+/// What `create` made.
+pub struct Created {
     pub home: PathBuf,
     pub plan: Plan,
 }
 
 /// Asks (or reads the flags), summons, writes the guide and prints what to do next. The caller
 /// starts the node.
-pub fn launch(a: &LaunchArgs) -> Result<Launched> {
+pub fn create(a: &CreateArgs) -> Result<Created> {
     use std::io::IsTerminal;
     let m = Machine::detect();
     let interactive = !a.yes && std::io::stdin().is_terminal();
@@ -615,7 +636,7 @@ pub fn launch(a: &LaunchArgs) -> Result<Launched> {
             writeln!(p.out, "  {k:<15} {v}")?;
         }
         writeln!(p.out)?;
-        if !p.confirm("Launch it?", true)? {
+        if !p.confirm("Create it?", true)? {
             bail!("nothing made");
         }
         plan
@@ -640,7 +661,7 @@ pub fn launch(a: &LaunchArgs) -> Result<Launched> {
     } else {
         None
     };
-    std::fs::write(home.join("LAUNCH.md"), guide(&plan, &g, &home, &hash, https.as_deref()))?;
+    std::fs::write(home.join("README.md"), guide(&plan, &g, &home, &hash, https.as_deref()))?;
 
     println!("\n🪦 {} is summoned ({}).", plan.name, plan.token);
     println!("   Explorer:      {}", plan.local_url());
@@ -655,7 +676,7 @@ pub fn launch(a: &LaunchArgs) -> Result<Launched> {
     // The one link to send: the wallet, where friends' browsers make passkeys.
     match (&https, plan.shared_url()) {
         (Some(u), _) => println!("   Send friends:  {u}/wallet/"),
-        (None, Some(u)) => println!("   Send friends:  {u}/wallet/  (plain http: for passkeys, serve it over HTTPS with `tailscale serve --bg {}`)", chain::SUMMON_HTTP_PORT),
+        (None, Some(u)) => println!("   Send friends:  {u}/wallet/  (plain http: for passkeys, {})", plan.https_hint()),
         (None, None) => {}
     }
     if let Some(u) = plan.shared_url() {
@@ -666,15 +687,15 @@ pub fn launch(a: &LaunchArgs) -> Result<Launched> {
         println!("                  {}", l.link);
     }
     println!("   Start again:   {}", plan.run_command(&home));
-    println!("   Everything else (apps, adding validators): {}", display_home(&home.join("LAUNCH.md")));
-    Ok(Launched { home, plan })
+    println!("   Everything else (apps, adding validators): {}", display_home(&home.join("README.md")));
+    Ok(Created { home, plan })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ask(script: &str, a: &LaunchArgs, m: &Machine) -> (Result<Plan>, String) {
+    fn ask(script: &str, a: &CreateArgs, m: &Machine) -> (Result<Plan>, String) {
         let mut out = Vec::new();
         let r = plan_by_asking(&mut Prompter { inp: script.as_bytes(), out: &mut out }, a, m);
         (r, String::from_utf8(out).unwrap())
@@ -706,7 +727,7 @@ mod tests {
     fn enter_takes_every_default() {
         let m = Machine { tailscale_ip: Some("100.64.0.7".into()), lan_ip: Some("192.168.1.20".into()) };
         // A name, then Enter for everything else.
-        let (plan, out) = ask("Jack in the Block\n\n\n\n\n\n\n\n\n\n\n", &LaunchArgs::default(), &m);
+        let (plan, out) = ask("Jack in the Block\n\n\n\n\n\n\n\n\n\n\n", &CreateArgs::default(), &m);
         let plan = plan.unwrap();
         assert_eq!(plan, Plan {
             name: "Jack in the Block".into(),
@@ -731,7 +752,7 @@ mod tests {
         // Without Tailscale the default is this machine; 4 picks the internet, which asks for an
         // address and turns the faucet off by default.
         let script = "\nJack in the Block\nJA CK\nJACK\nJack's friends' ledger.\nNot An Id\n\n9\n4\n\nhttp://x.org\nledger.example.org\n1\n\n0\n500\ny\n";
-        let (plan, out) = ask(script, &LaunchArgs::default(), &NO_NET);
+        let (plan, out) = ask(script, &CreateArgs::default(), &NO_NET);
         let plan = plan.unwrap();
         assert_eq!((plan.token.as_str(), plan.reach, plan.host.as_deref()), ("JACK", Reach::Internet, Some("ledger.example.org")));
         assert_eq!((plan.block_time_ms, plan.faucet, plan.min_bond, plan.programs, plan.https), (1_000, false, Some(500 * DROPS_PER_FANG), true, false));
@@ -743,7 +764,7 @@ mod tests {
 
     #[test]
     fn flags_skip_their_questions() {
-        let a = LaunchArgs { name: Some("Jack in the Block".into()), token: Some("jack".into()), reach: Some(Reach::Local), block_time_ms: Some(2_000), programs: true, ..Default::default() };
+        let a = CreateArgs { name: Some("Jack in the Block".into()), token: Some("jack".into()), reach: Some(Reach::Local), block_time_ms: Some(2_000), programs: true, ..Default::default() };
         // Only the description, the chain id, the faucet and the bond are asked.
         let (plan, out) = ask("\n\n\n\n", &a, &NO_NET);
         let plan = plan.unwrap();
@@ -751,18 +772,18 @@ mod tests {
         assert!(!out.contains("Chain name") && !out.contains("A block every") && !out.contains("Pick 1–"), "{out}");
         assert_eq!(plan.bind(), "127.0.0.1");
         // Run out of answers: an error, not a loop.
-        assert!(ask("", &LaunchArgs::default(), &NO_NET).0.unwrap_err().to_string().contains("stdin closed"));
+        assert!(ask("", &CreateArgs::default(), &NO_NET).0.unwrap_err().to_string().contains("stdin closed"));
     }
 
     #[test]
     fn flags_alone() {
         let m = Machine { tailscale_ip: Some("100.64.0.7".into()), lan_ip: None };
-        let plan = plan_from_flags(&LaunchArgs { name: Some("Jack in the Block".into()), https: true, ..Default::default() }, &m).unwrap();
+        let plan = plan_from_flags(&CreateArgs { name: Some("Jack in the Block".into()), https: true, ..Default::default() }, &m).unwrap();
         assert_eq!((plan.token.as_str(), plan.reach, plan.host.as_deref(), plan.https), ("JITB", Reach::Tailscale, Some("100.64.0.7"), true));
-        assert!(plan_from_flags(&LaunchArgs::default(), &m).unwrap_err().to_string().contains("--name is needed"));
-        assert!(plan_from_flags(&LaunchArgs { name: Some("X Y".into()), reach: Some(Reach::Internet), ..Default::default() }, &m).unwrap_err().to_string().contains("--host is needed"));
-        assert!(plan_from_flags(&LaunchArgs { name: Some("X Y".into()), reach: Some(Reach::Local), https: true, ..Default::default() }, &m).is_err());
-        let local = plan_from_flags(&LaunchArgs { name: Some("X Y".into()), ..Default::default() }, &NO_NET).unwrap();
+        assert!(plan_from_flags(&CreateArgs::default(), &m).unwrap_err().to_string().contains("--name is needed"));
+        assert!(plan_from_flags(&CreateArgs { name: Some("X Y".into()), reach: Some(Reach::Internet), ..Default::default() }, &m).unwrap_err().to_string().contains("--host is needed"));
+        assert!(plan_from_flags(&CreateArgs { name: Some("X Y".into()), reach: Some(Reach::Local), https: true, ..Default::default() }, &m).is_err());
+        let local = plan_from_flags(&CreateArgs { name: Some("X Y".into()), ..Default::default() }, &NO_NET).unwrap();
         assert_eq!((local.reach, local.host), (Reach::Local, None));
     }
 
@@ -788,7 +809,7 @@ mod tests {
     /// open internet, wallets only on a tailnet served over HTTPS (Funnel), none otherwise.
     #[test]
     fn listing_links() {
-        let home = std::env::temp_dir().join(format!("blockula-launch-list-{}-{}", chain::now_ms(), std::process::id()));
+        let home = std::env::temp_dir().join(format!("blockula-create-list-{}-{}", chain::now_ms(), std::process::id()));
         let plan = Plan {
             name: "Jack in the Block".into(),
             description: "Jack's friends' ledger.".into(),
@@ -822,6 +843,11 @@ mod tests {
             "contact": "<your GitHub handle>",
         }));
         assert!(guide(&plan, &g, &home, &hash, None).contains(&format!("## List it on blockula.app\n\nAnyone can find it in the chain directory at https://blockula.app once https://ledger.example.org serves")));
+        // HTTPS advice fits the reach: a reverse proxy on the internet, Tailscale's own on a tailnet.
+        let g_text = guide(&plan, &g, &home, &hash, None);
+        assert!(g_text.contains("reverse proxy") && !g_text.contains("tailscale serve"), "{g_text}");
+        assert!(!plan.https_hint().contains("tailscale") && plan.https_hint().contains("BUILD-ON-IT.md#4-put-it-online"));
+        assert!(Plan { reach: Reach::Tailscale, ..plan.clone() }.https_hint().contains("tailscale serve --bg 7070"));
 
         // An IP address can't be a listing's https name: the rpc is left for a DNS name.
         let ip = Plan { host: Some("203.0.113.10".into()), description: String::new(), ..plan.clone() };
@@ -848,7 +874,7 @@ mod tests {
     /// The plan summons what it says, and the guide names the real genesis hash.
     #[test]
     fn summons_the_plan_and_writes_the_guide() {
-        let home = std::env::temp_dir().join(format!("blockula-launch-{}-{}", chain::now_ms(), std::process::id()));
+        let home = std::env::temp_dir().join(format!("blockula-create-{}-{}", chain::now_ms(), std::process::id()));
         let plan = Plan {
             name: "Jack in the Block".into(),
             description: "Jack's friends' ledger.".into(),

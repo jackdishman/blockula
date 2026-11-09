@@ -1,5 +1,5 @@
 // The node's built-in explorer (node/src/explorer.html), as explorer.spec.ts serves it: its footer
-// says the chain's FANG has no value (test chains: test FANG; a chain someone launched: its own),
+// says the chain's FANG has no value (test chains: test FANG; a chain someone made: its own),
 // its copy makes no value or reward promises, and its Hunts and contribution pool copy says who
 // pays and what a pool without repositories pays.
 import { readFileSync } from "node:fs";
@@ -8,13 +8,13 @@ import { expect, test, type Page } from "@playwright/test";
 
 const ORIGIN = "https://node-explorer.blockula.test";
 const HTML = readFileSync(path.join(__dirname, "../../node/src/explorer.html"), "utf8");
-// A chain someone launched with `blockula summon` (docs/LAUNCH.md).
+// A chain someone made with `blockula summon` (docs/CREATE.md).
 const OWN_CHAIN = "mychain";
 const BURNED = "Fees destroyed forever. The base fee prices block space so spam costs the spammer; burning it takes that FANG out of the supply. It isn't a mechanism to manage FANG's price.";
 const HUNT_TIP = "A bounty on a GitHub issue. Its FANG sits in escrow until the creator awards it. The chain doesn't check the pull request: the creator decides who's paid. Once it expires the creator can cancel it, refunding every funder exactly; before that only a governance refund can.";
 const CREATOR = { address: "boo1creatorqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq", name: "maker.boo", short: "boo1creato…qqqq" };
 
-/** What a chain made with `blockula launch --name … --token …` adds to its status. */
+/** What a chain made with `blockula create --name … --token …` adds to its status. */
 let brand: { name?: string; token?: string } = {};
 
 /** A node's answers. `repos`: the contribution pool's repositories (none: it pays nothing). */
@@ -43,7 +43,7 @@ async function open(page: Page, chainId: string, hash = "", repos: { repo: strin
   await page.goto(`${ORIGIN}/${hash}`);
 }
 
-test("a chain someone launched says it isn't audited and its FANG has no value", async ({ page }) => {
+test("a chain someone made says it isn't audited and its FANG has no value", async ({ page }) => {
   await open(page, OWN_CHAIN);
   // explorer.spec.ts holds the imprint itself to this.
   await expect(page.locator("#imprint")).toHaveText("Post-quantum signatures · ML-DSA-65 · Not audited");
@@ -52,7 +52,7 @@ test("a chain someone launched says it isn't audited and its FANG has no value",
   await expect(page.locator("footer").getByRole("link")).toHaveCount(0);
 });
 
-test("a chain launched with a name and a ticker shows them", async ({ page }) => {
+test("a chain made with a name and a ticker shows them", async ({ page }) => {
   brand = { name: "Jack in the Block", token: "JACK" };
   try {
     await open(page, "jack-in-the-block");

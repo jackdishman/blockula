@@ -6,7 +6,7 @@
 > (PROGRAMS-V0.md sections 0 and 9.3). The fuzz targets as built are in PROGRAMS.md section 13's
 > "As built for v0".
 
-> **Update, 2026-10-22: there's no mainnet.** Blockula 1.0 is a kit for launching your own ledger ([LAUNCH.md](LAUNCH.md)), and programs are an optional feature with no deadline: built into the node and switched off. The plan's mainnet step (Phase 5, D2, section 9.2) is dropped. LAUNCH-PLAN.md and COUNSEL_BRIEF.md, which it mentions, were removed with the mainnet plan.
+> **Update, 2026-10-22: there's no mainnet.** Blockula 1.0 is a kit for launching your own ledger ([CREATE.md](CREATE.md)), and programs are an optional feature with no deadline: built into the node and switched off. The plan's mainnet step (Phase 5, D2, section 9.2) is dropped. LAUNCH-PLAN.md and COUNSEL_BRIEF.md, which it mentions, were removed with the mainnet plan.
 
 Status: plan, 2026-10-19, against main at `2bbecde` (after v0.5.2). It turns the design in
 [PROGRAMS.md](PROGRAMS.md) (revision 3, 2026-10-19) into milestones and pull requests. The design

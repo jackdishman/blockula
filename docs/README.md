@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| [LAUNCH.md](LAUNCH.md) | Launch your own ledger with `blockula launch`: friends join and become validators, the apps, what it costs |
+| [CREATE.md](CREATE.md) | Create your own chain with `blockula create`: friends join and become validators, the apps, what it costs |
 | [BUILD-ON-IT.md](BUILD-ON-IT.md) | Make the chain yours: Claude and the MCP, changing the explorer and wallet with Claude Code, the SDK, programs and governance, HTTPS, hosting the wallet for friends, the contributor prompt |
 | [USE-CASES.md](USE-CASES.md) | Eight things friends, a club, a class or a team can do on their chain, with the first commands |
 | [RUN-A-NODE.md](RUN-A-NODE.md) | A full node or a validator as a service, and pointing the wallet, SDK and MCP at your own node |
@@ -33,7 +33,7 @@
 
 ## Design history
 
-Written while Blockula was headed for a value-bearing mainnet, which was dropped in October 2026 for the launch kit. The code still cites them, and they explain why things are the way they are; their plans for a mainnet, its token and its launch aren't happening.
+Written while Blockula was headed for a value-bearing mainnet, which was dropped in October 2026 for the kit. The code still cites them, and they explain why things are the way they are; their plans for a mainnet, its token and its launch aren't happening.
 
 | | |
 |---|---|

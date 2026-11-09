@@ -2934,7 +2934,7 @@ mod http_tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// A chain made with `blockula launch` (a name and a ticker): the explorer and its app
+    /// A chain made with `blockula create` (a name and a ticker): the explorer and its app
     /// manifest carry the name, the home-screen icons are PNGs, and amounts people read are in
     /// the ticker, while a FANG chain's responses are untouched.
     #[tokio::test]

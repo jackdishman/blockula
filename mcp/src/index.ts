@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // 🧛 Blockula MCP server. Add to Claude Code with:
 //   claude mcp add blockula -- npx -y @blockula/mcp                      (a `blockula dev` chain)
-//   claude mcp add blockula -e BLOCKULA_RPC=https://<node> -- npx -y @blockula/mcp   (a chain you launched)
+//   claude mcp add blockula -e BLOCKULA_RPC=https://<node> -- npx -y @blockula/mcp   (a chain you made)
 //
 // Env:
 //   BLOCKULA_NETWORK    local (default), testnet or custom (same as --network)
@@ -939,7 +939,7 @@ tool(
 
 tool(
   "summon_chain",
-  "Create a brand-new Blockula chain (fresh genesis + validator key) that you can run as your own network. `name`, `description` and `token` (its ticker) are what wallets and explorers show; the genesis hash binds them. A person launching one by hand runs `blockula launch`.",
+  "Create a brand-new Blockula chain (fresh genesis + validator key) that you can run as your own network. `name`, `description` and `token` (its ticker) are what wallets and explorers show; the genesis hash binds them. A person making one by hand runs `blockula create`.",
   {
     chain_id: z.string().regex(/^[a-z0-9-]{3,40}$/),
     faucet: z.boolean().default(true),

@@ -167,6 +167,10 @@ input { width: 100%; padding: 8px 2px 6px; border: 0; border-bottom: 1.5px solid
 input::placeholder { color: rgba(106, 95, 83, 0.7); font-style: italic; }
 input:focus { outline: none; border-bottom-color: var(--blood); box-shadow: 0 1.5px 0 var(--blood); background: rgba(250, 246, 236, 0.6); }
 input.mono { font-family: var(--mono); font-size: 16px; }
+/* Boxes and dots are ticked, not written on the line: none of the text style above. */
+input:is([type="checkbox"], [type="radio"]) { flex: none; width: 18px; height: 18px; margin: 4px 0 0; padding: 0; border: 0; box-shadow: none; background: none; accent-color: var(--blood); cursor: pointer; }
+input:is([type="checkbox"], [type="radio"]):focus { box-shadow: none; background: none; }
+input:is([type="checkbox"], [type="radio"]):focus-visible { outline: 2px solid var(--blood); outline-offset: 2px; }
 .suffix-input { display: flex; align-items: stretch; }
 .suffix { display: flex; align-items: flex-end; padding: 0 2px 7px 10px; border-bottom: 1.5px solid var(--ink); color: var(--dim); font: 400 19px var(--caps); letter-spacing: 0.04em; }
 .suffix-input:focus-within .suffix { border-bottom-color: var(--blood); box-shadow: 0 1.5px 0 var(--blood); }

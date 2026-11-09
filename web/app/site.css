@@ -95,7 +95,24 @@ html[data-site] .site-top nav a { border-bottom-width: 2px; }
 .site-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
 .site-tile { border: 1.5px solid var(--ink); background: var(--paper-hi); padding: 16px 18px; display: flex; flex-direction: column; gap: 6px; }
 .site-tile p { margin: 0; font-size: 17px; }
+.site-inside { grid-template-columns: repeat(4, 1fr); }
 .site-inside .site-tile { border-color: var(--hair); background: transparent; }
+.site-perks .site-tile p { font-size: 16.5px; }
+.site-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+/* The comparison: scrolls inside its own frame on a phone, never the page. */
+.site-compare-wrap { padding: 0; overflow-x: auto; max-width: 100%; }
+.site-compare-wrap:focus-visible { outline: 2px solid var(--blood); outline-offset: 2px; }
+.site-compare { width: 100%; min-width: 620px; border-collapse: collapse; font-size: 16px; line-height: 1.35; }
+.site-compare th, .site-compare td { padding: 11px 14px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--hair); }
+.site-compare thead th { font: 400 17px var(--caps); letter-spacing: 0.05em; color: var(--ink-soft); border-bottom: 1.5px solid var(--ink); }
+.site-compare tbody th { font: 400 15px var(--caps); letter-spacing: 0.04em; color: var(--dim); width: 19%; }
+.site-compare tbody tr:last-child > * { border-bottom: 0; }
+.site-compare td { color: var(--dim); }
+.site-compare .site-compare-us { color: var(--ink); background: rgba(141, 20, 24, 0.05); }
+.site-compare thead .site-compare-us { color: var(--blood); }
+.site-compare-note { max-width: 680px; align-self: center; margin: 0; text-align: center; }
+/* On a phone the question column stays put while the answers scroll under it. */
+.site-compare tbody th, .site-compare thead th:first-child { position: sticky; left: 0; z-index: 1; background: var(--paper-hi); }
 
 /* Launch and contribute */
 .site-launch { max-width: 820px; width: 100%; align-self: center; }
@@ -113,6 +130,7 @@ html[data-site] .site-top nav a { border-bottom-width: 2px; }
 .site-chain-name .site-h3 { overflow-wrap: anywhere; }
 .site-ticker { color: var(--ink-soft); }
 .site-wants { color: var(--moss); }
+.site-ours { color: var(--blood); }
 .site-chain-status { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 0 6px; }
 .site-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--moss); flex: none; }
 .site-dot.rest { background: var(--dim); }

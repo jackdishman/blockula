@@ -45,7 +45,7 @@ Native account abstraction (Phase 1). Each account holds a list of authorized ke
 - **Treasury:** 10% of issuance plus name fees. Pays for sponsored onboarding txs (new users need zero FANG), faucets, audits and grants.
 - **Ghost Mode:** a small verification premium, partly offset by aggregation.
 - **Health targets:** ≥50% staked, Nakamoto coefficient ≥10, slashing for double-signing (heavy) and downtime (light).
-- **No value.** FANG has none by design: each chain's faucet hands it out, and nobody sells or buys it ([LAUNCH.md](LAUNCH.md)).
+- **No value.** FANG has none by design: each chain's faucet hands it out, and nobody sells or buys it ([CREATE.md](CREATE.md)).
 
 ## 🪦 Proof of Contribution (rewarding useful work)
 
@@ -161,7 +161,7 @@ Next:
 
 ## Roadmap
 
-**The direction (decided Oct 22, 2026).** There's no mainnet. Blockula 1.0 is a kit for launching your own light, quantum-safe ledger on machines you already have ([LAUNCH.md](LAUNCH.md)): `blockula summon --host` starts a chain other machines can reach, friends join, and the chain's admin approves new validators. Each chain's FANG has no value. The public testnet stays up as the demo, and its Hunts pay test FANG. Programs are optional: built into the node, switched off, with no deadline.
+**The direction (decided Oct 22, 2026).** There's no mainnet. Blockula 1.0 is a kit for launching your own light, quantum-safe ledger on machines you already have ([CREATE.md](CREATE.md)): `blockula summon --host` starts a chain other machines can reach, friends join, and the chain's admin approves new validators. Each chain's FANG has no value. The public testnet stays up as the demo, and its Hunts pay test FANG. Programs are optional: built into the node, switched off, with no deadline.
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -170,7 +170,7 @@ Next:
 | 1.5 | GitHub linking ✅ (on-chain claim + node-side gist check), Hunts v0 ✅ (escrow, crowdfunding, award/cancel/refund on-chain, `blockula hunt award` checks the merge), Familiars ✅ (registered agent session keys credited on awards and allowed to claim), validator-attested GitHub facts ✅, MCP contribution tools ✅. Remaining: acceptance-test Hunts | mostly done |
 | 2 | Proof of Contribution v1 ✅: Souls, vouching, claims, Séances (commit-reveal pairwise juries), contribution pool with per-sponsor ranked payouts, vesting and clawback. Validator revert checks ✅, a commit-reveal beacon for jury draws ✅, Ghost Mode ✅ (built, off until governance activates it). Remaining: a juror UI in the web wallet, Covens and Seasons, jury-run sybil flags, viewing keys, The Crypt, proof aggregation | in progress |
 | 3 | Built and integrated: permissionless staking with delegation, slashing and jailing ✅, issuance, the base-fee market and vesting ✅, governance (conviction voting, bootstrap council, treasury, distributions, multisig) ✅, height-gated upgrades and slashing protection ✅, sync trust tables ✅. Remaining: repo budgets and fork royalties. The audits, incentivized testnet and genesis ceremony a value-bearing mainnet needed were dropped with it | code side done |
-| Kit (1.0) | Launching your own ledger: `summon --host`, 5-second default blocks, `faucet --to`, `send --key` and the guide ✅ ([LAUNCH.md](LAUNCH.md)). Next: blocks only when there are transactions (a protocol change), a guided launch on the web, and an optional mode without a unit | in progress |
+| Kit (1.0) | Launching your own ledger: `summon --host`, 5-second default blocks, `faucet --to`, `send --key` and the guide ✅ ([CREATE.md](CREATE.md)). Next: blocks only when there are transactions (a protocol change), a guided launch on the web, and an optional mode without a unit | in progress |
 | 4 | Third-party programs, optional (protocol v2: [PROGRAMS.md](PROGRAMS.md), planned in [PROGRAMS-PLAN.md](PROGRAMS-PLAN.md); built in and switched off), light clients, STARK signature aggregation | no deadline |
 
 ## Known limits

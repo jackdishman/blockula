@@ -12,7 +12,7 @@
 > [AUDIT_SCOPE.md](AUDIT_SCOPE.md#programs-optional-off-by-default) the external audit's scope.
 
 > **Update, 2026-10-22: there's no mainnet.** Blockula 1.0 is a kit for launching your own ledger
-> ([LAUNCH.md](LAUNCH.md)), and programs are an optional feature with no deadline: built into the
+> ([CREATE.md](CREATE.md)), and programs are an optional feature with no deadline: built into the
 > node and switched off. What this design says about going live on mainnet (D2, 14.3, section 16)
 > is dropped. MAINNET.md, LAUNCH-PLAN.md and COUNSEL_BRIEF.md, which it cited, were removed with
 > the mainnet plan.

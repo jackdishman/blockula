@@ -1,14 +1,14 @@
 # 🧛 Blockula
 
-**Launch your own quantum-safe ledger in a minute.** Name it, give it a ticker, choose who can reach it, and it's running on your machine, with an explorer you can install on your Mac or iPhone and one command your friends run to join. Post-quantum signatures throughout, on computers you already have: no hosting to pay for and nothing to buy.
+**Run your own quantum-safe blockchain in a minute.** Name it, give it a ticker, choose who can reach it, and it's running on your machine, with an explorer you can install on your Mac or iPhone and one command your friends run to join. Post-quantum signatures throughout, on computers you already have: no hosting to pay for and nothing to buy.
 
 ```bash
 curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh
-blockula launch
+blockula create
 ```
 
 ```text
-🦇 Launch your own ledger. Press Enter to keep a [default].
+🦇 Create your own chain. Press Enter to keep a [default].
 
 1/4  Name it
   Chain name: Jack in the Block
@@ -29,7 +29,7 @@ blockula launch
    For friends:   blockula join --genesis http://100.64.0.7:7070 --genesis-hash cc5b… --home ~/.blockula/jack-in-the-block
 ```
 
-The whole walk-through, with friends joining and becoming validators: **[docs/LAUNCH.md](docs/LAUNCH.md)**. Chains open to everyone can be listed on [blockula.app](https://blockula.app), where others join them or run a validator: [chains/README.md](chains/README.md).
+The whole walk-through, with friends joining and becoming validators: **[docs/CREATE.md](docs/CREATE.md)**. Chains open to everyone can be listed on [blockula.app](https://blockula.app), where others join them or run a validator: [chains/README.md](chains/README.md).
 
 ## What you get
 
@@ -41,7 +41,7 @@ The whole walk-through, with friends joining and becoming validators: **[docs/LA
 - **Quantum-safe.** Every account, vote and block is signed with **ML-DSA-65** (NIST FIPS 204); validators key their channels with hybrid X25519 + **ML-KEM-768**; hashes are BLAKE3-256.
 - **Complete.** Accounts with several keys and spending limits for agents, readable `.boo` names, staking, governance, and optional WebAssembly programs (experimental, off by default).
 
-**Its unit has no value.** Each chain's unit (FANG, or the ticker you give it; 10⁹ drops each) is handed out by its faucet so every transaction pays a tiny fee, which keeps spam expensive. Nobody sells it, buys it or gets paid in it. Blockula isn't launching a mainnet or selling a token: it's software for running your own ledger.
+**Its unit has no value.** Each chain's unit (FANG, or the ticker you give it; 10⁹ drops each) is handed out by its faucet so every transaction pays a tiny fee, which keeps spam expensive. Nobody sells it, buys it or gets paid in it. Blockula has no mainnet and sells no token: it's software for running your own ledger.
 
 ## Try it alone first
 
@@ -49,7 +49,7 @@ The whole walk-through, with friends joining and becoming validators: **[docs/LA
 blockula dev        # a throwaway one-node chain with a faucet, 1-second blocks, explorer at http://localhost:7070
 ```
 
-Or `blockula launch` and pick **Just this machine**: a chain you keep, that only you can reach.
+Or `blockula create` and pick **Just this machine**: a chain you keep, that only you can reach.
 
 ## Apps
 
@@ -89,7 +89,7 @@ In the browser a passkey unlocks the wallet, with no seed phrase: `createPasskey
 
 | | |
 |---|---|
-| [LAUNCH.md](docs/LAUNCH.md) | Launch a chain, friends join and become validators, apps, costs |
+| [CREATE.md](docs/CREATE.md) | Create a chain, friends join and become validators, apps, costs |
 | [BUILD-ON-IT.md](docs/BUILD-ON-IT.md) | Claude, custom apps, the SDK and programs, HTTPS, a wallet link for friends |
 | [USE-CASES.md](docs/USE-CASES.md) | Eight things to do on a small chain |
 | [RUN-A-NODE.md](docs/RUN-A-NODE.md) | A full node or a validator as a service, and using your own node |
@@ -101,7 +101,7 @@ In the browser a passkey unlocks the wallet, with no seed phrase: `createPasskey
 ## Layout
 
 ```
-node/     The node and the `blockula` CLI (Rust): launch, consensus, execution, HTTP API, the explorer
+node/     The node and the `blockula` CLI (Rust): create, consensus, execution, HTTP API, the explorer
 web/      The passkey web wallet (Next.js), also an explorer
 sdk-ts/   @blockula/sdk: wallets, signing, the client, passkeys
 mcp/      @blockula/mcp: the MCP server for coding agents

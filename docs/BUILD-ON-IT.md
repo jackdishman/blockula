@@ -1,8 +1,8 @@
 # Build on your chain
 
-You [launched a chain](LAUNCH.md). This page makes it yours: talk to it from Claude, change its apps, extend it, put it online, and give friends a link they can use. Each task has a short version first, and the details after.
+You [made a chain](CREATE.md). This page makes it yours: talk to it from Claude, change its apps, extend it, put it online, and give friends a link they can use. Each task has a short version first, and the details after.
 
-Below, `<node>` is the URL of one of your chain's nodes (`http://localhost:7070` on the machine that runs it, `https://<machine>.<tailnet>.ts.net` once it's [on HTTPS](#4-put-it-online)). Your chain id and genesis hash are in `~/.blockula/<chain id>/LAUNCH.md`, or:
+Below, `<node>` is the URL of one of your chain's nodes (`http://localhost:7070` on the machine that runs it, `https://<machine>.<tailnet>.ts.net` once it's [on HTTPS](#4-put-it-online)). Your chain id and genesis hash are in `~/.blockula/<chain id>/README.md`, or:
 
 ```bash
 curl -s <node>/api/status | grep -oE '"(chain_id|genesis_hash)":"[^"]*"'
@@ -156,7 +156,7 @@ Amounts are strings in units (`"1.5"`), never JS numbers. In the browser, `creat
 
 **The HTTP API.** Every node serves it at `<node>/api/…`: status, blocks, transactions, accounts, names, fees, validators, proposals, Hunts and more. The table is in [AGENTS.md](../AGENTS.md#http-api-node-default-httplocalhost7070). Any origin may call it (CORS is open), and reads are rate-limited per IP.
 
-**Programs** are WebAssembly programs anyone on your chain can upload and call. They're experimental and off unless your chain was made with them (`blockula launch --programs`) or a vote switched them on ([LAUNCH.md](LAUNCH.md#programs-experimental-off-by-default)). The repo has a small counter to try:
+**Programs** are WebAssembly programs anyone on your chain can upload and call. They're experimental and off unless your chain was made with them (`blockula create --programs`) or a vote switched them on ([CREATE.md](CREATE.md#programs-experimental-off-by-default)). The repo has a small counter to try:
 
 ```bash
 blockula program upload node/vm/tests/programs/counter.wasm --interface node/vm/tests/programs/counter.iface.json --key ~/.blockula/<chain id>/validator.key
@@ -181,7 +181,7 @@ The parameters are at `<node>/api/params`, and who may change which is in [GOVER
 
 Every node already serves the explorer and the API at port 7070. To put them on HTTPS:
 
-**Tailscale Serve (your tailnet only).** `blockula launch --https` does this for you. Turn on HTTPS certificates in the Tailscale admin console first, then:
+**Tailscale Serve (your tailnet only).** `blockula create --https` does this for you. Turn on HTTPS certificates in the Tailscale admin console first, then:
 
 ```bash
 tailscale serve --bg 7070       # https://<machine>.<tailnet>.ts.net, for everyone on your tailnet
@@ -260,15 +260,15 @@ The same build runs on any Node.js host (`npm run start -w @blockula/web`, behin
 
 ### The project site
 
-https://blockula.app is a build of the same app with `NEXT_PUBLIC_SITE=project`: Blockula's landing page rather than a wallet. Its "Try the demo" section reads a demo chain (`NEXT_PUBLIC_DEMO_NODE`, a node made with `blockula launch` and put online over HTTPS) and sends visitors to that node's own wallet, `<node>/wallet/`. Its "Connect to any chain" field opens any node's wallet the same way. [web/README.md, "The project site"](../web/README.md#the-project-site) has the variables.
+https://blockula.app is a build of the same app with `NEXT_PUBLIC_SITE=project`: Blockula's landing page rather than a wallet. Its "Try the demo" section reads a demo chain (`NEXT_PUBLIC_DEMO_NODE`, a node made with `blockula create` and put online over HTTPS) and sends visitors to that node's own wallet, `<node>/wallet/`. Its "Connect to any chain" field opens any node's wallet the same way. [web/README.md, "The project site"](../web/README.md#the-project-site) has the variables.
 
 ## 6. Invite friends and validators
 
-[LAUNCH.md](LAUNCH.md) has the steps; send friends the parts they need:
+[CREATE.md](CREATE.md) has the steps; send friends the parts they need:
 
-- **Join with a full node:** [Friends join](LAUNCH.md#2-friends-join).
-- **Become a validator:** [Friends become validators](LAUNCH.md#3-friends-become-validators). On Tailscale, use your node's HTTPS name for `--rpc` ([why](#4-put-it-online)).
-- **How many, and who may join:** [How many validators?](LAUNCH.md#how-many-validators) and [Who can join?](LAUNCH.md#who-can-join).
+- **Join with a full node:** [Friends join](CREATE.md#2-friends-join).
+- **Become a validator:** [Friends become validators](CREATE.md#3-friends-become-validators). On Tailscale, use your node's HTTPS name for `--rpc` ([why](#4-put-it-online)).
+- **How many, and who may join:** [How many validators?](CREATE.md#how-many-validators) and [Who can join?](CREATE.md#who-can-join).
 - **Ideas for what to do together:** [USE-CASES.md](USE-CASES.md).
 
 ## 7. Contributors: paste this into your coding agent

@@ -1,6 +1,6 @@
 # Operating Blockula
 
-For validator operators, sentry and RPC operators, and the release and incident teams, on a chain you launch or join ([LAUNCH.md](LAUNCH.md)). Examples that name `blockula-testnet-2` come from the public testnet, which ran from October to November 2026. It follows the protocol's design in [MAINNET-DESIGN.md](MAINNET-DESIGN.md) (DEC-3, DEC-14, section 3.9). Ids like OPS-7 or SF-13 are items of the mainnet readiness list it was first written against (MAINNET-DESIGN.md's note says where to read it).
+For validator operators, sentry and RPC operators, and the release and incident teams, on a chain you make or join ([CREATE.md](CREATE.md)). Examples that name `blockula-testnet-2` come from the public testnet, which ran from October to November 2026. It follows the protocol's design in [MAINNET-DESIGN.md](MAINNET-DESIGN.md) (DEC-3, DEC-14, section 3.9). Ids like OPS-7 or SF-13 are items of the mainnet readiness list it was first written against (MAINNET-DESIGN.md's note says where to read it).
 
 New to running a node? Start with [RUN-A-NODE.md](RUN-A-NODE.md): a full node at home or on a small server, connecting your wallet, SDK, MCP and CLI to it, and becoming a validator, sized for today's network. This document is the reference for running validators professionally.
 
@@ -50,7 +50,7 @@ A validator's HTTP API locks the same state the consensus engine uses, so a publ
 ## Validator set and hosting policy
 
 - **Active-set cap: 32 by default** (`max_validators`, DEC-3). Votes are equal-weight; the set is the top 32 candidates by pool stake. The cap rises by governance once certificates shrink: a ⅔ certificate is ~73 KB at n = 32 and every validator re-broadcasts two per view (see [Bandwidth](#bandwidth)).
-- **Independence is the security budget.** Halting the chain takes ⌊(n−1)/3⌋+1 validators (11 of 32). The mainnet's design asked for 21–32 independent operators at genesis; a chain you launch with friends is as safe as the people who run its validators.
+- **Independence is the security budget.** Halting the chain takes ⌊(n−1)/3⌋+1 validators (11 of 32). The mainnet's design asked for 21–32 independent operators at genesis; a chain you run with friends is as safe as the people who run its validators.
 - **No hosting provider, ASN or jurisdiction above ¼ of the active set** (8 of 32), always below ⅓ (DEC-14). Genesis operators declare provider, ASN and jurisdiction in their operator files, and the genesis builder checks the caps; after genesis the chain can't see where nodes run, so whoever coordinates its operators keeps the count and asks operators in an over-represented provider, ASN or jurisdiction to move. Count by the ASN that actually routes the validator's IP (`whois -h whois.radb.net <ip>` or `curl ipinfo.io/<ip>/org`), not the reseller's brand.
 - **Recommended providers, mixed.** Bare metal and dedicated servers give unmetered or generously included bandwidth and predictable disks:
   - Latitude.sh, OVHcloud, Cherry Servers, Hetzner (dedicated). **Hetzner:** its terms have restricted crypto workloads before (mining is banned, and some blockchain node operators have been asked to leave); every operator must check the current terms and get written confirmation before running a validator there.
@@ -213,7 +213,7 @@ sudo install -d -o blockula -g blockula -m 700 /var/lib/blockula
 ```
 
 2. **Install a verified binary**, as your own user with `gh auth login` done: [a first install](#a-first-install) (paste the block there). It checks the archive against the release announcement in the operators' channel, then the release's offline signature against the release key id, which it pins in `~/.blockula/release-key-id`. Every later upgrade is checked against that pin ([Upgrading](#upgrading)). Nothing the release ships, its `install.sh` included, runs before those checks pass.
-3. **The genesis file and the validator home.** Take the genesis file from the signed release, checked against the pinned key, not from a node: `blockula release fetch` puts only files that match the release's signed `checksums.txt` into `genesis-$V`. Releases ship the retired public testnet's (`genesis-blockula-testnet-2.json`); for a chain someone launched, take its genesis hash from its creator and pin it ([LAUNCH.md](LAUNCH.md)). Then `validator init` creates the validator home and its consensus key.
+3. **The genesis file and the validator home.** Take the genesis file from the signed release, checked against the pinned key, not from a node: `blockula release fetch` puts only files that match the release's signed `checksums.txt` into `genesis-$V`. Releases ship the retired public testnet's (`genesis-blockula-testnet-2.json`); for a chain someone launched, take its genesis hash from its creator and pin it ([CREATE.md](CREATE.md)). Then `validator init` creates the validator home and its consensus key.
 
 <!-- runbook-test: validator-genesis -->
 ```bash
@@ -229,7 +229,7 @@ sudo install -d -o blockula -g blockula -m 700 /var/lib/blockula
 
 Each block runs in a subshell with `set -euo pipefail`, so it stops at the first command that fails: fill in the `<…>` values, paste it whole, and nothing after a failed check runs. The blocks hold no comments, so they paste the same into bash and zsh. `scripts/test-release-runbook.sh` runs them as they're written here (CI).
 
-A chain's first validators make their keys before its genesis exists instead: `blockula summon` does it for a chain you launch ([LAUNCH.md](LAUNCH.md)), and a chain built from a reviewed spec holds a [genesis ceremony](GENESIS_CEREMONY.md), with each home built from the published `genesis.json` (verify its hash).
+A chain's first validators make their keys before its genesis exists instead: `blockula summon` does it for a chain you make ([CREATE.md](CREATE.md)), and a chain built from a reviewed spec holds a [genesis ceremony](GENESIS_CEREMONY.md), with each home built from the published `genesis.json` (verify its hash).
 
 Run it under systemd:
 
@@ -372,7 +372,7 @@ The public testnet (`blockula-testnet-2`, until it was retired in November 2026)
 
 ## Programs (optional, off by default)
 
-Programs are small WebAssembly programs that anyone can upload and run on a chain ([PROGRAMS-V0.md](PROGRAMS-V0.md) is the specification). A chain has none unless it was made with them (`blockula summon --programs`, `blockula dev --programs`: [LAUNCH.md](LAUNCH.md#programs-experimental-off-by-default)) or its governance switched them on ([GOVERNANCE.md](GOVERNANCE.md#programs-optional-off-by-default)). On a chain without them nothing here applies: the node computes what it always did, and exits 13 and 14 never happen. This section is for the operators of a chain that has them. It's an experiment, and the people running the validators carry the consequences of it.
+Programs are small WebAssembly programs that anyone can upload and run on a chain ([PROGRAMS-V0.md](PROGRAMS-V0.md) is the specification). A chain has none unless it was made with them (`blockula summon --programs`, `blockula dev --programs`: [CREATE.md](CREATE.md#programs-experimental-off-by-default)) or its governance switched them on ([GOVERNANCE.md](GOVERNANCE.md#programs-optional-off-by-default)). On a chain without them nothing here applies: the node computes what it always did, and exits 13 and 14 never happen. This section is for the operators of a chain that has them. It's an experiment, and the people running the validators carry the consequences of it.
 
 ### What a chain takes on
 

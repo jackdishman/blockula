@@ -12,10 +12,11 @@ import { useWallet } from "@/lib/wallet";
 
 export const REPO = "https://github.com/jackdishman/blockula";
 export const INSTALL = `curl -fsSL ${REPO}/releases/latest/download/install.sh | sh`;
-const LAUNCH = "blockula launch";
+const CREATE = "blockula create";
 const DEV = "blockula dev";
 const BUILD_ON_IT = `${REPO}/blob/main/docs/BUILD-ON-IT.md`;
-export const LAUNCH_GUIDE = `${REPO}/blob/main/docs/LAUNCH.md`;
+/** The guide to starting a chain of your own and inviting friends. */
+export const CHAIN_GUIDE = `${REPO}/blob/main/docs/CREATE.md`;
 
 const LOCAL = /^(localhost|127\.0\.0\.1|\[::1\])$/;
 const isLocalUrl = (u: string) => {
@@ -77,7 +78,7 @@ export function Landing() {
           </>
         ) : (
           <>
-            <h1>Launch your own quantum-safe ledger</h1>
+            <h1>Start your own quantum-safe ledger</h1>
             <p className="lead">One command names a chain and starts it on your machine. Friends&apos; computers join it.</p>
           </>
         )}
@@ -86,11 +87,11 @@ export function Landing() {
       {down && (
         <section className="card stack" data-testid="landing-no-chain">
           <h2>No chain is running here yet</h2>
-          <p className="dim">Install Blockula and launch one (macOS and Linux):</p>
+          <p className="dim">Install Blockula and start one (macOS and Linux):</p>
           <Command text={INSTALL} />
-          <Command text={LAUNCH} />
+          <Command text={CREATE} />
           <p className="dim small">
-            Or <code>{DEV}</code> for a throwaway one to try things on. Then reload this page. <a href={LAUNCH_GUIDE}>The launch guide</a> has the rest.
+            Or <code>{DEV}</code> for a throwaway one to try things on. Then reload this page. <a href={CHAIN_GUIDE}>The guide</a> has the rest.
           </p>
         </section>
       )}
@@ -128,7 +129,7 @@ export function Landing() {
       </section>
 
       <section className="stack" aria-labelledby="uses">
-        <h2 id="uses">What a small chain is good for</h2>
+        <h2 id="uses">What a chain of your own is good for</h2>
         <div className="landing-uses">
           {USES.map((u) => (
             <div key={u.title} className="landing-use">
@@ -173,7 +174,7 @@ function Programs({ on }: { on: boolean | undefined }) {
   return (
     <span className="landing-programs" data-state={on === false ? "off" : "unknown"}>
       {on === false ? "Programs are off on this chain. " : "WebAssembly programs are off unless a chain is made with them. "}
-      A new chain gets them with <code>blockula launch --programs</code> (or <code>blockula dev --programs</code>); an existing one only by a governance vote.
+      A new chain gets them with <code>blockula create --programs</code> (or <code>blockula dev --programs</code>); an existing one only by a governance vote.
     </span>
   );
 }
@@ -225,7 +226,7 @@ function ServedInvite() {
           </p>
           <Command text={`tailscale serve --bg ${port}`} />
           <p className="dim small">
-            Then send them <code>https://&lt;this machine&gt;.&lt;your tailnet&gt;.ts.net/wallet/</code>: they open it, make a passkey wallet and can pay right away. <code>blockula launch</code> offers to set this up (Tailscale, then HTTPS). <a href={LAUNCH_GUIDE}>Other ways to reach each other</a>.
+            Then send them <code>https://&lt;this machine&gt;.&lt;your tailnet&gt;.ts.net/wallet/</code>: they open it, make a passkey wallet and can pay right away. <code>blockula create</code> offers to set this up (Tailscale, then HTTPS). <a href={CHAIN_GUIDE}>Other ways to reach each other</a>.
           </p>
         </>
       ) : (
@@ -281,7 +282,7 @@ function HostedInvite() {
           <Command text={INSTALL} />
           <Command text={join} label="Copy join command" />
           <p className="dim small">
-            Then they run the wallet against their node (<a href={LAUNCH_GUIDE}>Apps, in the launch guide</a>). Serve this wallet over HTTPS on your tailnet and this box becomes a link to share.
+            Then they run the wallet against their node (<a href={CHAIN_GUIDE}>Apps, in the guide</a>). Serve this wallet over HTTPS on your tailnet and this box becomes a link to share.
           </p>
         </>
       )}
@@ -304,7 +305,7 @@ function ValidatorSteps({ node }: { node: string }) {
       <p className="dim small">Then you approve it, and it starts taking turns at the next epoch:</p>
       <Command text={`blockula validator approve <validator address> --key ~/.blockula/${id}/validator.key --rpc http://localhost:7070`} />
       <p className="dim small">
-        <code>~/.blockula/{id}/LAUNCH.md</code> on your machine has these with your addresses filled in.
+        <code>~/.blockula/{id}/README.md</code> on your machine has these with your addresses filled in.
       </p>
     </details>
   );

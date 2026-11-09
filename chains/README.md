@@ -6,7 +6,7 @@ The project doesn't run, check or vouch for these chains. Their coins have no va
 
 ## List your chain
 
-`blockula launch` prints a **List it on blockula.app** link when your chain can be reached from the internet. It opens GitHub's new-file page with this file filled in. Fill in `contact`, check the rest, and open the pull request. By hand:
+`blockula create` prints a **List it on blockula.app** link when your chain can be reached from the internet. It opens GitHub's new-file page with this file filled in. Fill in `contact`, check the rest, and open the pull request. By hand:
 
 ```json
 {

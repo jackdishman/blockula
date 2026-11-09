@@ -47,7 +47,7 @@ test("a first visit to / shows this chain and the get-started path", async ({ pa
   await expect(main).toContainText("can be changed with Claude Code");
   // Programs are off here (no `fuel` in /api/fees), and the step says how a chain gets them.
   await expect(page.getByTestId("step-programs").locator(".landing-programs")).toHaveAttribute("data-state", "off");
-  await expect(page.getByTestId("step-programs")).toContainText("blockula launch --programs");
+  await expect(page.getByTestId("step-programs")).toContainText("blockula create --programs");
   await expect(main.getByRole("link", { name: "Programs", exact: true })).toHaveCount(0);
 
   // The invite: the wallet runs on localhost, so it says a link wouldn't open elsewhere, and gives the join command for this chain.
@@ -99,9 +99,9 @@ test("on a chain with programs on, the program step gives the CLI's calls", asyn
 test("with no node answering, it shows how to start a chain", async ({ page }) => {
   await page.route(`${RPC}/api/**`, (r) => r.abort());
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Launch your own quantum-safe ledger" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Start your own quantum-safe ledger" })).toBeVisible();
   const none = page.getByTestId("landing-no-chain");
-  await expect(none.locator(".landing-cmd code")).toHaveText([INSTALL, "blockula launch"]);
+  await expect(none.locator(".landing-cmd code")).toHaveText([INSTALL, "blockula create"]);
   await expect(none).toContainText("blockula dev");
   // Labels without numbers, and placeholders in the prompt.
   await expect(page.getByTestId("flow-issuance")).toContainText("New coins each epoch");

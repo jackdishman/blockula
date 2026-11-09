@@ -1,6 +1,6 @@
 # Blockula wallet (web)
 
-The passkey wallet, and an explorer, for a chain you [launched](../docs/LAUNCH.md). A passkey unlocks an ML-DSA-65 key that lives only in the tab's memory; the account is a list of owner and session keys on-chain (see the root README).
+The passkey wallet, and an explorer, for a chain you [made](../docs/CREATE.md). A passkey unlocks an ML-DSA-65 key that lives only in the tab's memory; the account is a list of owner and session keys on-chain (see the root README).
 
 Every node serves it at `/wallet/` (`http://localhost:7070/wallet/`): the binary embeds a static export of this app, so a friend needs only the link. Its node is the page's origin, its passkey domain the page's host name, its chain the one that node reports (pinned on first use, as for a custom node), and it has no network picker.
 
@@ -37,20 +37,20 @@ With none of these set, the wallet starts on a node on this machine (`http://loc
 | `NEXT_PUBLIC_BLOCKULA_RPC` | (unset) | Your node's URL, `https://` for a hosted wallet: adds the network and makes it the default |
 | `NEXT_PUBLIC_TESTNET_CHAIN_ID` | `blockula-testnet-2` | Your chain id: the node must report it |
 | `NEXT_PUBLIC_TESTNET_GENESIS_HASH` | the retired testnet's | Your chain's genesis hash: the node must report it |
-| `NEXT_PUBLIC_TESTNET_PREFIX` | `tboo` | The address prefix: `boo` for a chain made with `blockula launch` or `summon` |
+| `NEXT_PUBLIC_TESTNET_PREFIX` | `tboo` | The address prefix: `boo` for a chain made with `blockula create` or `summon` |
 | `NEXT_PUBLIC_TESTNET_WITNESSES` | (unset) | Comma-separated `https://` URLs of other nodes of your chain. Names that end up in a signature are proven against them first (audit gap-7-1); without any, a name is the selected node's word and the wallet says so |
 
-The values come from `~/.blockula/<chain id>/LAUNCH.md` or `curl -s <node>/api/status` (`chain_id`, `genesis_hash`, `address_prefix`).
+The values come from `~/.blockula/<chain id>/README.md` or `curl -s <node>/api/status` (`chain_id`, `genesis_hash`, `address_prefix`).
 
 ### The project site
 
-`NEXT_PUBLIC_SITE=project` builds Blockula's own landing page (https://blockula.app) instead of a wallet: `/` is the project's page (`components/site/`), and every other route redirects to it (`proxy.ts`). It has no network picker, no wallet and no chain gate. It shows a live demo chain, opens any node's own wallet (`<node>/wallet/`) from an address a visitor pastes, lists the chains in the repo's chain directory ("Join a chain", `components/site/Chains.tsx`), and has the launch and contributor prompts. It follows the system's light or dark (`app/site.css`, scoped to `html[data-site]`, so the wallet builds look as before).
+`NEXT_PUBLIC_SITE=project` builds Blockula's own landing page (https://blockula.app) instead of a wallet: `/` is the project's page (`components/site/`), and every other route redirects to it (`proxy.ts`). It has no network picker, no wallet and no chain gate. It shows a live demo chain, opens any node's own wallet (`<node>/wallet/`) from an address a visitor pastes, lists the chains in the repo's chain directory ("Join a chain", `components/site/Chains.tsx`), and has the create-a-chain and contributor prompts. It follows the system's light or dark (`app/site.css`, scoped to `html[data-site]`, so the wallet builds look as before).
 
 | Variable | Default | |
 |---|---|---|
 | `NEXT_PUBLIC_SITE` | (unset) | `project` makes the project site. Any other value fails the build, and so does combining it with the served build or `NEXT_PUBLIC_NETWORK=mainnet` |
 | `BLOCKULA_CHAINS_DIR` | `../chains` | The chain directory the site lists. `next.config.ts` reads its `<chain id>.json` files at build time, checks them with `lib/chains.ts` (the rules `scripts/check-chains.mjs` runs in CI; a bad listing fails the build) and hands them to the page as `BLOCKULA_SITE_CHAINS`. Each listed `rpc` origin joins the CSP's `connect-src`, so a new listing needs a new deploy. The e2e builds point it at `e2e/fixtures/` |
-| `NEXT_PUBLIC_DEMO_NODE` | (unset) | The demo chain's node: `https://` (plain `http://` only for this machine or a private network, as for the connect field). The page reads its `/api/status` and `/api/blocks` from the browser (nodes send permissive CORS), shows its name, height, validators and newest blocks, links its wallet (`<node>/wallet/`), explorer and invite page, and gives the agent prompt pinned to it. The CSP's `connect-src` allows this origin and the listed chains' nodes, nothing else. Unset, or not answering, the demo section says the demo is resting and points at launching your own. A malformed value fails the build |
+| `NEXT_PUBLIC_DEMO_NODE` | (unset) | The demo chain's node: `https://` (plain `http://` only for this machine or a private network, as for the connect field). The page reads its `/api/status` and `/api/blocks` from the browser (nodes send permissive CORS), shows its name, height, validators and newest blocks, links its wallet (`<node>/wallet/`), explorer and invite page, and gives the agent prompt pinned to it. The CSP's `connect-src` allows this origin and the listed chains' nodes, nothing else. Unset, or not answering, the demo section says the demo is resting and points at creating your own. A malformed value fails the build |
 
 ```sh
 NEXT_PUBLIC_SITE=project NEXT_PUBLIC_DEMO_NODE=https://demo.example npm run build -w @blockula/web
@@ -58,7 +58,7 @@ NEXT_PUBLIC_SITE=project NEXT_PUBLIC_DEMO_NODE=https://demo.example npm run buil
 
 The demo node must serve the wallet over HTTPS on a hostname of its own (passkeys are bound to it): `tailscale funnel 7070`, or a VPS behind Caddy ([docs/BUILD-ON-IT.md, "Put it online"](../docs/BUILD-ON-IT.md#4-put-it-online)). `e2e/site.spec.ts` and `e2e/site-nodemo.spec.ts` test both builds against a mocked demo node.
 
-**The chain directory.** Each card reads its node's `/api/status` and `/api/validators` from the browser every half minute: live, resting (not answering), or refused when the node reports another chain id or genesis hash than its listing (no wallet button then). A chain with `validators_wanted` gets **Become a validator**: the steps of [docs/RUN-A-NODE.md, "Validate someone else's chain"](../docs/RUN-A-NODE.md#validate-someone-elses-chain) with its node, genesis hash and home filled in, and the way in its set needs (admission, approval or stake). With no listings it shows how to launch and list one. Listing rules: [chains/README.md](../chains/README.md). `e2e/site-chains.spec.ts` tests it against the fixture listings in `e2e/fixtures/chains/`.
+**The chain directory.** Each card reads its node's `/api/status` and `/api/validators` from the browser every half minute: live, resting (not answering), or refused when the node reports another chain id or genesis hash than its listing (no wallet button then). A chain with `validators_wanted` gets **Become a validator**: the steps of [docs/RUN-A-NODE.md, "Validate someone else's chain"](../docs/RUN-A-NODE.md#validate-someone-elses-chain) with its node, genesis hash and home filled in, and the way in its set needs (admission, approval or stake). With no listings it shows how to create and list one. Listing rules: [chains/README.md](../chains/README.md). `e2e/site-chains.spec.ts` tests it against the fixture listings in `e2e/fixtures/chains/`.
 
 ### Mainnet build mode (unused)
 

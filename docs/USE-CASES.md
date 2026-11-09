@@ -1,6 +1,6 @@
 # What to do with your chain
 
-A small chain run by friends, a club, a class or a team. Here are eight things people can do on one today, with the first commands to try. Each assumes a chain [you launched](LAUNCH.md), and `<node>` is one of its nodes (`http://localhost:7070` on the machine that runs it).
+A small chain run by friends, a club, a class or a team. Here are eight things people can do on one today, with the first commands to try. Each assumes a chain [you made](CREATE.md), and `<node>` is one of its nodes (`http://localhost:7070` on the machine that runs it).
 
 The unit has no value on any of them. It's how the chain counts and charges fees, not money.
 
@@ -22,15 +22,15 @@ Then open `<node>/#/account/alex.boo` to see everything Alex sent and got.
 ## 2. A class that runs its own blockchain
 
 **Who:** a teacher and students, each with a laptop.
-**What:** the teacher launches a chain; every student joins with a full node, and four of them become validators. Close one validator's laptop and the chain keeps going; close two and it stops until one comes back. Everyone sees the same blocks in their own explorer.
+**What:** the teacher creates a chain; every student joins with a full node, and four of them become validators. Close one validator's laptop and the chain keeps going; close two and it stops until one comes back. Everyone sees the same blocks in their own explorer.
 **Uses:** full nodes, validators, consensus, the explorer.
 
 ```bash
-blockula launch --name "CS 101 Chain" --token CS --reach home --yes       # the teacher
+blockula create --name "CS 101 Chain" --token CS --reach home --yes       # the teacher
 blockula join --genesis http://<teacher's address>:7070 --genesis-hash <hash> --home ~/.blockula/cs-101-chain   # each student
 ```
 
-The validator steps are in [LAUNCH.md](LAUNCH.md#3-friends-become-validators). `<node>/#/validators` shows who's making blocks and who missed turns.
+The validator steps are in [CREATE.md](CREATE.md#3-friends-become-validators). `<node>/#/validators` shows who's making blocks and who missed turns.
 
 ## 3. A club that votes
 
@@ -102,7 +102,7 @@ await wallet.send("alice.boo", "1", { memo: "great demo" });
 **Uses:** programs.
 
 ```bash
-blockula launch --name "Program Lab" --token LAB --reach local --programs --yes
+blockula create --name "Program Lab" --token LAB --reach local --programs --yes
 blockula program upload node/vm/tests/programs/counter.wasm --interface node/vm/tests/programs/counter.iface.json --key ~/.blockula/program-lab/validator.key
 ```
 

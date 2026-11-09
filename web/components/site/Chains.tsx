@@ -3,7 +3,7 @@
 import { useEffect, useId, useState, type ReactNode } from "react";
 import { Command, INSTALL, REPO } from "@/components/Landing";
 import { Copy } from "@/components/ui";
-import { contactUrl, listingJson, listingLink, units, type ListedChain } from "@/lib/chains";
+import { contactUrl, listingJson, listingLink, projectRun, units, type ListedChain } from "@/lib/chains";
 import { SITE_CHAINS } from "@/lib/config";
 import { CONTRIBUTE_PROMPT, walletOf } from "@/lib/site";
 
@@ -99,7 +99,9 @@ export function ChainsSection() {
               <ChainCard key={c.chain_id} chain={c} />
             ))}
           </ul>
-          <p className="center dim small site-chains-note">The project doesn&apos;t run or check these chains. A node decides what its chain looks like to you, and the coins have no value.</p>
+          <p className="center dim small site-chains-note">
+            {SITE_CHAINS.some((c) => projectRun(c.rpc)) ? "Apart from the ones marked as run by the project, the project doesn't run or check these chains." : "The project doesn't run or check these chains."} A node decides what its chain looks like to you, and the coins have no value.
+          </p>
         </>
       ) : (
         <Empty />
@@ -117,15 +119,15 @@ function Empty() {
     <div className="card plate site-chains-empty stack" data-testid="chains-empty">
       <div className="center">
         <h3 className="site-h3">No chains listed yet</h3>
-        <p className="dim">Launch one and list it: yours would be the first.</p>
+        <p className="dim">Start one and list it: yours would be the first.</p>
       </div>
       <ol className="site-list">
-        <li>Launch it, reached over <b>the open internet</b> (or Tailscale Funnel, for wallets only).</li>
+        <li>Start it, reached over <b>the open internet</b> (or Tailscale Funnel, for wallets only).</li>
         <li>Serve it over HTTPS on a name of its own, so wallets can make passkeys.</li>
-        <li>Open the <b>List it on blockula.app</b> link <code>blockula launch</code> prints, and send the pull request.</li>
+        <li>Open the <b>List it on blockula.app</b> link <code>blockula create</code> prints, and send the pull request.</li>
       </ol>
       <Command text={INSTALL} />
-      <Command text="blockula launch" />
+      <Command text="blockula create" />
     </div>
   );
 }
@@ -136,7 +138,7 @@ function ListYours() {
       <span className="eyebrow">List your chain</span>
       <h3 className="site-h3">One file, one pull request</h3>
       <p className="dim small">
-        A chain gets a card here from a file in the repo, <code>chains/&lt;chain id&gt;.json</code>. It needs an <code>https://</code> node anyone can reach. <code>blockula launch</code> prints a link with yours filled in.
+        A chain gets a card here from a file in the repo, <code>chains/&lt;chain id&gt;.json</code>. It needs an <code>https://</code> node anyone can reach. <code>blockula create</code> prints a link with yours filled in.
       </p>
       <div className="row-gap">
         <a className="btn small" href={listingLink("your-chain", TEMPLATE)} data-testid="list-template">Start the file on GitHub</a>
@@ -181,6 +183,7 @@ function ChainCard({ chain: c }: { chain: ListedChain }) {
         <div className="site-chain-name">
           <h3 className="site-h3">{c.name}</h3>
           <span className="pill site-ticker" data-testid="chain-token">{c.token}</span>
+          {projectRun(c.rpc) && <span className="pill site-ours" data-testid="chain-ours">Run by the Blockula project</span>}
           {takes && <span className="pill site-wants" data-testid="chain-wants">Wants validators</span>}
         </div>
         <Status live={live} token={c.token} />

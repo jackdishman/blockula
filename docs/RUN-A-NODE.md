@@ -1,6 +1,6 @@
 # Run a Blockula node
 
-Your own node gives you your own view of a chain: one you [launched](LAUNCH.md), or one someone else launched. (Blockula's public testnet, `blockula-testnet-2`, was retired in November 2026; there's no public chain to join.) Your wallet, apps and agents can read through it and send through it, and it's the independent witness that lets them prove names. This page covers a node at home or on a small server, and becoming a validator.
+Your own node gives you your own view of a chain: one you [made](CREATE.md), or one someone else made. (Blockula's public testnet, `blockula-testnet-2`, was retired in November 2026; there's no public chain to join.) Your wallet, apps and agents can read through it and send through it, and it's the independent witness that lets them prove names. This page covers a node at home or on a small server, and becoming a validator.
 
 [OPERATIONS.md](OPERATIONS.md) is the reference for professional validator operators: sentries, monitoring, incident response and releases.
 
@@ -10,7 +10,7 @@ Your own node gives you your own view of a chain: one you [launched](LAUNCH.md),
 > - **Validators can lose stake.** Signing two different blocks for the same turn (two copies of one key, a restored disk) slashes 5% of the validator's pool, its delegators' stake included, and bans the validator for good. Missing too many turns jails it and slashes a little.
 > - **Stake is slow to leave.** Unbonding takes 21 days by default (a chain's genesis can set less), and FANG that's unbonding can still be slashed for a fault from before it left.
 > - **Upgrades can stop your node.** When governance schedules a protocol version your release doesn't run, your node stops at that height until you install one that does. The network can also be halted on purpose to fix a problem.
-> - **Whoever runs the validators governs at first.** Until a chain's bootstrap period ends, its validators can pass proposals as a council: on a chain someone launched, that's whoever runs its validators.
+> - **Whoever runs the validators governs at first.** Until a chain's bootstrap period ends, its validators can pass proposals as a council: on a chain someone else made, that's whoever runs its validators.
 > - **Validating isn't paid work.** Rewards are FANG from the chain's issuance, and FANG has no value. There's no service agreement and no compensation for downtime, slashes or halts.
 > - **You're responsible for your own compliance:** the law where you are, and your hosting provider's terms (some ban blockchain workloads).
 > - **Your validator's addresses are public and permanent.** The chain publishes the p2p and HTTP addresses you register, and peers see your node's IP.
@@ -37,7 +37,7 @@ Measured on 2026-10-21 with release 0.5.2: a local chain of 4 validators and a f
 
 - **Memory** grows with the chain's state (accounts, names), not with its history or the size of the set. Give any node at least 1 GB of RAM for headroom; a public RPC node needs more under load.
 - **Bandwidth** is what limits a home validator. Certificates are sent to every other validator, so a validator's traffic grows with the size of the set. The 7- and 32-validator figures come from the certificate maths in [OPERATIONS.md, Bandwidth](OPERATIONS.md#bandwidth). A home connection with a 1.2 TB monthly cap fits a validator in a set of up to about 10.
-- **Chains you launch yourself** (`blockula summon`, [LAUNCH.md](LAUNCH.md)) make a block every 5 seconds by default, so an idle validator sends about a fifth of the upload above, which was measured at 1-second blocks. [LAUNCH.md, What it costs](LAUNCH.md#what-it-costs) has both, measured side by side.
+- **Chains you make yourself** (`blockula summon`, [CREATE.md](CREATE.md)) make a block every 5 seconds by default, so an idle validator sends about a fifth of the upload above, which was measured at 1-second blocks. [CREATE.md, What it costs](CREATE.md#what-it-costs) has both, measured side by side.
 - **Disk** for a full node grows with use: about 80 MB a day on an idle chain of 4 validators (about 30 GB a year), plus about 17 KB per transfer. A full node keeps every block unless you pass `--prune-blocks N`. A validator keeps about two days. [OPERATIONS.md, Disk sizing](OPERATIONS.md#disk-sizing) has the full tables.
 
 ## Install
@@ -54,7 +54,7 @@ It checks the download's checksum, and its build provenance when the GitHub CLI 
 blockula join --genesis https://<a node of the chain> --genesis-hash <its genesis hash> --home ~/.blockula/node
 ```
 
-It fetches the genesis from that node, checks it against the hash (the chain's creator gives it to you with the address, [LAUNCH.md](LAUNCH.md)), fast-syncs from a certified snapshot (seconds), then follows the chain. Its API and explorer are at http://localhost:7171, on this machine only.
+It fetches the genesis from that node, checks it against the hash (the chain's creator gives it to you with the address, [CREATE.md](CREATE.md)), fast-syncs from a certified snapshot (seconds), then follows the chain. Its API and explorer are at http://localhost:7171, on this machine only.
 
 - **Restart it** with `blockula run --home ~/.blockula/node`. Check it with `blockula status --rpc http://localhost:7171` or `curl -s localhost:7171/api/health`.
 - **History.** A fast-synced node holds blocks from its snapshot on (`history_from` in `/api/status`). Pass `--full` to `join` to replay from genesis instead, as long as a peer still has the early blocks.
@@ -77,7 +77,7 @@ It fetches the genesis from that node, checks it against the hash (the chain's c
   WantedBy=multi-user.target
   ```
 
-- **A chain on a home network or Tailscale** ([LAUNCH.md](LAUNCH.md)): its nodes serve plain `http://<address>:7070`, which `join` accepts on a private network.
+- **A chain on a home network or Tailscale** ([CREATE.md](CREATE.md)): its nodes serve plain `http://<address>:7070`, which `join` accepts on a private network.
 
 ## Use your node
 
@@ -124,7 +124,7 @@ Point everything at `http://localhost:7171`. Your own node answers for what you 
 
 ## Become a validator
 
-On a chain someone launched (on your own, `summon` made the validators: [LAUNCH.md](LAUNCH.md)):
+On a chain someone else made (on your own, `summon` made the validators: [CREATE.md](CREATE.md)):
 
 1. **Install a verified release ([OPERATIONS.md, A first install](OPERATIONS.md#a-first-install)).
 2. **Create the validator home.** On a public chain both addresses are required, and loopback, private and unspecified hosts are refused:
@@ -201,6 +201,6 @@ It signs `update_validator` with your current commission, so only the addresses 
 
 <!-- D8 (decided 2026-10-21): the self-bond path for outside validators. Keep it in this section. -->
 
-A validator registers with a self-bond of at least the chain's `min_self_bond` (10,000 FANG by default). A chain you launch sets its own: `blockula summon` defaults to 50 FANG, and to 10,000 with `--no-faucet` ([LAUNCH.md](LAUNCH.md#who-can-join)).
+A validator registers with a self-bond of at least the chain's `min_self_bond` (10,000 FANG by default). A chain you make sets its own: `blockula summon` defaults to 50 FANG, and to 10,000 with `--no-faucet` ([CREATE.md](CREATE.md#who-can-join)).
 
-- **A chain you launch, or one you join:** its faucet pays the bond (`blockula wallet faucet --to`), or, on a chain without one, a validator's account sends it (`blockula wallet send --key`): [LAUNCH.md](LAUNCH.md).
+- **A chain you make, or one you join:** its faucet pays the bond (`blockula wallet faucet --to`), or, on a chain without one, a validator's account sends it (`blockula wallet send --key`): [CREATE.md](CREATE.md).
