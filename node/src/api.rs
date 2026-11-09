@@ -696,6 +696,8 @@ pub fn router(node: Node) -> Router {
         .route("/api/claim/{id}", get(claim))
         .route("/api/seance/{id}", get(seance))
         .route("/api/souls", get(souls))
+        .route("/api/accounts", get(accounts))
+        .route("/api/names", get(names))
         .route("/api/proposals", get(proposals))
         .route("/api/proposal/{id}", get(proposal))
         .route("/api/distribution/{id}", get(distribution))
@@ -2389,6 +2391,122 @@ async fn souls(State(n): State<Node>, Query(q): Query<LimitQuery>) -> ApiResult 
     Ok(Json(json!({ "souls": rows })))
 }
 
+// ---------------------------------------------------------------- 👥 People
+
+/// A page of `/api/accounts` or `/api/names`: at most this many rows.
+const PEOPLE_PAGE_MAX: usize = 100;
+
+#[derive(Deserialize)]
+struct PeopleQuery {
+    sort: Option<String>,
+    limit: Option<usize>,
+    /// The last row of the page before (an address, or a name without `.boo`).
+    after: Option<String>,
+}
+
+/// The rows of `list` after `after` (the previous page's last), at most `limit`, and the cursor of
+/// the page after them (`None` at the end). A cursor no longer in the list starts from the top.
+fn people_page<'a>(list: &'a [String], after: Option<&str>, limit: usize) -> (&'a [String], Option<&'a str>) {
+    let start = after.and_then(|a| list.iter().position(|x| x == a)).map_or(0, |i| i + 1);
+    let end = (start + limit).min(list.len());
+    let page = &list[start.min(end)..end];
+    (page, (end < list.len()).then(|| page.last().map(String::as_str)).flatten())
+}
+
+/// The people directory: accounts by balance, by recent activity or by name, a page at a time,
+/// ranked once per block (`ReadView::people`).
+async fn accounts(State(n): State<Node>, Query(q): Query<PeopleQuery>) -> ApiResult {
+    let v = n.live.view();
+    let st = &v.state;
+    let people = v.people();
+    let limit = q.limit.unwrap_or(50).clamp(1, PEOPLE_PAGE_MAX);
+    let sort = q.sort.as_deref().unwrap_or("balance");
+    let list: &[String] = match sort {
+        "balance" => &people.by_balance,
+        "names" => &people.by_name,
+        "recent" => people.by_recent.as_deref().ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, format!("sort=recent isn't offered on a chain of more than {} accounts", crate::view::PEOPLE_RECENT_MAX_ACCOUNTS)))?,
+        other => return Err(ApiError(StatusCode::BAD_REQUEST, format!("sort must be balance, recent or names, not {other}"))),
+    };
+    let (page, next) = people_page(list, q.after.as_deref(), limit);
+    let now = crate::econ::now(st);
+    let rows: Vec<Value> = page
+        .iter()
+        .map(|addr| {
+            let acct = st.account(addr);
+            let active = |n: &String| st.names.get(n).is_some_and(|r| crate::econ::name_active(st, r));
+            let names: Vec<String> = v.names_of(addr, 8).into_iter().filter(active).map(|n| format!("{n}{NAME_SUFFIX}")).collect();
+            let transferable = crate::econ::transferable(st, addr, now);
+            let last = match people.by_recent {
+                Some(_) => people.last_active.get(addr).copied(),
+                None => v.history(addr, 1).first().map(|(h, _)| *h),
+            };
+            json!({
+                "account": label(&v, addr),
+                "names": names,
+                "balance": acct.balance.to_string(),
+                "balance_display": fmt_fang(acct.balance),
+                "transferable": transferable.to_string(),
+                "transferable_display": fmt_fang(transferable),
+                "last_active": last,
+                "validator": st.validators.get(addr).is_some_and(|r| r.status == crate::chain::ValidatorStatus::Active),
+                "program": st.programs.records.get(addr).is_some(),
+                "system": crate::chain::system_account(st.params.prefix(), addr),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "sort": sort, "accounts": rows, "next": next, "total": list.len(), "accounts_total": st.accounts.len() })))
+}
+
+/// Registered names (active, or in the grace when only the owner can renew), newest registration
+/// first or alphabetically, a page at a time.
+async fn names(State(n): State<Node>, Query(q): Query<PeopleQuery>) -> ApiResult {
+    let v = n.live.view();
+    let st = &v.state;
+    let limit = q.limit.unwrap_or(50).clamp(1, PEOPLE_PAGE_MAX);
+    let sort = q.sort.as_deref().unwrap_or("recent");
+    let now = crate::econ::now(st);
+    let after = q.after.as_deref().map(|a| a.strip_suffix(NAME_SUFFIX).unwrap_or(a).to_string());
+    let (page, next): (Vec<String>, Option<String>) = match sort {
+        "recent" => {
+            let (page, next) = people_page(&v.people().names_recent, after.as_deref(), limit);
+            (page.to_vec(), next.map(str::to_string))
+        }
+        "alpha" => {
+            // The names table is in name order: walk it from the cursor, skipping lapsed names.
+            let from = after.clone().unwrap_or_default();
+            let mut rows: Vec<String> = Vec::with_capacity(limit + 1);
+            for (name, r) in st.names.range::<_, String>((std::ops::Bound::Excluded(from), std::ops::Bound::Unbounded)) {
+                if now <= crate::econ::grace_until(st, r) {
+                    rows.push(name.clone());
+                    if rows.len() > limit {
+                        break;
+                    }
+                }
+            }
+            let more = rows.len() > limit;
+            rows.truncate(limit);
+            let next = more.then(|| rows.last().cloned()).flatten();
+            (rows, next)
+        }
+        other => return Err(ApiError(StatusCode::BAD_REQUEST, format!("sort must be recent or alpha, not {other}"))),
+    };
+    let rows: Vec<Value> = page
+        .iter()
+        .filter_map(|name| st.names.get(name).map(|r| (name, r)))
+        .map(|(name, r)| {
+            json!({
+                "name": format!("{name}{NAME_SUFFIX}"),
+                "owner": label(&v, &r.owner),
+                "registered_at": r.registered_at,
+                "expires_at": r.expires_at,
+                "grace_until": crate::econ::grace_until(st, r),
+                "status": if crate::econ::name_active(st, r) { "active" } else { "grace" },
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "sort": sort, "names": rows, "next": next.map(|n| format!("{n}{NAME_SUFFIX}")), "total": v.people().names_recent.len() })))
+}
+
 // ---------------------------------------------------------------- 🏛️ Governance
 
 /// A u128 amount (vote tallies) as a string, with its display.
@@ -3342,7 +3460,66 @@ mod http_tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    const READS: [&str; 14] = ["/api/status", "/api/blocks", "/api/block/1", "/api/account/alice.boo", "/api/name/alice", "/api/search/alice", "/api/validators", "/api/hunts", "/api/contributions", "/api/claims", "/api/souls", "/api/mempool", "/api/epochs", "/api/health"];
+    const READS: [&str; 16] = ["/api/status", "/api/blocks", "/api/block/1", "/api/account/alice.boo", "/api/name/alice", "/api/search/alice", "/api/validators", "/api/hunts", "/api/contributions", "/api/claims", "/api/souls", "/api/accounts?sort=recent", "/api/names", "/api/mempool", "/api/epochs", "/api/health"];
+
+    /// The people directory: accounts by balance, by name and by recent activity, names by
+    /// registration and alphabetically, a page at a time with a cursor, and bad sorts refused.
+    #[tokio::test]
+    async fn people_directory() {
+        let (root, n) = node("people");
+        let keys: Vec<_> = (11u8..14).map(|i| crate::crypto::Keys::from_seed([i; 32])).collect();
+        {
+            let mut c = n.chain.lock();
+            // The test chain's faucet float is small: 6, 1 and 7 FANG, a block each.
+            for (k, fang) in keys.iter().zip([6, 1, 7]) {
+                c.faucet(&k.address(), fang * DROPS_PER_FANG).unwrap();
+                c.produce_block().unwrap();
+            }
+            // Keys 0 and 2 register names (zelda, amber), a block apart.
+            for (k, name) in [(&keys[0], "zelda"), (&keys[2], "amber")] {
+                let mut t = Tx { chain_id: "people".into(), genesis_hash: c.genesis_hash.clone(), from: k.address(), nonce: 0, fee: 0, tip: 0, valid_until: c.height() + 10, action: Action::RegisterName { name: name.into() }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+                t.fee = min_fee(t.size());
+                c.submit(t.sign(k)).unwrap();
+                c.produce_block().unwrap();
+            }
+        }
+        let get = |uri: &'static str| call(&n, "GET", uri, None, "127.0.0.1:1");
+        let (s, a, _) = get("/api/accounts").await;
+        assert_eq!(s, StatusCode::OK, "{a}");
+        let rows = a["accounts"].as_array().unwrap();
+        let balances: Vec<u64> = rows.iter().map(|r| r["balance"].as_str().unwrap().parse().unwrap()).collect();
+        assert!(balances.windows(2).all(|w| w[0] >= w[1]), "richest first: {balances:?}");
+        assert_eq!(a["total"].as_u64(), Some(rows.len() as u64));
+        let amy = rows.iter().find(|r| r["account"]["address"] == keys[2].address().as_str()).unwrap();
+        assert_eq!((amy["names"][0].as_str(), amy["account"]["name"].as_str(), amy["last_active"].as_u64()), (Some("amber.boo"), Some("amber.boo"), Some(5)));
+        // By name: only named accounts, alphabetically.
+        let (_, a, _) = get("/api/accounts?sort=names").await;
+        let named: Vec<&str> = a["accounts"].as_array().unwrap().iter().map(|r| r["names"][0].as_str().unwrap()).collect();
+        assert_eq!(named, ["amber.boo", "zelda.boo"]);
+        // By recent activity: amber registered last.
+        let (_, a, _) = get("/api/accounts?sort=recent").await;
+        assert_eq!(a["accounts"][0]["account"]["address"], keys[2].address().as_str());
+        // Pages: one row, then the rest after its cursor.
+        let (_, p1, _) = get("/api/accounts?sort=names&limit=1").await;
+        assert_eq!((p1["accounts"].as_array().unwrap().len(), p1["next"].as_str()), (1, Some(keys[2].address().as_str())));
+        let uri = format!("/api/accounts?sort=names&limit=1&after={}", keys[2].address());
+        let (_, p2, _) = call(&n, "GET", &uri, None, "127.0.0.1:1").await;
+        assert_eq!((p2["accounts"][0]["names"][0].as_str(), p2["next"].as_str()), (Some("zelda.boo"), None));
+        // Names: newest first, or alphabetically, with their owners.
+        let (_, nm, _) = get("/api/names").await;
+        let names: Vec<&str> = nm["names"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!((names, nm["names"][0]["status"].as_str(), nm["names"][0]["owner"]["address"].as_str()), (vec!["amber.boo", "zelda.boo"], Some("active"), Some(keys[2].address().as_str())));
+        let (_, nm, _) = get("/api/names?sort=alpha&limit=1").await;
+        assert_eq!((nm["names"][0]["name"].as_str(), nm["next"].as_str()), (Some("amber.boo"), Some("amber.boo")));
+        let (_, nm, _) = get("/api/names?sort=alpha&after=amber.boo").await;
+        assert_eq!((nm["names"][0]["name"].as_str(), nm["next"].as_str()), (Some("zelda.boo"), None));
+        // Bad sorts are refused; the limit is capped.
+        assert_eq!(get("/api/accounts?sort=fame").await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(get("/api/names?sort=fame").await.0, StatusCode::BAD_REQUEST);
+        let (_, a, _) = get("/api/accounts?limit=100000").await;
+        assert!(a["accounts"].as_array().unwrap().len() <= PEOPLE_PAGE_MAX);
+        std::fs::remove_dir_all(root).ok();
+    }
 
     /// Every read is served while consensus holds the chain (SEC-4): handlers read the published
     /// view, never the `Mutex<Chain>`.
@@ -3374,7 +3551,7 @@ mod http_tests {
         for _ in 0..=READS.len() {
             let (uri, s, v) = rx.recv_timeout(Duration::from_secs(20)).expect("a read is waiting for the chain lock");
             assert!(s == StatusCode::OK || (uri == "/api/health" && s == StatusCode::SERVICE_UNAVAILABLE), "{uri}: {s} {v}");
-            if uri.starts_with("/api/account") {
+            if uri.starts_with("/api/account/") {
                 assert_eq!(v["names"][0], "alice.boo");
                 assert_eq!(v["recent_txs"].as_array().unwrap().len(), 2);
             }

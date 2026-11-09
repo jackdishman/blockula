@@ -200,6 +200,58 @@ export class MockNode {
     return { address, name: this.systemLabels.get(address) ?? (name ? `${name}.boo` : address === VALIDATOR ? "🧛 validator" : null), short: `${address.slice(0, 10)}…${address.slice(-6)}` };
   }
 
+  /**
+   * `/api/accounts` and `/api/names` (node/src/api.rs `accounts`, `names`): the directory, a page
+   * at a time after a cursor (the previous page's last address or name), at most 100 a page.
+   */
+  directory(path: string, q: URLSearchParams): [number, Json] {
+    const limit = Math.min(100, Math.max(1, Number(q.get("limit") ?? 50)));
+    const page = <T,>(list: T[], key: (t: T) => string) => {
+      const after = q.get("after")?.replace(/\.boo$/, "");
+      const i = after ? list.findIndex((t) => key(t) === after) + 1 : 0;
+      const rows = list.slice(i, i + limit);
+      return { rows, next: i + limit < list.length && rows.length ? key(rows[rows.length - 1]) : null };
+    };
+    const lastActive = (a: string) => {
+      const hs = [...this.txs.values()].filter((t) => t.height != null && (t.from === a || t.to === a || t.names?.includes(a))).map((t) => t.height as number);
+      return hs.length ? Math.max(...hs) : null;
+    };
+    if (path === "/names") {
+      const sort = q.get("sort") ?? "recent";
+      if (sort !== "recent" && sort !== "alpha") return [400, { error: "sort must be recent or alpha" }];
+      const all = [...this.names].map(([name, owner]) => ({ name, owner, info: this.nameInfo.get(name) ?? {} })).filter((n) => n.info.status !== "available");
+      const ordered = sort === "alpha" ? all.sort((a, b) => a.name.localeCompare(b.name)) : all.sort((a, b) => (b.info.registered_at ?? 0) - (a.info.registered_at ?? 0) || a.name.localeCompare(b.name));
+      const { rows, next } = page(ordered, (n) => n.name);
+      const names = rows.map((n) => ({ name: `${n.name}.boo`, owner: this.label(n.owner), registered_at: n.info.registered_at ?? 1, expires_at: n.info.expires_at ?? this.height + 31_536_000, grace_until: n.info.grace_until ?? this.height + 33_000_000, status: n.info.status ?? "active" }));
+      return [200, { sort, names, next: next && `${next}.boo`, total: all.length }];
+    }
+    const sort = q.get("sort") ?? "balance";
+    if (!["balance", "recent", "names"].includes(sort)) return [400, { error: "sort must be balance, recent or names" }];
+    const nameOf = (a: string) => [...this.names].find(([, o]) => o === a)?.[0];
+    let list = [...this.accounts.keys()];
+    if (sort === "balance") list.sort((a, b) => (this.acct(b).balance > this.acct(a).balance ? 1 : this.acct(b).balance < this.acct(a).balance ? -1 : a.localeCompare(b)));
+    if (sort === "names") list = list.filter(nameOf).sort((a, b) => (nameOf(a) as string).localeCompare(nameOf(b) as string));
+    if (sort === "recent") list = list.filter((a) => lastActive(a) != null).sort((a, b) => (lastActive(b) as number) - (lastActive(a) as number) || a.localeCompare(b));
+    const { rows, next } = page(list, (a) => a);
+    const accounts = rows.map((a) => {
+      const balance = this.acct(a).balance;
+      const system = this.systemLabels.get(a) ?? null;
+      return {
+        account: this.label(a),
+        names: [...this.names].filter(([, o]) => o === a).map(([n]) => `${n}.boo`),
+        balance: balance.toString(),
+        balance_display: formatFang(balance),
+        transferable: balance.toString(),
+        transferable_display: formatFang(balance),
+        last_active: lastActive(a),
+        validator: a === VALIDATOR || a === OTHER_VALIDATOR,
+        program: this.accountExtra.get(a)?.program != null,
+        system,
+      };
+    });
+    return [200, { sort, accounts, next, total: list.length, accounts_total: this.accounts.size }];
+  }
+
   private record(r: Omit<TxRec, "id" | "height">) {
     this.height += 1;
     const id = this.nextId();
@@ -685,6 +737,7 @@ export class MockNode {
         return x ? reply(200, x) : reply(404, { error: "Séance not found" });
       }
       if (req.method() === "GET" && path === "/souls") return reply(200, { souls: this.souls.slice(0, Number(new URL(req.url()).searchParams.get("limit") ?? 50)) });
+      if (req.method() === "GET" && (path === "/accounts" || path === "/names")) return reply(...this.directory(path, new URL(req.url()).searchParams));
       if (req.method() === "GET" && (m = path.match(/^\/multisig\/(.+)$/))) {
         const ms = this.multisigs.get(this.resolve(m[1]));
         return ms ? reply(200, ms) : reply(404, { error: "not a multisig account" });

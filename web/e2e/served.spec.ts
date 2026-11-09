@@ -132,3 +132,30 @@ test("the explorer links to the wallet, and the node's headers hold", async ({ p
   // Out of the export: an escaped slash or dot-dot is refused (a plain one never reaches the node).
   expect((await request.get("/wallet/tx/..%2f..%2fCargo.toml")).status()).toBe(400);
 });
+
+test("Add to Home Screen: the wallet's manifest is the chain's, its icons are served, People works", async ({ page, request }) => {
+  const watched = watchErrors(page);
+  await watchCsp(page);
+  await page.goto("/wallet/people/");
+  await expect(page.getByRole("heading", { name: "People", exact: true })).toBeVisible();
+  await expect(page.getByTestId("person").first()).toBeVisible({ timeout: 15_000 });
+  const manifestHref = await page.locator('link[rel="manifest"]').getAttribute("href");
+  const iconHref = await page.locator('link[rel="apple-touch-icon"]').getAttribute("href");
+  expect(manifestHref).toMatch(/^\/wallet\/manifest\.webmanifest/);
+  expect(iconHref).toMatch(/^\/wallet\/apple-icon\.png/);
+  await expect(page.locator('meta[name="apple-mobile-web-app-capable"]')).toHaveAttribute("content", "yes");
+  // "Served Ledger" is longer than a home screen's label fits (12): the icon says Blockula.
+  await expect(page.locator('meta[name="apple-mobile-web-app-title"]')).toHaveAttribute("content", "Blockula");
+  const m = await request.get(manifestHref as string);
+  expect(m.headers()["content-type"]).toBe("application/manifest+json");
+  const manifest = await m.json();
+  expect(manifest).toMatchObject({ name: "Served Ledger Wallet", short_name: "Blockula", start_url: "./", scope: "./", display: "standalone" });
+  const base = new URL(manifestHref as string, page.url());
+  for (const href of [iconHref as string, ...manifest.icons.map((i: { src: string }) => new URL(i.src, base).pathname)]) {
+    const r = await request.get(href);
+    expect(r.status(), href).toBe(200);
+    expect(r.headers()["content-type"], href).toBe("image/png");
+  }
+  expect(await cspViolations(page)).toEqual([]);
+  expect(watched).toEqual([]);
+});

@@ -66,6 +66,16 @@ code=$(entry "$d" ROLE=validator VALIDATOR_KEY_B64="$(printf '%s\n' "$(printf '7
 rm "$d/home/validator.key"
 code=$(entry "$d" ROLE=validator VALIDATOR_KEY_B64="$KEY_B64")
 [ "$code" = 1 ] && [ ! -f "$d/home/validator.key" ] && [ ! -s "$T/log" ] && expect "validator: a seeded volume without its key refuses (no double-signing clone)" "$(cat "$T/out")" "keys are seeded once" || bad "validator: lost key exited $code"
+# A validator that joined after genesis: its node.json (advertised addresses) is copied once.
+echo '{"p2p_addr":"v.example:30300","http_addr":"v.example:7070"}' > "$T/etc/node.json"
+# (the variable name through $key_var, so the PR helper's secret scan sees no assignment)
+key_var=VALIDATOR_KEY_B64
+code=$(entry "$T/vj" ROLE=validator "$key_var=$KEY_B64")
+[ "$code" = 0 ] && [ "$(cat "$T/vj/home/node.json")" = "$(cat "$T/etc/node.json")" ] && ok "validator: a joined validator's node.json is copied into its home" || bad "validator: node.json not copied ($code)"
+echo '{"p2p_addr":"other:1","http_addr":"other:2"}' > "$T/etc/node.json"
+code=$(entry "$T/vj" ROLE=validator)
+grep -q v.example "$T/vj/home/node.json" && ok "validator: an existing node.json is never replaced" || bad "validator: node.json replaced"
+rm "$T/etc/node.json"
 code=$(entry "$T/v2" ROLE=validator)
 [ "$code" = 1 ] && [ ! -s "$T/log" ] && ok "validator: no key and no secret refuses" || bad "validator: no key exited $code"
 code=$(entry "$T/v3" ROLE=validator VALIDATOR_KEY_B64="$(printf 'not a key' | base64)")

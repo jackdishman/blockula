@@ -1,0 +1,29 @@
+/* People (app/people): a directory of accounts by name. Rows wrap on a phone, never scroll sideways. */
+.name-strip { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px 14px; }
+.name-strip li { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; max-width: 100%; }
+.people-controls { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.people-controls .filters { margin-bottom: 0; }
+.people-search { flex: 1 1 220px; max-width: 360px; display: flex; }
+.people-search input { width: 100%; min-width: 0; }
+.people-list { list-style: none; margin: 0 0 12px; padding: 0; }
+.person { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto auto; gap: 4px 14px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--hair); }
+.person.no-rank { grid-template-columns: auto minmax(0, 1fr) auto auto; }
+.person.is-you { background: linear-gradient(90deg, rgba(141, 20, 24, 0.06), transparent 70%); }
+.person-rank { font: 400 15px var(--caps); color: var(--dim); min-width: 1.6em; text-align: right; }
+.person-sigil { width: 40px; height: 40px; display: grid; place-items: center; border: 1.5px solid var(--ink); background: var(--paper-hi); font: 400 22px/1 var(--display); color: var(--ink); text-decoration: none; box-shadow: 2px 2px 0 var(--ink); }
+.person-who { min-width: 0; }
+.person-name { font: 400 24px/1.15 var(--display); color: var(--ink); text-decoration: none; overflow-wrap: anywhere; }
+.person-name:hover { color: var(--blood); }
+.person-meta { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; color: var(--dim); font-size: 15px; margin-top: 2px; }
+.person-meta .mono { font-size: 13px; }
+.person-balance { font: 400 20px var(--display); text-align: right; white-space: nowrap; }
+.person-actions { display: flex; justify-content: flex-end; min-width: 0; }
+@media (max-width: 640px) {
+  .person, .person.no-rank { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .person-rank { display: none; }
+  .person-sigil { grid-row: span 2; width: 34px; height: 34px; font-size: 19px; }
+  .person-name { font-size: 21px; }
+  .person-balance { font-size: 18px; }
+  .person-actions { grid-column: 2 / -1; justify-content: flex-start; }
+  .person-actions:empty { display: none; }
+}

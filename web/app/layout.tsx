@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 import { ChainGate } from "@/components/ChainGate";
 import { Haunt, MotionToggle } from "@/components/Haunt";
 import { Header } from "@/components/Header";
+import { HomeScreenHint } from "@/components/HomeScreenHint";
 import { Ornament } from "@/components/Ornament";
 import { SiteFooter, SiteHeader } from "@/components/site/Chrome";
 import { IS_MAINNET_BUILD, SERVED, SITE } from "@/lib/config";
@@ -29,6 +30,12 @@ export const metadata: Metadata = SITE
   : {
       title: "Blockula Wallet",
       description: "A post-quantum wallet unlocked by your passkey. No seed phrase, just a .boo name.",
+      // Add to Home Screen: the wallet opens full screen under this name (a node serving it
+      // writes its chain's name here, node/src/wallet.rs). The icon is app/apple-icon.png and the
+      // manifest app/manifest.ts, both linked by Next under the base path.
+      appleWebApp: { capable: true, title: "Blockula", statusBarStyle: "default" },
+      // Next writes only `mobile-web-app-capable`; iOS before 17.4 reads the apple- one.
+      other: { "apple-mobile-web-app-capable": "yes" },
     };
 
 // The project site follows the system's light or dark (app/site.css); the wallet is printed on paper.
@@ -58,6 +65,7 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
         <Haunt />
         <WalletProvider>
           <Header />
+          <HomeScreenHint />
           <ChainGate>{children}</ChainGate>
           <footer className="imprint">
             <Ornament kind="bat" />

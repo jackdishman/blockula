@@ -298,8 +298,8 @@ const views = {
         <div class="figures" style="border-top-width:1px">
           ${stat(fang(s.supply_display), "total supply")}
           ${stat(fang(s.burned_display), term("burned"))}
-          ${stat(s.accounts, "accounts")}
-          ${stat(s.names, term("name", ".boo names"))}
+          ${stat(s.accounts, s.wallet ? `<a href="${esc(s.wallet)}people/">accounts</a>` : "accounts")}
+          ${stat(s.names, s.wallet ? `<a href="${esc(s.wallet)}people/">.boo names</a>` : term("name", ".boo names"))}
         </div>
         <div class="health">
           <span><b class="${health.ok ? "ok" : "bad"}">${health.ok ? "● The network is healthy" : "● " + esc(health.reason || "unhealthy")}</b></span>

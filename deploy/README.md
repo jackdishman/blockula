@@ -22,6 +22,17 @@ What it sets up, each step skipped once done (re-run it to upgrade to a newer re
 
 A single validator means the chain stops if its machine does, and the first outside validators join only once you admit them (`blockula validator admit`, from the key in `~/.config/blockula/hosted/<chain id>/home`): with 2 or 3 validators every one must be online, so admit people you expect to stay up.
 
+## One more validator for a chain: `deploy/host-validator.sh`
+
+`deploy/host-validator.sh` runs a validator for an existing chain (yours or someone else's) on Fly.io. It's how the demo chain got its second validator, `blockula-demo-v2`, and Path A of [docs/BECOME-A-VALIDATOR.md](../docs/BECOME-A-VALIDATOR.md).
+
+```bash
+GENESIS=https://demo.blockula.app GENESIS_HASH=<64 hex> APP=my-validator REGION=ord \
+  deploy/host-validator.sh
+```
+
+It checks the node reports that genesis hash, verifies the release as `host-chain.sh` does, and runs `blockula validator init` into `~/.config/blockula/hosted/<chain id>-<app>` (advertising `<app>.fly.dev:30300` for p2p and `<app>.fly.dev:7070` for HTTP). It takes the bond from the faucet if the chain has one, and creates the app, its volume and a dedicated IPv4. The key goes up once as the `VALIDATOR_KEY_B64` secret, deleted once the node answers. `genesis.json` and `node.json` ship as machine files. Then it signs `blockula validator register` and prints the command the chain's operator runs to let it in. Re-run it to upgrade; it never makes a second key for an app.
+
 ## A multi-validator testnet: `deploy/launch.sh`
 
 `deploy/launch.sh` launches a protocol v1 testnet on Fly.io. It launched `blockula-testnet-2`, the public testnet from October 2026 until it was retired in November 2026 (its history is archived: [REPLAY.md](../docs/REPLAY.md)). This page is the reference for launching a chain of your own the same way; for a chain on your own machines, see [LAUNCH.md](../docs/LAUNCH.md). Where it names `blockula-testnet-2`, its apps or its URL, read your own `CHAIN_ID`, `PREFIX` and `RPC_APP`.
