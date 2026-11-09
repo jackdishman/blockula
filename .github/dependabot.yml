@@ -35,6 +35,13 @@ updates:
       cargo:
         patterns: ["*"]
     ignore:
+      # Commonware moves as one set, and its p2p transport is the vendored hybrid
+      # commonware-stream (node/vendor/commonware-stream), which only a re-port can move: from
+      # 2026.10.0 p2p takes a SAKE/CUPS `Upgrader`, a new wire format that ships as a coordinated
+      # upgrade (VENDORED.md, "Re-porting on the next Commonware upgrade"). A partial bump can't
+      # resolve against the vendored copy (#119), so new releases are taken in that work, not here.
+      - dependency-name: "commonware-*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
       # The programs validator is calibrated and fuzzed on 0.228.0. Upgrade deliberately,
       # with the parser API changes, renewed calibration and fuzzing in the same work.
       - dependency-name: wasmparser

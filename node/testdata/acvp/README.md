@@ -32,7 +32,7 @@ That brings the ACVP part to about 1.2 MB (about 0.7 MB compressed in git), plus
 
 ## What runs, and against which code path
 
-| Group | Cases | Rust (`ml-dsa` 0.1.1) | TypeScript (`@noble/post-quantum` 0.7.1) |
+| Group | Cases | Rust (`ml-dsa` 0.1.2) | TypeScript (`@noble/post-quantum` 0.7.1) |
 |---|---|---|---|
 | ACVP keyGen tg2 (`KeyGen_internal`, seed) | 25 | `crypto::Keys::from_seed`, `pq::PrivateKey::from_seed_bytes` (public key); expanded secret key | `ml_dsa65.keygen` (public and secret key), `Wallet.fromSeed` |
 | ACVP sigGen tg5: external, pure, with context, deterministic | 15 | `pq::PrivateKey::sign` (context = namespace), `crypto::Keys::sign` when the context is empty, raw `sign_deterministic` | `ml_dsa65.sign({ context, extraEntropy: false })` |
