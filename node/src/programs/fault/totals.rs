@@ -57,12 +57,22 @@ pub fn check_totals(state: &State) -> bool {
     if state.programs.meta.is_none() {
         return true;
     }
+    #[cfg(test)]
+    CHECKS.with(|c| c.set(c.get() + 1));
     let found = drift(state);
     for d in &found {
         tracing::error!(total = d.total, recorded = %d.recorded, found = %d.found, "program accounting drift: META's total differs from what the accounts, records and blobs add up to; the FANG programs control may be wrong");
     }
     DRIFT.store(!found.is_empty(), Relaxed);
     found.is_empty()
+}
+
+// Test builds: how many checks of a state with programs ran on this thread. The alarm is
+// process-wide, so a test that asks *when* the check runs counts here instead: tests running
+// alongside it cross epoch boundaries of their own and set or clear the alarm.
+#[cfg(test)]
+thread_local! {
+    pub(super) static CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether the last [`check_totals`] found a mismatch.

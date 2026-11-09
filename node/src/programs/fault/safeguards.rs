@@ -732,24 +732,25 @@ fn check_totals_flags_a_corrupted_value_held_sponsored_and_escrow() {
 static DRIFT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// `Chain::apply_block` runs the check at each epoch boundary and only there (§7.1). Epochs are
-/// four blocks here, so blocks 3 and 7 end one; the alarm is set by hand (a corrupted state would
-/// trip `debug_check` in a test build), and a sound check at the boundary clears it.
+/// four blocks here, so blocks 3 and 7 end one. It counts this thread's checks (`totals::CHECKS`)
+/// rather than reading the alarm, which is process-wide: other tests cross epoch boundaries of
+/// their own at the same time, and a sound check anywhere clears it. That a sound check clears
+/// the alarm is the test above's.
 #[test]
 fn the_totals_are_checked_at_each_epoch_boundary_and_only_there() {
+    let checks = || totals::CHECKS.with(|c| c.get());
     let mut d = Dev::with("totals-boundary", true, Some(4));
     d.deploy(1);
     assert_eq!(d.c.height(), 2);
-    let _gauge = DRIFT_LOCK.lock();
-    totals::DRIFT.store(true, std::sync::atomic::Ordering::Relaxed);
+    let before = checks();
     d.run(vec![]).unwrap();
-    assert!(!accounting_drift(), "block 3 ends the first epoch: checked, sound, cleared");
-    totals::DRIFT.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(checks(), before + 1, "block 3 ends the first epoch: checked");
     for height in 4..7 {
         d.run(vec![]).unwrap();
-        assert!(accounting_drift(), "block {height} is no boundary: unchecked");
+        assert_eq!(checks(), before + 1, "block {height} is no boundary: unchecked");
     }
     d.run(vec![]).unwrap();
-    assert!(!accounting_drift(), "block 7 ends the second");
+    assert_eq!(checks(), before + 2, "block 7 ends the second");
 }
 
 /// `/metrics` carries the safeguards' series once programs exist (`programs::api::metrics` prints
