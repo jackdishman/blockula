@@ -7,6 +7,7 @@ import { GithubChip, MultisigActions } from "@/components/creators";
 import { FlowChart, Meter } from "@/components/explorer/charts";
 import { Amount, Fang, Hash, Loading, NotFound, plural, Section, Stat, StatusPill, Term, useMe, whoText } from "@/components/explorer/kit";
 import { Ledger } from "@/components/explorer/Ledger";
+import { RequestPay } from "@/components/explorer/RequestPay";
 import { WatchButton } from "@/components/explorer/Watch";
 import { blocksToHuman, keyCode } from "@/lib/format";
 import { nodeExplorer } from "@/lib/config";
@@ -45,6 +46,7 @@ export default function AccountPage() {
   const multisig = useNode<MultisigView>(known ? `/multisig/${encodeURIComponent(known)}` : null, { every: msPoll ? 10_000 : undefined });
   if (multisig.data && !msPoll) setMsPoll(true);
   const [filter, setFilter] = useState<Filter>({ by: "all" });
+  const [requesting, setRequesting] = useState(false);
 
   if (acct.error && !acct.data) {
     // A name nobody has registered isn't an account yet; it might be yours to claim.
@@ -124,11 +126,15 @@ export default function AccountPage() {
             <>
               <Link className="btn small primary" href="/send">Send</Link>
               <Link className="btn small" href="/receive">Receive</Link>
+              <button type="button" className="btn small" aria-expanded={requesting} onClick={() => setRequesting((r) => !r)} data-testid="request">
+                Request
+              </button>
               <Link className="btn small ghost" href="/devices">Devices &amp; agents</Link>
             </>
           )}
         </div>
       </div>
+      {yours && requesting && <RequestPay to={name ?? addr} onClose={() => setRequesting(false)} />}
 
       <div className="figures">
         <Stat v={<Fang display={a.balance_display} short />} k="balance" />
