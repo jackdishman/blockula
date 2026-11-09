@@ -11,6 +11,35 @@ import { DemoSection } from "./Demo";
 const USE_CASES = `${REPO}/blob/main/docs/USE-CASES.md`;
 const BUILD_ON_IT = `${REPO}/blob/main/docs/BUILD-ON-IT.md`;
 const AUDIT = `${REPO}/blob/main/docs/AUDIT-2026-10.md`;
+const VALIDATOR_GUIDE = `${REPO}/blob/main/docs/BECOME-A-VALIDATOR.md`;
+
+/** Ways in for someone who wants to help, smallest first. Each names one thing to do and where. */
+const JOIN_IN: { title: string; body: string; href: string; link: string }[] = [
+  {
+    title: "Run a validator",
+    body: "The demo chain is kept going by volunteers, each with a small server or a computer at home. The guide takes about an hour, and the chain is sturdier with every one that joins.",
+    href: VALIDATOR_GUIDE,
+    link: "Become a validator",
+  },
+  {
+    title: "Fix something small",
+    body: "Issues marked as good first ones are sized for an evening and say what done looks like. People and their coding agents are both welcome.",
+    href: "#contribute",
+    link: "Pick one, or hand your agent the prompt",
+  },
+  {
+    title: "Start a chain and list it",
+    body: "Run one for your club, your class or your friends, then add it to the list above so others can find it and help validate it.",
+    href: "#start",
+    link: "Start your own",
+  },
+  {
+    title: "Break it and say so",
+    body: "Try the wallet, read the code, tell us what confused you or what failed. Security problems go to us privately first.",
+    href: `${REPO}/blob/main/SUPPORT.md`,
+    link: "Where to report what",
+  },
+];
 
 /** What sets it apart, each in plain words first and the technical name second. */
 const PERKS: { title: string; body: ReactNode }[] = [
@@ -284,6 +313,24 @@ export function ProjectSite() {
       </section>
 
       <ChainsSection />
+
+      <section className="site-section" id="join-in" aria-labelledby="join-in-title" data-testid="join-in">
+        <div className="site-head">
+          <span className="eyebrow">Join in</span>
+          <h2 id="join-in-title" className="site-h2">Built in the open, by whoever turns up</h2>
+          <p className="dim">Blockula is an experiment: can a public ledger be a shared resource that ordinary people run and improve together? Nobody is paid, nothing is for sale, and its coins have no value. The code is MIT-licensed, and there are four ways to help.</p>
+        </div>
+        <div className="site-grid site-inside">
+          {JOIN_IN.map((j) => (
+            <div key={j.title} className="site-tile">
+              <h3 className="site-h3">{j.title}</h3>
+              <p className="dim">{j.body}</p>
+              <p className="small"><a href={j.href}>{j.link}</a></p>
+            </div>
+          ))}
+        </div>
+        <p className="center dim small"><a href={`${REPO}/blob/main/CONTRIBUTING.md`}>How contributing works</a></p>
+      </section>
     </main>
   );
 }

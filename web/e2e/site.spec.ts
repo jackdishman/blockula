@@ -104,6 +104,19 @@ test("the demo chain's live stats, its wallet a click away, and the agent prompt
   expect(await cspViolations(page)).toEqual([]);
 });
 
+test("join in: four ways to help, each with one link to where it starts", async ({ page }) => {
+  await demoChain(page);
+  await page.goto("/");
+  const join = page.getByTestId("join-in");
+  await expect(join.getByRole("heading", { level: 2 })).toHaveText("Built in the open, by whoever turns up");
+  await expect(join.getByRole("heading", { level: 3 })).toHaveText(["Run a validator", "Fix something small", "Start a chain and list it", "Break it and say so"]);
+  await expect(join.getByRole("link", { name: "Become a validator" })).toHaveAttribute("href", /\/docs\/BECOME-A-VALIDATOR\.md$/);
+  await expect(join.getByRole("link", { name: "Pick one, or hand your agent the prompt" })).toHaveAttribute("href", "#contribute");
+  await expect(page.locator("#contribute")).toContainText("Good first issues");
+  await expect(join.getByRole("link", { name: "Start your own" })).toHaveAttribute("href", "#start");
+  await expect(join.getByRole("link", { name: "Where to report what" })).toHaveAttribute("href", /\/SUPPORT\.md$/);
+});
+
 test("the page may talk to the demo node and the listed chains' nodes only (CSP connect-src)", async ({ page }) => {
   const res = await page.goto("/");
   const csp = res?.headers()["content-security-policy"] ?? "";
