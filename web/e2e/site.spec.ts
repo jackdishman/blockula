@@ -81,7 +81,10 @@ test("the demo chain's live stats, its wallet a click away, and the agent prompt
 
   // Why it's different, how it compares, starting your own, contributing, and the honesty lines.
   await expect(page.locator("#why .site-tile h3")).toContainText(["Ready for quantum computers", "Final in about two seconds", "Runs on what you already own", "Yours to host", "No seed phrases", "Nobody to get rich"]);
-  await expect(page.getByTestId("compare").locator("thead th")).toHaveText(["Question", "Blockula", "Bitcoin", "Ethereum"]);
+  await expect(page.getByTestId("compare").locator("thead th")).toHaveText(["Chain", "Signatures", "When a payment is final", "Who makes blocks", "To run a node", "Making a wallet", "Coins for early buyers"]);
+  await expect(page.getByTestId("compare").locator("tbody tr:not(.site-compare-group) th")).toContainText(["Blockula", "Bitcoin", "Ethereum", "Solana", "Base", "Arbitrum One", "Optimism", "Robinhood Chain", "ZKsync Era", "Starknet"]);
+  // Every chain answers every question.
+  for (const row of await page.getByTestId("compare").locator("tbody tr:not(.site-compare-group)").all()) await expect(row.locator("td")).toHaveCount(6);
   await expect(page.locator("#compare")).toContainText("haven't been independently audited");
   await expect(page.locator("#start .landing-cmd code")).toHaveText(["curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh", "blockula create"]);
   await expect(page.getByRole("link", { name: "The guide", exact: true })).toHaveAttribute("href", "https://github.com/jackdishman/blockula/blob/main/docs/CREATE.md");

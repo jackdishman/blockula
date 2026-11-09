@@ -48,14 +48,76 @@ const PERKS: { title: string; body: ReactNode }[] = [
   },
 ];
 
-/** How it compares, in a few rows anyone can read. */
-const COMPARE: { row: string; blockula: string; bitcoin: string; ethereum: string }[] = [
-  { row: "Signatures", blockula: "ML-DSA-65, built to resist quantum computers", bitcoin: "Elliptic curves (ECDSA, Schnorr): a big quantum computer could forge them", ethereum: "Elliptic curves (ECDSA, BLS): the same risk" },
-  { row: "When a payment is final", blockula: "About 2 seconds, for good", bitcoin: "About an hour (6 blocks) to be safe", ethereum: "About 13 minutes" },
-  { row: "Who makes blocks", blockula: "Validators you invite, voting", bitcoin: "Miners racing with warehouses of hardware", ethereum: "Validators with 32 ETH staked each" },
-  { row: "To run a validator", blockula: "A laptop, a Mac mini or a $5 server", bitcoin: "Mining rigs and cheap power", ethereum: "32 ETH and a dedicated machine with a 2 TB+ disk" },
-  { row: "Making a wallet", blockula: "A passkey: Face ID or Touch ID", bitcoin: "A 12–24 word seed phrase", ethereum: "A 12–24 word seed phrase" },
-  { row: "Coins sold to early buyers", blockula: "None, ever: the coins have no price", bitcoin: "None", ethereum: "A 2014 presale" },
+/** The questions the comparison asks of every chain, in its columns. */
+const QUESTIONS = ["Signatures", "When a payment is final", "Who makes blocks", "To run a node", "Making a wallet", "Coins for early buyers"] as const;
+
+type Chain = { name: string; kind?: string; answers: [string, string, string, string, string, string] };
+
+/** How it compares: Blockula, the big chains, and the Layer 2s that run on top of Ethereum. */
+const COMPARE: { group: string; note?: string; chains: Chain[] }[] = [
+  {
+    group: "Blockula",
+    chains: [
+      {
+        name: "Blockula",
+        answers: ["ML-DSA-65, built to resist quantum computers", "About 2 seconds, for good", "Validators you invite, voting", "A laptop, a Mac mini or a $5 server: and you can make the blocks", "A passkey: Face ID or Touch ID", "None, ever: the coins have no price"],
+      },
+    ],
+  },
+  {
+    group: "Layer 1s",
+    note: "chains that make their own blocks",
+    chains: [
+      {
+        name: "Bitcoin",
+        answers: ["Elliptic curves (ECDSA, Schnorr): a big quantum computer could forge them", "About an hour (6 blocks) to be safe", "Miners racing with warehouses of hardware", "A full node fits a home computer; mining takes rigs and cheap power", "A 12–24 word seed phrase", "None"],
+      },
+      {
+        name: "Ethereum",
+        answers: ["Elliptic curves (ECDSA, BLS): the same risk", "About 13 minutes", "Validators with 32 ETH staked each", "32 ETH and a dedicated machine with a 2 TB+ disk", "A 12–24 word seed phrase", "A 2014 presale"],
+      },
+      {
+        name: "Solana",
+        answers: ["Elliptic curves (Ed25519): the same risk", "Under a second since its Alpenglow upgrade (October 2026)", "Validators weighted by the SOL staked with them", "A data-center server (24+ cores, hundreds of GB of memory) and a fee to take part", "A 12–24 word seed phrase", "Sold to funds in private rounds, then a 2020 public auction"],
+      },
+    ],
+  },
+  {
+    group: "Layer 2s",
+    note: "chains that run on top of Ethereum and post their transactions to it",
+    chains: [
+      {
+        name: "Base",
+        kind: "Coinbase",
+        answers: ["Ethereum’s elliptic curves (a passkey wallet’s are elliptic too)", "Shown in under a second; final on Ethereum after about 15–30 minutes; 7 days to move coins back to Ethereum", "One sequencer, run by Coinbase", "You can follow it (an Ethereum node plus Base’s, terabytes of disk); only Coinbase makes its blocks", "A seed phrase, or a passkey in Coinbase’s Base app", "No coin of its own: fees are paid in ETH (Coinbase has said it’s exploring one)"],
+      },
+      {
+        name: "Arbitrum One",
+        kind: "Offchain Labs",
+        answers: ["Ethereum’s elliptic curves", "Shown in under a second; final on Ethereum after about 15–30 minutes; about a week to move coins back", "One sequencer, run by Offchain Labs; anyone can challenge what it posts", "You can follow it (an Ethereum node plus Arbitrum’s); only the sequencer makes its blocks", "A 12–24 word seed phrase", "ARB (2023): free to early users, with a large share kept for its team and backers"],
+      },
+      {
+        name: "Optimism",
+        kind: "OP Labs",
+        answers: ["Ethereum’s elliptic curves", "Shown in about 2 seconds; final on Ethereum after about 15–30 minutes; 7 days to move coins back", "One sequencer, run by OP Labs; anyone can challenge what it posts", "You can follow it (an Ethereum node plus Optimism’s); only the sequencer makes its blocks", "A 12–24 word seed phrase", "OP (2022): free to early users, with a large share kept for its team and backers"],
+      },
+      {
+        name: "Robinhood Chain",
+        kind: "Robinhood, built on Arbitrum",
+        answers: ["Ethereum’s elliptic curves", "Shown in a tenth of a second; final on Ethereum after about 15–30 minutes; about a week to move coins back", "One sequencer, run by Robinhood", "You can follow it; only Robinhood makes its blocks", "A 12–24 word seed phrase (Robinhood Wallet’s too)", "No coin of its own: fees are paid in ETH"],
+      },
+      {
+        name: "ZKsync Era",
+        kind: "Matter Labs",
+        answers: ["Ethereum’s elliptic curves", "Shown in about a second; final on Ethereum once a proof is checked there, a few hours later", "One sequencer, run by Matter Labs", "You can follow it (an Ethereum node plus ZKsync’s); only the sequencer makes its blocks", "A 12–24 word seed phrase", "ZK (2024): free to early users, with a large share kept for its team and backers"],
+      },
+      {
+        name: "Starknet",
+        kind: "StarkWare",
+        answers: ["Its proofs use hashes, which quantum computers aren’t known to break; its accounts still sign with an elliptic curve", "Shown in seconds; final on Ethereum once a proof is checked there, a few hours later", "Sequencers run by StarkWare", "You can follow it (an Ethereum node plus Starknet’s); only the sequencers make its blocks", "A 12–24 word seed phrase", "STRK (2024): free to early users, with a large share kept for its team and backers"],
+      },
+    ],
+  },
 ];
 
 const STEPS: { kind: OrnamentKind; title: string; body: ReactNode }[] = [
@@ -110,32 +172,50 @@ export function ProjectSite() {
       <section className="site-section" id="compare" aria-labelledby="compare-title">
         <div className="site-head">
           <span className="eyebrow">How it compares</span>
-          <h2 id="compare-title" className="site-h2">Blockula, Bitcoin and Ethereum</h2>
+          <h2 id="compare-title" className="site-h2">Blockula, the big chains and Ethereum’s Layer 2s</h2>
+          <p className="lead">Bitcoin, Ethereum and Solana make their own blocks. Base, Arbitrum, Optimism, Robinhood Chain, ZKsync and Starknet are Layer 2s: quicker and cheaper, because one company&apos;s computer (a sequencer) puts the transactions in order, and Ethereum backs them up later.</p>
         </div>
         <div className="card site-compare-wrap" tabIndex={0} role="region" aria-labelledby="compare-title">
           <table className="site-compare" data-testid="compare">
             <thead>
               <tr>
-                <th scope="col"><span className="site-sr">Question</span></th>
-                <th scope="col" className="site-compare-us">Blockula</th>
-                <th scope="col">Bitcoin</th>
-                <th scope="col">Ethereum</th>
+                <th scope="col"><span className="site-sr">Chain</span></th>
+                {QUESTIONS.map((q) => (
+                  <th key={q} scope="col">{q}</th>
+                ))}
               </tr>
             </thead>
-            <tbody>
-              {COMPARE.map((r) => (
-                <tr key={r.row}>
-                  <th scope="row">{r.row}</th>
-                  <td className="site-compare-us">{r.blockula}</td>
-                  <td>{r.bitcoin}</td>
-                  <td>{r.ethereum}</td>
-                </tr>
-              ))}
-            </tbody>
+            {COMPARE.map((g) => (
+              <tbody key={g.group} data-testid={`compare-${g.group}`}>
+                {g.note && (
+                  <tr className="site-compare-group">
+                    <th scope="colgroup" colSpan={QUESTIONS.length + 1}>
+                      <span>
+                        {g.group} <span className="dim">· {g.note}</span>
+                      </span>
+                    </th>
+                  </tr>
+                )}
+                {g.chains.map((c) => {
+                  const us = c.name === "Blockula" ? "site-compare-us" : undefined;
+                  return (
+                    <tr key={c.name} className={us}>
+                      <th scope="row">
+                        {c.name}
+                        {c.kind && <span className="site-compare-kind">{c.kind}</span>}
+                      </th>
+                      {c.answers.map((a, i) => (
+                        <td key={QUESTIONS[i]}>{a}</td>
+                      ))}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            ))}
           </table>
         </div>
         <p className="dim small site-compare-note">
-          Fair&apos;s fair: Bitcoin and Ethereum are guarded by thousands of nodes and years of real use. Blockula is experimental, its post-quantum libraries haven&apos;t been independently audited yet (<a href={AUDIT}>our own review</a>), and it&apos;s made for chains among friends, not for holding value.
+          Fair&apos;s fair: these chains are guarded by thousands of nodes, years of real use and billions of dollars, and a company running a Layer 2 can make one of its own with Arbitrum&apos;s or Optimism&apos;s kit (Robinhood did), with Ethereum behind it. Blockula is experimental, its post-quantum libraries haven&apos;t been independently audited yet (<a href={AUDIT}>our own review</a>), and it&apos;s made for chains among friends, not for holding value. Times are typical, as of November 2026.
         </p>
       </section>
 
