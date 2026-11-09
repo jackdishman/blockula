@@ -18,7 +18,7 @@ for (const route of ["tx", "account", "block", "name", "program", "programs", "h
   }
 }
 // Add to Home Screen: the manifest (app/manifest.ts; the node renames it for its chain) and its icons.
-for (const file of ["people/index.html", "manifest.webmanifest", "apple-icon.png", "icon-192.png", "icon-512.png"]) {
+for (const file of ["people/index.html", "terms/index.html", "privacy/index.html", "manifest.webmanifest", "apple-icon.png", "icon-192.png", "icon-512.png"]) {
   if (!existsSync(join(out, file))) {
     console.error(`web/out/${file} is missing from the export.`);
     process.exit(1);
