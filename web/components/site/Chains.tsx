@@ -5,10 +5,11 @@ import { Command, INSTALL, REPO } from "@/components/Landing";
 import { Copy } from "@/components/ui";
 import { contactUrl, listingJson, listingLink, projectRun, units, type ListedChain } from "@/lib/chains";
 import { SITE_CHAINS } from "@/lib/config";
-import { CONTRIBUTE_PROMPT, walletOf } from "@/lib/site";
+import { CONTRIBUTE_PROMPT, validatorPrompt, walletOf } from "@/lib/site";
 
 const REGISTRY = `${REPO}/blob/main/chains/README.md`;
 const RUN_A_NODE = `${REPO}/blob/main/docs/RUN-A-NODE.md`;
+const BECOME_A_VALIDATOR = `${REPO}/blob/main/docs/BECOME-A-VALIDATOR.md`;
 const GOOD_FIRST_ISSUES = `${REPO}/issues?q=is%3Aopen+label%3A%22good+first+issue%22`;
 /** The template "List your chain" opens on GitHub: placeholders the checker refuses until they're filled in. */
 const TEMPLATE = listingJson({
@@ -299,6 +300,11 @@ function ValidatorSteps({ id, chain: c, live }: { id: string; chain: ListedChain
           <b>A validator takes turns making blocks.</b> You need a computer that stays on and online, with TCP 30300 (validators) and 7171 (your node) open to the internet: forward them on your router. One that sleeps or drops off misses its turns and gets jailed.
         </p>
         <p className="dim small">Never run two copies of one <code>validator.key</code>: signing twice bans it for good. Setting it up as a service: <a href={RUN_A_NODE}>Run a node</a>.</p>
+        <div className="row site-wrap" data-testid="validator-guide">
+          <a href={BECOME_A_VALIDATOR} className="small">New to this? Read the step-by-step guide</a>
+          <Copy text={validatorPrompt(c.rpc, c.genesis_hash)} label="Copy the setup prompt" />
+        </div>
+        <p className="dim small">The guide covers the cloud (Fly.io or a $5 server), a home server, and a home server behind a cheap relay that keeps your IP private. The prompt lets your coding agent do the setup, and stops before anything costs money or opens a port.</p>
       </div>
       <label className="field">
         <span>Your machine&apos;s public IP or DNS name</span>

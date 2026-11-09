@@ -93,6 +93,7 @@ In the browser a passkey unlocks the wallet, with no seed phrase: `createPasskey
 | [BUILD-ON-IT.md](docs/BUILD-ON-IT.md) | Claude, custom apps, the SDK and programs, HTTPS, a wallet link for friends |
 | [USE-CASES.md](docs/USE-CASES.md) | Eight things to do on a small chain |
 | [RUN-A-NODE.md](docs/RUN-A-NODE.md) | A full node or a validator as a service, and using your own node |
+| [BECOME-A-VALIDATOR.md](docs/BECOME-A-VALIDATOR.md) | Validate someone else's chain, step by step: cloud, home, or home behind a relay |
 | [REFERENCE.md](docs/REFERENCE.md) | Chains by hand, public servers, the hardened API, validators, Hunts and the contribution pool |
 | [OPERATIONS.md](docs/OPERATIONS.md) | Running validators: upgrades, restarts, slashing protection, monitoring |
 | [AGENTS.md](AGENTS.md) | For coding agents: the copy-paste prompt, the rules and the HTTP API |

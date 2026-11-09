@@ -2,6 +2,8 @@
 
 [blockula.app](https://blockula.app) lists Blockula chains that anyone can open: one file here per chain, `chains/<chain id>.json`. Each gets a card on the site with its live status (read from its node by the visitor's browser), buttons for its wallet and explorer and, if it takes validators, the commands to become one.
 
+To run a validator for a listed chain, [docs/BECOME-A-VALIDATOR.md](../docs/BECOME-A-VALIDATOR.md) is the step-by-step guide.
+
 The project doesn't run, check or vouch for these chains. Their coins have no value, and nobody sells or buys them.
 
 ## List your chain

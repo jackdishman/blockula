@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { CONTRIBUTE_PROMPT, demoNode, isPrivateHost, nodeAddress, walletOf } from "./site.ts";
+import { CONTRIBUTE_PROMPT, VALIDATOR_PROMPT, demoNode, isPrivateHost, nodeAddress, validatorPrompt, walletOf } from "./site.ts";
 
 test("https anywhere, plain http only on this machine or a private network (mcp/src/network.ts's rule)", () => {
   for (const [input, url] of [
@@ -58,4 +58,14 @@ test("the contributor prompt is CONTRIBUTING.md's", () => {
   const md = readFileSync(new URL("../../CONTRIBUTING.md", import.meta.url), "utf8");
   const quoted = /## Start in two minutes[\s\S]*?\n> (.+)\n/.exec(md)?.[1];
   assert.equal(CONTRIBUTE_PROMPT, quoted);
+});
+
+test("the validator setup prompt is BECOME-A-VALIDATOR.md's, with a chain's node and hash filled in", () => {
+  const md = readFileSync(new URL("../../docs/BECOME-A-VALIDATOR.md", import.meta.url), "utf8");
+  const quoted = /## Let your coding agent do it[\s\S]*?```text\n([\s\S]*?)\n```/.exec(md)?.[1];
+  assert.equal(VALIDATOR_PROMPT, quoted);
+  const filled = validatorPrompt("https://demo.blockula.app", "ab".repeat(32));
+  assert.match(filled, /Node: {10}https:\/\/demo\.blockula\.app\n/);
+  assert.match(filled, new RegExp(`Genesis hash:  ${"ab".repeat(32)}\\n`));
+  assert.match(filled, /Path: {10}<A /);
 });

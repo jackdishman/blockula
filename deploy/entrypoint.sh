@@ -7,8 +7,10 @@
 #                   cloned/scaled/replacement machine with an empty volume can't come up signing
 #                   with the same key (double-signing). Nothing in the machine's configuration
 #                   refers to the secret, so restarts after it's gone read the key from the volume
-#                   alone. The variable is dropped before the node starts.
-#   ROLE=rpc:       public full node; with an empty home it joins once (pinning GENESIS_HASH,
+#                   alone. The variable is dropped before the node starts. $BLOCKULA_ETC/node.json,
+#                   if the machine has one (a validator that joined after genesis: the addresses
+#                   it advertises), is copied into the home once, like genesis.json.
+#   ROLE=rpc:      public full node; with an empty home it joins once (pinning GENESIS_HASH,
 #                   which `join` requires for a chain this binary doesn't know, and a checkpoint:
 #                   CHECKPOINT, or one its PEER_HTTP nodes agree on, below), then restarts with
 #                   `blockula run`.
@@ -131,6 +133,9 @@ case "${ROLE:-}" in
     home=$data/home
     mkhome "$home"
     [ -f "$home/genesis.json" ] || put 644 "$etc/genesis.json" "$home/genesis.json"
+    # A validator that joined after genesis advertises what `blockula validator init` wrote to
+    # node.json (deploy/host-validator.sh ships it); a genesis validator has none.
+    [ -f "$home/node.json" ] || [ ! -f "$etc/node.json" ] || put 644 "$etc/node.json" "$home/node.json"
     if [ ! -f "$home/validator.key" ]; then
       if [ -f "$home/.seeded" ] || [ -z "${VALIDATOR_KEY_B64:-}" ]; then
         echo "refusing to start: no validator key on this volume (keys are seeded once; never clone or scale a validator)" >&2
