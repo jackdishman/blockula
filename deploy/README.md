@@ -18,9 +18,13 @@ What it sets up, each step skipped once done (re-run it to upgrade to a newer re
 4. **The key leaves Fly's secrets.** It's staged as `VALIDATOR_KEY_B64` for the first boot, written onto the volume by `deploy/entrypoint.sh`, and the secret is deleted once the node answers for the genesis. A cloned or replacement machine with an empty volume refuses to start instead of double-signing; the local copy is your backup.
 5. **The domain.** It asks Fly for the domain's certificate and prints the `A` and `AAAA` records to add, and the chain's listing for blockula.app (`chains/<chain id>.json`).
 
-**Cost:** about $5 a month (the machine, the volume and the $2 IPv4). **Settings:** the script's header lists them (`VERSION`, `APP`, `REGION`, `BLOCK_TIME_MS`, `NO_FAUCET`, `VM_MEMORY`, `VOLUME_GB`). **Logs:** `fly logs -a <app>`. A chain at a subdomain of blockula.app is marked **Run by the Blockula project** in the chain directory: only the project can serve those names.
+**Cost:** about $5 a month (the machine, the volume and the $2 IPv4). **Settings:** the script's header lists them (`VERSION`, `APP`, `REGION`, `BLOCK_TIME_MS`, `NO_FAUCET`, `PROGRAMS`, `PEER_HTTP`, `VM_MEMORY`, `VOLUME_GB`). **Logs:** `fly logs -a <app>`. A chain at a subdomain of blockula.app is marked **Run by the Blockula project** in the chain directory: only the project can serve those names.
 
 A single validator means the chain stops if its machine does, and the first outside validators join only once you admit them (`blockula validator admit`, from the key in `~/.config/blockula/hosted/<chain id>/home`): with 2 or 3 validators every one must be online, so admit people you expect to stay up.
+
+**Once a second validator has joined, re-run with `PEER_HTTP` set** to the other validators' HTTP APIs (for the demo chain, `PEER_HTTP="http://blockula-demo-v2.fly.dev:7070"`), and keep it on every re-run. After a restart the node asks them where the network stands before it signs again (slashing protection). With no one to ask it waits, and with two validators the chain waits with it: the demo chain's v1.0.3 upgrade stopped for about 7 minutes that way.
+
+**Once a second validator has joined, re-run with `PEER_HTTP` set** to the other validators' HTTP APIs (for the demo chain, `PEER_HTTP="http://blockula-demo-v2.fly.dev:7070"`), and keep it on every re-run. After a restart the node asks them where the network stands before it signs again (slashing protection); without anyone to ask, it waits, and with two validators the chain waits with it. The demo chain's v1.0.3 upgrade stopped for about 7 minutes that way.
 
 ## One more validator for a chain: `deploy/host-validator.sh`
 

@@ -73,10 +73,13 @@ fi
 ADDRESS=$(cat "$HOSTED_DIR/address")
 [ -n "$ADDRESS" ] || die "no address in $HOSTED_DIR/address (blockula validator init prints it)"
 
-# 3. The bond.
-min_bond=$(curl -fsS "$GENESIS/api/validators" | jq -r .min_bond)
+# 3. The bond. A validator already registered has bonded (its bond is stake, not balance): an
+# upgrade re-run asks the faucet for nothing.
+validators=$(curl -fsS "$GENESIS/api/validators")
+min_bond=$(jq -r .min_bond <<<"$validators")
+registered=$(jq -r --arg a "$ADDRESS" '[.active, .joining, .candidates, .jailed, .leaving] | map(. // []) | add | map(.validator.address, .owner.address) | index($a) != null' <<<"$validators")
 balance=$(curl -fsS "$GENESIS/api/account/$ADDRESS" | jq -r '.balance // "0"')
-if [ "$balance" -lt "$min_bond" ] 2>/dev/null; then
+if [ "$registered" != true ] && [ "$balance" -lt "$min_bond" ] 2>/dev/null; then
   if [ "$(curl -fsS "$GENESIS/api/genesis" | jq -r .faucet)" = true ]; then
     blockula wallet faucet --to "$ADDRESS" --rpc "$GENESIS" >/dev/null
     echo "✓ funded $ADDRESS from the faucet"
