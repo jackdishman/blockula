@@ -22,6 +22,8 @@ export async function addAuthenticator(page: Page) {
   });
   return {
     credentials: async () => (await cdp.send("WebAuthn.getCredentials", { authenticatorId })).credentials,
+    /** Whether the next prompts verify the user (false: Face ID fails, so a prompt that requires it is refused). */
+    verifyUser: (ok: boolean) => cdp.send("WebAuthn.setUserVerified", { authenticatorId, isUserVerified: ok }),
   };
 }
 
