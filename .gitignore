@@ -4,5 +4,9 @@ target
 .scratch-home
 .vercel
 .env*
+.venv/
+__pycache__/
+*.egg-info/
+/sdk-py/build/
 # Generated at publish time (scripts/mcp-shrinkwrap.mjs)
 mcp/npm-shrinkwrap.json
