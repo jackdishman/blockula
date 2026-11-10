@@ -381,7 +381,8 @@ fn candidates_join_by_stake_within_the_churn_limit() {
         vals[2].chain.lock().submit(register(&genesis, &b, 0, 4 * min, 30_500)).unwrap();
         wait_until(&context, "registration", || vals[3].chain.lock().state.validators.get(&b.address()).is_some_and(|v| v.status == ValidatorStatus::Candidate)).await;
         vals[3].chain.lock().submit(signed(&genesis, &admin, 2, Action::Delegate { validator: b.address(), amount: 100 * DROPS_PER_FANG })).unwrap();
-        wait_until(&context, "delegation", || vals[0].chain.lock().state.staking.pools[&b.address()].stake > 4 * min).await;
+        // vals[0] may not have executed the registration yet (only vals[3] was waited on): no pool is "not yet".
+        wait_until(&context, "delegation", || vals[0].chain.lock().state.staking.pools.get(&b.address()).is_some_and(|p| p.stake > 4 * min)).await;
         let same_epoch = {
             let c = vals[0].chain.lock();
             let e = |v: &str| c.state.params.epoch_of(c.state.validators[v].registered_at);
