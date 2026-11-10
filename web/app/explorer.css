@@ -212,6 +212,8 @@ details.raw pre, pre.raw { background: var(--paper-hi); border: 1px solid var(--
 
 /* Programs */
 .programs { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 20px; }
+/* auto-fill keeps a single pin the size of the other cards; auto-fit would stretch it across the row. */
+.programs.pins { grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); }
 .program-card { display: flex; flex-direction: column; gap: 10px; color: var(--ink); text-decoration: none; transition: box-shadow 0.12s, transform 0.12s; }
 .program-card:hover { color: var(--ink); box-shadow: 5px 5px 0 var(--ink); transform: translate(-2px, -2px); }
 .program-card h2 { margin: 0; font: 400 26px/1.1 var(--display); letter-spacing: 0; }
