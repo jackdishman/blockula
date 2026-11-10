@@ -1,6 +1,7 @@
 /**
- * Deployed programs the wallet keeps on the Programs page after they leave the recent-block
- * window. The node has no list of every program (docs/PROGRAMS-V0.md §8.2); `programs.ts` describes
+ * Deployed programs the wallet pins at the top of the Programs page, above every other program
+ * (`/api/programs`), or, on a node that predates that route, above a window of recent creates
+ * (docs/PROGRAMS-V0.md §8.2) so they stay listed after it. `programs.ts` describes
  * a program once its address is known. To add a pin, append it under that chain's id and genesis
  * hash (docs/EXPLORER.md). Pure, so `node --test` runs it directly (lib/featured-programs.test.mjs).
  *

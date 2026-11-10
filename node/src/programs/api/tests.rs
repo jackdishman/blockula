@@ -211,6 +211,45 @@ async fn a_program_is_served_with_its_record_methods_and_proof() {
     std::fs::remove_dir_all(root).ok();
 }
 
+/// `GET /api/programs`: every program, newest create first (ties by address), a page at a time,
+/// each row its record's summary and balance; `next` is the cursor, `null` on the last page.
+#[tokio::test]
+async fn programs_are_listed_newest_first_a_page_at_a_time() {
+    let (root, n) = chain("papi-list", Born::V2Programs);
+    let stored: Vec<String> = (0..3).map(|i| with_program(&n, i, &[]).address).collect();
+    {
+        // As if created at heights 5, 9 and 9: the record's height is all the order reads.
+        let mut c = n.chain.lock();
+        for (a, h) in stored.iter().zip([5, 9, 9]) {
+            let mut r = c.state.programs.records.get(a).unwrap().clone();
+            r.0.created_at = h;
+            c.state.programs.records.insert(a.clone(), r);
+        }
+        c.produce_block_with(vec![]).unwrap();
+    }
+    let mut tied = [stored[1].clone(), stored[2].clone()];
+    tied.sort();
+    let want = [tied[0].clone(), tied[1].clone(), stored[0].clone()];
+    let (s, j, _) = call(&n, "/api/programs?limit=2").await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(j["total"], 3);
+    let page: Vec<&str> = j["programs"].as_array().unwrap().iter().map(|r| r["address"].as_str().unwrap()).collect();
+    assert_eq!(page, [want[0].as_str(), want[1].as_str()]);
+    assert_eq!(j["next"], json!(want[1]));
+    let row = &j["programs"][0];
+    assert_eq!(row["created_at"], 9);
+    assert_eq!(row["balance"], "500");
+    assert_eq!(row["version"], 1);
+    assert_eq!(row["creator"], label(&n.live.view(), &creator()));
+    let (_, j, _) = call(&n, &format!("/api/programs?limit=2&after={}", want[1])).await;
+    let page: Vec<&str> = j["programs"].as_array().unwrap().iter().map(|r| r["address"].as_str().unwrap()).collect();
+    assert_eq!(page, [want[2].as_str()]);
+    assert!(j["next"].is_null());
+    let (_, j, _) = call(&n, "/api/programs").await;
+    assert_eq!(j["programs"].as_array().unwrap().len(), 3);
+    std::fs::remove_dir_all(root).ok();
+}
+
 /// `GET /api/program/{address}/storage`: the program's entries in key order, as hex, a page at a
 /// time (`limit`, then `after` = the last page's `next`), reading only the entries it returns and
 /// one more, never another program's.
@@ -531,7 +570,7 @@ async fn dormant_chains_answer_exactly_as_before() {
         // Anything a program route could name: the routes don't look.
         let prefix = n.live.view().state.params.prefix().to_string();
         let address = digest::program_address(&prefix, &crypto::address_bytes(&validator).unwrap(), 0);
-        for uri in [format!("/api/program/{address}"), format!("/api/program/{validator}/storage"), "/api/program/x".into(), format!("/api/code/{}", "ab".repeat(32)), format!("/api/interface/{}", "ab".repeat(32)), "/api/code/xyz".into()] {
+        for uri in ["/api/programs".to_string(), format!("/api/program/{address}"), format!("/api/program/{validator}/storage"), "/api/program/x".into(), format!("/api/code/{}", "ab".repeat(32)), format!("/api/interface/{}", "ab".repeat(32)), "/api/code/xyz".into()] {
             let (s, e, _) = call(&n, &uri).await;
             assert_eq!((s, e["error"].as_str()), (StatusCode::NOT_FOUND, Some("no programs exist on this chain: programs have never been switched on")), "{born:?} {uri}");
         }

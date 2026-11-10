@@ -137,6 +137,8 @@ export class MockNode {
   multisigs = new Map<string, Json>();
   /** Deployed programs (protocol v2) as /api/program serves them, by address; stored code and interfaces by hash. */
   programs = new Map<string, Json>();
+  /** Whether it serves `/api/programs` (a node from before that route doesn't: the page then scans recent blocks). */
+  listsPrograms = true;
   codes = new Map<string, Json>();
   interfaces = new Map<string, Json>();
   /** Merged into `/api/validators` (v1's leaving, tombstoned, admission…). */
@@ -728,6 +730,22 @@ export class MockNode {
       if (req.method() === "GET" && (m = path.match(/^\/hunt\/(\d+)$/))) {
         const h = this.hunts.find((x) => x.id === Number(m?.[1]));
         return h ? reply(200, h) : reply(404, { error: "hunt not found" });
+      }
+      if (req.method() === "GET" && path === "/programs" && this.listsPrograms) {
+        // node/src/programs/api.rs `programs`: newest create first, ties by address, `after` an address.
+        const sp = new URL(req.url()).searchParams;
+        const limit = Math.min(Math.max(Number(sp.get("limit") ?? 50) || 50, 1), 100);
+        const list = [...this.programs.values()].sort((a, b) => Number(b.created_at) - Number(a.created_at) || String(a.address).localeCompare(String(b.address)));
+        const after = sp.get("after");
+        const start = after ? list.findIndex((p) => p.address === after) + 1 : 0;
+        const page = list.slice(start, start + limit);
+        const rows = page.map((p) => {
+          const code = p.code as { wasm_hash: string; interface_hash: string };
+          const storage = p.storage as { items: number };
+          return { address: p.address, creator: p.creator, created_at: p.created_at, wasm_hash: code.wasm_hash, interface_hash: code.interface_hash, version: p.version, accepts_transfers: p.accepts_transfers, balance: p.balance, balance_display: p.balance_display, items: storage.items };
+        });
+        const next = start + limit < list.length ? (page.at(-1)?.address ?? null) : null;
+        return reply(200, { programs: rows, next, total: list.length, height: this.height });
       }
       if (req.method() === "GET" && (m = path.match(/^\/program\/(t?boo1[0-9a-z]+)$/))) {
         const p = this.programs.get(m[1]);
