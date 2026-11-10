@@ -2061,7 +2061,7 @@ check includes fuel through `econ::check_fee`.
 
 **No list route in v0.** Nothing lists deployed programs: the explorers show the creates in a
 window of recent blocks, a stopgap that any account can crowd with cheap creates, and an older
-program is reached by its address. A follow-up (should, before a supported programs-on release):
+program is reached by its address (or, in the web wallet, by a pin in `FEATURED_PROGRAMS`). A follow-up (should, before a supported programs-on release):
 `GET /api/programs?after=<address>&limit=<n>`, program addresses in creation order (`created_at`,
 then address), each with `created_at`, `wasm_hash` and the creator, a page at a time (`next`),
 from an index the node keeps beside the history rows; the explorers then list from it (§8.6).
@@ -2177,7 +2177,8 @@ history: tag 64's `addresses()` names each call's program, so the store's histor
 it). A transaction page shows the receipt with facts apart from claims (PRG 8.4). "What was signed,
 exactly" abridges only the blobs a program action carries (`wasm`, `interface`, `input`, data);
 every v1 action prints exactly as before, keys and proofs whole. Until the list route exists
-(§8.2) the Programs page lists the creates in a window of recent blocks, and says so.
+(§8.2) the Programs page lists the creates in a window of recent blocks, and says so, plus any
+program pinned for that chain id and genesis hash in `FEATURED_PROGRAMS` (`web/lib/explorer/featured.ts`).
 `web/lib/explorer/programs.ts` lists deployed programs beside native ones (`Program.kind:
 "deployed"`) with no `ActionSpec` forms yet (calls are CLI- and SDK-only in v0);
 `web/lib/explorer/ledger.ts` learns what tags 62–64 move (fee, value, deposits, the creation

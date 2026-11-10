@@ -2,11 +2,12 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Fang, Named, plural, Term } from "@/components/explorer/kit";
 import { inertText, shortAddress, typeText } from "@/lib/explorer/inert";
 import { compactDrops, parseDrops } from "@/lib/explorer/ledger";
-import { useNode } from "@/lib/explorer/node";
+import { NodeError, useNode } from "@/lib/explorer/node";
+import { createdProgramAddresses, featuredPrograms, listDeployed, type FeaturedProgram } from "@/lib/explorer/featured";
 import { deployedProgram, PROGRAMS, signature } from "@/lib/explorer/programs";
 import { to } from "@/lib/explorer/routes";
 import type { ChainStatus, ContributionsView, DeployedProgramView, HuntsView, ValidatorsDetail } from "@/lib/explorer/types";
@@ -62,28 +63,36 @@ export default function ProgramsPage() {
           </span>
         </div>
       </div>
-      <Deployed />
+      <Deployed chainId={status.data?.chain_id} genesisHash={status.data?.genesis_hash} />
     </main>
   );
 }
 
 /**
  * The addresses of the programs recent blocks created, newest first: from the receipts of their `create_program` transactions.
- * That's a window of recent blocks, not every program: no route lists them yet (docs/PROGRAMS-V0.md §8.2), and the page says so.
+ * That's a window of recent blocks, not every program: no route lists them yet (docs/PROGRAMS-V0.md §8.2). Pins in
+ * `FEATURED_PROGRAMS` stay listed for their chain. The page says which is which.
  */
 const CREATES = ["create_program"] as const;
 
 /** Programs anyone deployed, beside the built-in ones (docs/PROGRAMS-V0.md §8.6): read only, every name in them the deployer's. */
-function Deployed() {
+function Deployed({ chainId, genesisHash }: { chainId?: string; genesisHash?: string }) {
   const router = useRouter();
   const [q, setQ] = useState("");
   const creates = useProgramActivity(CREATES);
-  const addresses = [...new Set(creates.txs.flatMap((t) => (typeof t.program?.facts?.created === "string" && t.status === "finalized" ? [t.program.facts.created] : [])))].slice(0, 12);
+  const pins = featuredPrograms(chainId, genesisHash);
+  const listed = listDeployed(createdProgramAddresses(creates.txs), pins.map((p) => p.address));
+  const recent = listed.filter((s) => !s.featured);
+  const pinKey = pins.map((p) => p.address).join(" ");
+  const [report, setReport] = useState<{ key: string; n: number } | null>(null);
+  const onShown = useCallback((key: string, n: number) => setReport({ key, n }), []);
+  const featuredShown = report?.key === pinKey ? report.n : null;
   const open = (e: React.FormEvent) => {
     e.preventDefault();
     const v = q.trim().toLowerCase();
     if (v) router.push(to.deployed(v));
   };
+  const showEmpty = recent.length === 0 && !creates.loading && (pins.length === 0 || featuredShown === 0);
   return (
     <section className="stack-lg" aria-labelledby="deployed-heading">
       <div className="page-head">
@@ -92,7 +101,7 @@ function Deployed() {
         </span>
         <h2 id="deployed-heading">Programs anyone deployed</h2>
         <span className="sub">
-          WebAssembly on this chain, newest first. This lists the programs created in a window of recent blocks (the node has no list of every program yet), so an older program isn&apos;t here: open it by its address below. What they hold and store is on the chain; every name they use is their deployer&apos;s claim.
+          WebAssembly on this chain. Featured programs are pinned by this wallet for this chain, so they stay listed; a featured title, and the line under it, are this wallet&apos;s description. The rest are programs created in a window of recent blocks (the node has no list of every program yet), so an older one that isn&apos;t featured is opened by its address below. What a program holds is on the chain, and every name it uses is its deployer&apos;s claim.
         </span>
       </div>
       <form className="row-gap" onSubmit={open} role="search" aria-label="Open a program or code">
@@ -104,28 +113,78 @@ function Deployed() {
           Open
         </button>
       </form>
-      {addresses.length === 0 ? (
+      <FeaturedGroup pins={pins} pinKey={pinKey} onShown={onShown} />
+      {recent.length > 0 && (
+        <>
+          {featuredShown != null && featuredShown > 0 && <span className="eyebrow">Recent</span>}
+          <div className="programs" data-testid="deployed-programs">
+            {recent.map((s) => (
+              <DeployedCard key={s.address} address={s.address} />
+            ))}
+          </div>
+        </>
+      )}
+      {recent.length === 0 && creates.loading && <p className="card-note">Reading recent blocks…</p>}
+      {showEmpty && (
         <p className="card-note" data-testid="no-deployed">
-          {creates.loading ? "Reading recent blocks…" : "No program was created in the recent blocks (or this chain has programs off)."}
+          No program was created in the recent blocks (or this chain has programs off).
         </p>
-      ) : (
-        <div className="programs" data-testid="deployed-programs">
-          {addresses.map((a) => (
-            <DeployedCard key={a} address={a} />
-          ))}
-        </div>
       )}
     </section>
   );
 }
 
-function DeployedCard({ address }: { address: string }) {
+/** Pins for this chain, above the recent creates. A pin the node answers 404 for is left out, with no error. */
+function FeaturedGroup({ pins, pinKey, onShown }: { pins: readonly FeaturedProgram[]; pinKey: string; onShown: (key: string, n: number) => void }) {
+  const [missingKey, setMissingKey] = useState(pinKey);
+  const [missing, setMissing] = useState<ReadonlySet<string>>(() => new Set());
+  if (missingKey !== pinKey) {
+    setMissingKey(pinKey);
+    setMissing(new Set());
+  }
+  const missingNow = missingKey === pinKey ? missing : new Set<string>();
+  const mark = useCallback((address: string, isMissing: boolean) => {
+    setMissing((prev) => {
+      if (prev.has(address) === isMissing) return prev;
+      const next = new Set(prev);
+      if (isMissing) next.add(address);
+      else next.delete(address);
+      return next;
+    });
+  }, []);
+  const shown = pins.filter((p) => !missingNow.has(p.address)).length;
+  useEffect(() => { onShown(pinKey, shown); }, [onShown, pinKey, shown]);
+  if (pins.length === 0) return null;
+  return (
+    <div className="stack" data-testid="featured-programs" hidden={shown === 0}>
+      <div className="page-head">
+        <span className="eyebrow">Featured</span>
+        <span className="sub">Pinned for this chain. The title, and the line under the address, are this wallet&apos;s description.</span>
+      </div>
+      <div className="programs pins">
+        {pins.map((p) => (
+          <DeployedCard key={p.address} address={p.address} pin={p} onMissing={mark} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DeployedCard({ address, pin, onMissing }: { address: string; pin?: FeaturedProgram; onMissing?: (address: string, missing: boolean) => void }) {
   const read = useNode<DeployedProgramView>(`/program/${address}`, { every: 30_000 });
+  const missing = !!pin && read.error instanceof NodeError && read.error.status === 404;
+  useEffect(() => {
+    if (!pin || !onMissing) return;
+    if (missing) onMissing(address, true);
+    else if (read.data) onMissing(address, false);
+  }, [pin, onMissing, missing, read.data, address]);
+  if (missing) return null;
+  const tag = pin ? "program · featured" : "program · deployed";
   if (!read.data) {
     return (
-      <div className="card program-card">
-        <span className="tag">program · deployed</span>
-        <h2 className="mono">{shortAddress(address)}</h2>
+      <div className="card program-card" data-testid={pin ? "featured-card" : undefined}>
+        <span className="tag">{tag}</span>
+        <h2 className={pin ? undefined : "mono"}>{pin ? pin.title : shortAddress(address)}</h2>
         <span className="dim">{read.error ? `Couldn't read it: ${inertText(read.error.message, 120)}` : "Reading it…"}</span>
       </div>
     );
@@ -133,10 +192,20 @@ function DeployedCard({ address }: { address: string }) {
   const p = deployedProgram(read.data);
   const methods = Array.isArray(read.data.methods) ? read.data.methods : [];
   return (
-    <Link href={to.deployed(address)} className="card program-card" data-testid="deployed-card">
-      <span className="tag">program · deployed</span>
-      <h2 className="mono">{shortAddress(address)}</h2>
-      <span className="dim">{p.tagline}</span>
+    <Link href={to.deployed(address)} className="card program-card" data-testid={pin ? "featured-card" : "deployed-card"}>
+      <span className="tag">{tag}</span>
+      <h2 className={pin ? undefined : "mono"}>{pin ? pin.title : shortAddress(address)}</h2>
+      {pin ? (
+        <>
+          <span className="mono dim" title={address}>{shortAddress(address)}</span>
+          <span className="dim">
+            <span className="who-can">The wallet&apos;s description. </span>
+            {pin.blurb}
+          </span>
+        </>
+      ) : (
+        <span className="dim">{p.tagline}</span>
+      )}
       <span className="figure">
         <Fang display={read.data.balance_display} /> held
       </span>
