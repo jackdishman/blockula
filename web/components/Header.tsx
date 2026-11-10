@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
 import { DEFAULT_NETWORK, explorer, isNodeUrl, NETWORK, NETWORKS, RPC, SERVED, setNetwork, type Network, type NetworkKey } from "@/lib/config";
-import { isExplorerPath } from "@/lib/explorer/routes";
+import { isExplorerPath, to } from "@/lib/explorer/routes";
 import { useWallet } from "@/lib/wallet";
 import { CommandPalette, openPalette } from "./CommandPalette";
 import { Alerts } from "./explorer/Alerts";
@@ -43,8 +43,8 @@ export function Header() {
   const known = Object.values(NETWORKS).filter((n): n is Network => !!n);
   // A program's records (a hunt, a claim, a Séance) belong to Programs; every other chain page to Explore.
   const programs = /^\/(programs?|hunt|claim|seance)(\/|$)/.test(path);
-  const people = /^\/people(\/|$)/.test(path);
-  const explore = isExplorerPath(path) && !programs && !people;
+  const boos = /^\/boos(\/|$)/.test(path);
+  const explore = isExplorerPath(path) && !programs && !boos;
   return (
     <>
       <header className="top">
@@ -63,7 +63,7 @@ export function Header() {
           </button>
           <Link href="/" className={path === "/" ? "active" : ""}>{hint?.account ? "Wallet" : "Open wallet"}</Link>
           <Link href={explorer.home()} className={explore ? "active" : ""}>Explore</Link>
-          <Link href="/people" className={people ? "active" : ""}>People</Link>
+          <Link href={to.boos()} className={boos ? "active" : ""}>Boos</Link>
           <Link href="/programs" className={programs ? "active" : ""}>Programs</Link>
           {open && (
             <>

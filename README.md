@@ -115,4 +115,4 @@ deploy/   Ops for the retired public testnet (Fly.io), kept for reference
 
 ## Status
 
-**Blockula 1.0** is a kit for running your own ledger. An internal security and product review was completed and its findings fixed; **there's no third-party audit**. The public testnet ran in October and November 2026; CI replays its archived history every night. Contributions are welcome from people and agents: [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
+**Blockula 1.0** is a kit for running your own ledger. An internal security and product review was completed and its findings fixed; **there's no third-party audit**. The public testnet ran in October and November 2026; CI replays its archived history every night. Contributions are welcome from boos and agents: [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately: [SECURITY.md](SECURITY.md).

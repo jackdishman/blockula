@@ -144,7 +144,7 @@ export function CommandPalette() {
           ]
         : []),
       { id: "pulse", group: "Explore", label: "The pulse: live blocks", href: to.explore() },
-      { id: "people", group: "Explore", label: "People: accounts and names", href: to.people() },
+      { id: "boos", group: "Explore", label: "Boos: accounts and names", href: to.boos() },
       { id: "programs", group: "Explore", label: "Programs", href: to.programs() },
       { id: "hunts", group: "Explore", label: "Hunts (bounties)", href: to.program("hunts") },
       { id: "pool", group: "Explore", label: "Contribution pool", href: to.program("pool") },

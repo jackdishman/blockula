@@ -2,7 +2,7 @@
 export const to = {
   explore: () => "/explore",
   /** The directory of accounts and names. */
-  people: () => "/people",
+  boos: () => "/boos",
   block: (height: number | string) => `/block/${encodeURIComponent(String(height))}`,
   tx: (id: string) => `/tx/${encodeURIComponent(id)}`,
   account: (nameOrAddress: string) => `/account/${encodeURIComponent(nameOrAddress)}`,
@@ -24,5 +24,5 @@ export const searchHref = (hit: { type: string; id: string }) =>
 
 /** Explorer pages are wide (charts, tables); the wallet's own pages are a narrow column. */
 export function isExplorerPath(path: string) {
-  return /^\/(explore|people|block|tx|account|trace|programs?|hunt|claim|seance)(\/|$)/.test(path) || /^\/name\/[^/]+/.test(path);
+  return /^\/(explore|boos|block|tx|account|trace|programs?|hunt|claim|seance)(\/|$)/.test(path) || /^\/name\/[^/]+/.test(path);
 }

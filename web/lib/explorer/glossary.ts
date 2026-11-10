@@ -22,7 +22,7 @@ export const GLOSSARY = {
   vouch: "Staking FANG (and your Soul) on a newcomer being a real, distinct person. If they turn out to be a sybil, the voucher loses both. Newcomers can decline a vouch.",
   claim: "A merged PR submitted for the contribution pool. Validators check GitHub that it's merged and authored by the claimant's linked handle, then a Séance judges it.",
   vesting: "Rewards unlock gradually (about 90 days). Until then they can be clawed back, e.g. if the PR is reverted or the account turns out to be fake.",
-  pool: "FANG set aside to reward useful work. Each Séance pays out up to a quarter of it, split by jury scores. Per person, the best claim counts in full and each further one a quarter of the one before, so volume doesn't pay.",
+  pool: "FANG set aside to reward useful work. Each Séance pays out up to a quarter of it, split by jury scores. Per boo, the best claim counts in full and each further one a quarter of the one before, so volume doesn't pay.",
   owner_key: "A key with full control of the account: each passkey device, plus any recovery keys. It can add and revoke other keys.",
   session_key: "A spend-limited key, usually an agent's. It can only send transfers, at most its limit per period (amounts, fees, and the fee for opening any account it pays first), until it expires. The chain enforces this, not the agent.",
   mempool: "Transactions a node has accepted but no block has sealed yet. On Blockula they usually wait about a second.",

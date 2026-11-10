@@ -93,11 +93,11 @@ It joins at the next epoch boundary, within 10 minutes, and starts taking turns.
 
 ## Reaching each other
 
-Validators connect to each other on TCP port 30300, and people's nodes read from a validator's HTTP API on port 7070. Pick one way for everyone:
+Validators connect to each other on TCP port 30300, and other nodes read from a validator's HTTP API on port 7070. Pick one way for everyone:
 
 | | Best for | What to do |
 |---|---|---|
-| **Tailscale** (recommended) | Friends in different places | Everyone installs [Tailscale](https://tailscale.com) and joins one tailnet. Use each machine's Tailscale address (`100.x.y.z`, or its MagicDNS name). No port forwarding, and only people on your tailnet can reach the chain |
+| **Tailscale** (recommended) | Friends in different places | Everyone installs [Tailscale](https://tailscale.com) and joins one tailnet. Use each machine's Tailscale address (`100.x.y.z`, or its MagicDNS name). No port forwarding, and only boos on your tailnet can reach the chain |
 | **One home network** | Machines in one place | Use each machine's local address (`192.168.x.y`) |
 | **The open internet** | A ledger anyone can use | A public IP or DNS name, with TCP 30300 and 7070 forwarded to the machine. Read [Who can join](#who-can-join) first |
 
@@ -127,8 +127,8 @@ blockula run --home ~/.blockula/mychain --bind 0.0.0.0
 ## Who can join?
 
 - **While the set has 1 to 3 validators,** only you can add one, with `approve` as above.
-- **From 4 validators on,** the chain also takes newcomers by stake: anyone who registers with the bond can join at an epoch boundary, a few an epoch at most. On Tailscale or a home network, only people who can reach your nodes can get the bond from the faucet, so that's your group.
-- **On the open internet,** keep the seats for people you know. Summon with `--no-faucet`, which also raises the bond to 10,000 FANG, and give FANG yourself to people you trust. Your validator's account holds the chain's starting FANG:
+- **From 4 validators on,** the chain also takes newcomers by stake: anyone who registers with the bond can join at an epoch boundary, a few an epoch at most. On Tailscale or a home network, only boos who can reach your nodes can get the bond from the faucet, so that's your group.
+- **On the open internet,** keep the seats for boos you know. Summon with `--no-faucet`, which also raises the bond to 10,000 FANG, and give FANG yourself to boos you trust. Your validator's account holds the chain's starting FANG:
 
   ```bash
   blockula wallet send <their account> 10000 --key ~/.blockula/<chain id>/validator.key --rpc http://localhost:7070
@@ -179,11 +179,11 @@ blockula summon mychain --host <your address> --programs   # by hand
 - **A little more memory.** Don't set a tight memory or process limit on the service ([OPERATIONS.md](OPERATIONS.md#limits-a-validator-needs) has the numbers).
 - **Everyone runs the same release.** If one validator runs another build, it can fail on programs the others run fine.
 - **A pause button, and the duty to agree on it.** If something is wrong with programs, enough validators can stop new program transactions for three days (one if your chain has 1 to 3 validators, two of 4, three of 7). On a small chain that means any one of you can pause programs for three days, and keep doing it for up to 30 days of every 60, so choose validators you trust. Agree with the others before anyone signs, then `blockula program pause --key ~/.blockula/<chain id>/validator.key`. A validator signs it from its own account, so keep a few FANG there. [OPERATIONS.md](OPERATIONS.md#the-pause) walks through it.
-- **Programs can hold FANG.** FANG has no value on your chain, but there's a cap on how much programs can hold together (10,000,000 FANG to start with) that a vote can change, and a vote can switch programs off again (they keep what they hold and people can take it out).
+- **Programs can hold FANG.** FANG has no value on your chain, but there's a cap on how much programs can hold together (10,000,000 FANG to start with) that a vote can change, and a vote can switch programs off again (they keep what they hold and boos can take it out).
 
 ## Good to know
 
 - **Try it first** on your own machine: `blockula dev` runs a one-node chain with the same software (Blockula's public testnet was retired in November 2026).
 - **Programs** (small programs in WebAssembly that run on the chain) are optional and off unless you ask for them: [see above](#programs-experimental-off-by-default).
 - **Making blocks only when there are transactions** would cut an idle chain's cost further. That's a protocol change, for later.
-- **The software comes as is,** with no warranty ([LICENSE](../LICENSE)). If you ever want your chain's FANG to have value, by selling it or paying people in it, that's your project, and a question for your own lawyer.
+- **The software comes as is,** with no warranty ([LICENSE](../LICENSE)). If you ever want your chain's FANG to have value, by selling it or paying anyone in it, that's your project, and a question for your own lawyer.

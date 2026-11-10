@@ -193,10 +193,10 @@ const HUNTS_TEXT = {
   poolTitle: (open) => open ? "Get paid for useful work" : "The contribution pool",
   poolClosed: "This chain's contribution pool has no repositories yet, so it pays nothing. It keeps filling from issuance and the endowment. Only governance can add a repository.",
   budget: (c, r) => c.repos.length
-    ? stat(fang(c.pool.next_budget_display), `most a ${term("seance", "Séance")} can pay<span class="sub">${esc(r.pool_share_per_seance)} of the pool, with claims from ${r.full_budget_people || 16} or more people; less with fewer</span>`)
+    ? stat(fang(c.pool.next_budget_display), `most a ${term("seance", "Séance")} can pay<span class="sub">${esc(r.pool_share_per_seance)} of the pool, with claims from ${r.full_budget_people || 16} or more boos; less with fewer</span>`)
     : stat("nothing yet", `next ${term("seance", "Séance")} pays up to<span class="sub">no repositories</span>`),
   howTitle: (open) => open ? "How it works" : "How it would work",
-  learn: () => `<b>Useful work can be paid.</b> ${term("hunt", "Hunts")} are bounties on GitHub issues, paid by whoever posts them. The ${term("pool", "contribution pool")} pays for merged pull requests to repositories governance adds, judged by juries of people with ${term("soul", "Soul")}; it pays nothing until it has one, and its payments ${term("vesting", "unlock slowly")}. <a href="#/hunts">Hunts →</a> <a href="#/contribute">The pool →</a>`,
+  learn: () => `<b>Useful work can be paid.</b> ${term("hunt", "Hunts")} are bounties on GitHub issues, paid by whoever posts them. The ${term("pool", "contribution pool")} pays for merged pull requests to repositories governance adds, judged by juries of boos with ${term("soul", "Soul")}; it pays nothing until it has one, and its payments ${term("vesting", "unlock slowly")}. <a href="#/hunts">Hunts →</a> <a href="#/contribute">The pool →</a>`,
 };
 
 const GLOSSARY = {
@@ -222,7 +222,7 @@ const GLOSSARY = {
   vouch: "Staking FANG (and your Soul) on a newcomer being a real, distinct person. If they turn out to be a sybil, the voucher loses both. Newcomers can decline a vouch.",
   claim: "A merged PR submitted for the contribution pool. Validators check GitHub that it's merged and authored by the claimant's linked handle, then a Séance judges it.",
   vesting: "Rewards unlock gradually (about 90 days). Until then they can be clawed back, e.g. if the PR is reverted or the account turns out to be fake.",
-  pool: "FANG set aside to reward useful work. Each Séance pays out up to a quarter of it, split by jury scores. Per person, all their claims in a Séance share one win rate, the first counts in full and each further one a quarter of the one before, so more claims of the same quality add at most a third." + HUNTS_TEXT.glossaryPoolEnd,
+  pool: "FANG set aside to reward useful work. Each Séance pays out up to a quarter of it, split by jury scores. Per boo, all their claims in a Séance share one win rate, the first counts in full and each further one a quarter of the one before, so more claims of the same quality add at most a third." + HUNTS_TEXT.glossaryPoolEnd,
   stake: "FANG delegated to a validator's pool. The pool's stake decides whether it's in the active set; stakers share its rewards and its slashes.",
   commission: "The share of a pool's rewards its validator keeps before the rest goes to everyone staked in it.",
   jailed: "Taken out of the active set for missing too many of its turns (or for a missed beacon reveal). Its owner can unjail it after the jail period.",
@@ -298,8 +298,8 @@ const views = {
         <div class="figures" style="border-top-width:1px">
           ${stat(fang(s.supply_display), "total supply")}
           ${stat(fang(s.burned_display), term("burned"))}
-          ${stat(s.accounts, s.wallet ? `<a href="${esc(s.wallet)}people/">accounts</a>` : "accounts")}
-          ${stat(s.names, s.wallet ? `<a href="${esc(s.wallet)}people/">.boo names</a>` : term("name", ".boo names"))}
+          ${stat(s.accounts, s.wallet ? `<a href="${esc(s.wallet)}boos/">accounts</a>` : "accounts")}
+          ${stat(s.names, s.wallet ? `<a href="${esc(s.wallet)}boos/">.boo names</a>` : term("name", ".boo names"))}
         </div>
         <div class="health">
           <span><b class="${health.ok ? "ok" : "bad"}">${health.ok ? "● The network is healthy" : "● " + esc(health.reason || "unhealthy")}</b></span>
@@ -492,11 +492,11 @@ views.contribute = async function () {
       <li><b>${term("claim", "Claim it")}</b> with a small bond (${esc(r.claim_bond_display)}, more if you have several open), returned unless validators refute the claim or the jury marks it spam. You need ${term("soul", "Soul")} or a ${term("vouch", "vouch")} from someone who has it.</li>
       <li><b>Validators check GitHub</b>: the PR must be merged and authored by your linked handle. ${r.claim_maturity_blocks ? `Then it waits ${r.claim_maturity_blocks.toLocaleString()} blocks in case it's reverted.` : ""}</li>
       <li><b>A ${term("seance", "Séance")} judges it.</b> Up to ${r.jury_size} jurors drawn at random compare pairs of claims, seal their votes, then reveal them. Jurors who agree with the outcome earn Soul and ${esc(r.juror_share)} of the payout; those who keep disagreeing lose Soul, and no-shows lose part of their bond.</li>
-      <li><b>Payout.</b> Each Séance distributes up to ${esc(r.pool_share_per_seance)} of the pool (the full share once it judges claims of ${r.full_budget_people || 16} people; one person's many claims count once). Your claims are scored against other people's, never each other, and all of yours share one win rate, pooled over all their comparisons: the first counts in full at that rate, each next one a quarter of the one before (all together less than 4/3 of one), so one solid PR beats a pile of tiny ones, weak claims pull your rate down, and spam costs you. A person is the claimant account: every GitHub handle it links, and a sponsor's ${term("familiar", "Familiars")}, count together. Rewards ${term("vesting", "vest")} over ${r.vesting_blocks.toLocaleString()} blocks.</li>
+      <li><b>Payout.</b> Each Séance distributes up to ${esc(r.pool_share_per_seance)} of the pool (the full share once it judges claims of ${r.full_budget_people || 16} boos; one boo's many claims count once). Your claims are scored against other boos' claims, never each other, and all of yours share one win rate, pooled over all their comparisons: the first counts in full at that rate, each next one a quarter of the one before (all together less than 4/3 of one), so one solid PR beats a pile of tiny ones, weak claims pull your rate down, and spam costs you. A boo is the claimant account: every GitHub handle it links, and a sponsor's ${term("familiar", "Familiars")}, count together. Rewards ${term("vesting", "vest")} over ${r.vesting_blocks.toLocaleString()} blocks.</li>
     </ol><p class="dim">Agents can contribute as ${term("familiar", "Familiars")} of a human sponsor: the MCP's <span class="mono">submit_contribution</span>, or <span class="mono">blockula contrib claim owner/repo 123</span> from the CLI.</p>${open ? "" : "</details>"}`, "learn")}
     ${card(`<h2>${s ? `Séance #${s.id} · ${phaseText(s)}` : "No Séance open"}</h2>
       ${s ? `<p>${plural(s.claims.length, "claim")} · ${plural(s.jurors.length, "juror")} · budget ${esc(s.budget_display)} · <a href="#/seance/${s.id}">details →</a></p>${s.jurors.map((j) => `<span class="pill ${j.revealed ? "" : "pending"}">${esc(plain(j.juror.name || j.juror.short))} · ${j.revealed ? "revealed" : j.committed ? "sealed" : "waiting"}</span>`).join(" ")}`
-        : `<p class="empty">The next one can open from block #${c.next_seance_at} once matured claims of at least ${r.min_people || 2} people (not just one person's) and ${r.min_jury} jurors are available.</p>`}`)}
+        : `<p class="empty">The next one can open from block #${c.next_seance_at} once matured claims of at least ${r.min_people || 2} boos (not just one boo's) and ${r.min_jury} jurors are available.</p>`}`)}
     ${c.recent_seances.length ? card(`<h2>Recent Séances</h2><div class="rows">${c.recent_seances.map((x) => `<div class="row"><div><a href="#/seance/${x.id}">Séance #${x.id}</a> <span class="dim">· ${plural(x.claims, "claim")} · ${plural(x.jurors, "juror")}${x.results ? ` · ${x.results.accepted} accepted, ${x.results.spam} spam` : ""}</span></div><div class="dim">paid ${esc(x.budget_display)} budget</div></div>`).join("")}</div>`) : ""}
     ${card(`<h2>Recent claims</h2>${claims.claims.length ? `<div class="rows">${claims.claims.map(claimRow).join("")}</div>` : '<p class="empty">No claims yet. Be the first.</p>'}`)}
     ${card(`<h2>Souls</h2>${souls.souls.length ? `<div class="rows">${souls.souls.map((x, i) => `<div class="row"><div><span class="dim">${i + 1}.</span> ${who(x.account)}${x.github ? ` <span class="dim">@${esc(x.github)}</span>` : ""}${x.juror ? ' <span class="pill">juror</span>' : ""}</div><div>${esc(x.soul.display)}</div></div>`).join("")}</div>` : '<p class="empty">Nobody has Soul yet.</p>'}`)}
@@ -937,7 +937,7 @@ function startPage(s, ctx, invited) {
   const wallet = s.wallet ? `${o}${s.wallet}` : null;
   const plainHttp = !loopback() && location.protocol === "http:";
   const welcome = invited ? card(`<span class="eyebrow">Invitation</span><h1>You've been invited to ${name}</h1>
-    <p>A ledger a few people run together. Its ${esc(UNIT)} has no value: it only prices spam.</p>
+    <p>A ledger a few boos run together. Its ${esc(UNIT)} has no value: it only prices spam.</p>
     ${wallet ? `<p class="cta-row"><a class="wallet-cta" href="${esc(wallet)}">Open the wallet</a><span class="dim">Make a wallet with a passkey${s.faucet ? `, take 100 ${esc(UNIT)} from the faucet` : ""} and pay someone by name. Nothing to install.</span></p>
     <p class="dim">Or with the command line:</p>` : ""}
     <ol class="tasks">
@@ -963,7 +963,7 @@ function startPage(s, ctx, invited) {
       <p><a href="#/learn/tokenomics">How ${esc(UNIT)} works: supply, fees and issuance →</a></p>`)}
     ${invited ? inviteCard : ""}
     ${card(`<h2>For your coding agent</h2><p class="dim">Paste this into Claude Code to have it set up a wallet here and work on an open Hunt.</p>${cmd(agentPrompt(s))}`)}
-    ${card(`<h2>What people use a chain like this for</h2><ul class="uses">
+    ${card(`<h2>What boos use a chain like this for</h2><ul class="uses">
       <li><b>A friends' IOU ledger.</b> Settle up with a memo: <span class="mono">blockula wallet send sam.boo 12 --memo "pizza"</span>.</li>
       <li><b>Club points or tickets.</b> Hand out ${esc(UNIT)}; everyone's balance and history are in this explorer.</li>
       <li><b>A class or hackathon sandbox.</b> Everyone gets a wallet${s.faucet ? " from the faucet" : ""}, can run a node, and can watch it all here.</li>

@@ -119,7 +119,7 @@ v0.4 public testnet) can't peer with it.
 
 > FANG, Hunts and Soul have no monetary value.
 
-Contributions are welcome, from people and from agents (as Familiars): see [CONTRIBUTING.md](../CONTRIBUTING.md). Hunts and the contribution pool below are chain features: they ran on the public testnet while it lasted, and any chain can run them for its own repos.
+Contributions are welcome, from boos and from agents (as Familiars): see [CONTRIBUTING.md](../CONTRIBUTING.md). Hunts and the contribution pool below are chain features: they ran on the public testnet while it lasted, and any chain can run them for its own repos.
 
 **Hunts** are bounties on GitHub issues. They live on-chain: the FANG is escrowed in a Hunt, anyone can add to it, and only its creator awards it for the merged PR (nobody else can move the escrow; governance can only refund the funders). Browse them in the explorer's Hunts page or `GET /api/hunts`.
 
@@ -140,8 +140,8 @@ blockula hunt list | show | create | fund | cancel
 
 **Beyond Hunts, a chain's contribution pool pays FANG for any merged PR to a pool repo** (Proof of Contribution, [docs/PLAN.md](PLAN.md#-proof-of-contribution-rewarding-useful-work)):
 - Claim a merged PR you authored. Validators check it on GitHub.
-- A **Séance** judges it: a random jury of people with **Soul** (reputation you can't buy) compares claims in pairs, sealing their votes before revealing them.
-- Payouts rate a person's claims in a Séance together (one win rate over all their comparisons) and count each after the first a quarter of the one before (so in expectation volume adds at most a third), and vest over ~90 days with clawback.
+- A **Séance** judges it: a random jury of boos with **Soul** (reputation you can't buy) compares claims in pairs, sealing their votes before revealing them.
+- Payouts rate a boo's claims in a Séance together (one win rate over all their comparisons) and count each after the first a quarter of the one before (so in expectation volume adds at most a third), and vest over ~90 days with clawback.
 
 ```bash
 blockula contrib link-github vlad <gist id>       # once

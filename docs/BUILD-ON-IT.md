@@ -215,7 +215,7 @@ What makes it work:
 - **It's your node's.** The wallet is built into the `blockula` binary (`node/src/wallet.rs`). It talks only to the node that served it, shows your chain's name, and pins your chain (its id and genesis hash) the first time it loads, as it does any node's. There's no network menu.
 - **HTTPS is required for passkeys.** Browsers make passkeys only on HTTPS pages (or `localhost`), so put the node on HTTPS first ([Put it online](#4-put-it-online)): on Tailscale, `tailscale serve --bg 7070`. Over plain `http://` (a LAN or Tailscale IP) the wallet still opens, says why passkeys won't work there, and offers a browser-only key for testing.
 - **Passkeys belong to one hostname for good.** A wallet made at `https://box.tail1234.ts.net/wallet/` opens only there (or wherever else that hostname serves it). Pick the name you'll keep. A friend who runs their own node gets the same wallet from it at `http://localhost:7171/wallet/`, with passkeys of its own.
-- **Every friend needs Tailscale** for a tailnet address. For people outside it, `tailscale funnel --bg 7070` serves the same node, wallet included, to the internet; or put a full node behind a reverse proxy ([Put it online](#4-put-it-online)).
+- **Every friend needs Tailscale** for a tailnet address. For anyone outside it, `tailscale funnel --bg 7070` serves the same node, wallet included, to the internet; or put a full node behind a reverse proxy ([Put it online](#4-put-it-online)).
 - **A binary built from source** without `npm run build:wallet` serves a page at `/wallet/` saying how to build it in. Releases always have it.
 
 Prefer the command line? `blockula wallet new`, `blockula wallet faucet --rpc <node>`, `blockula wallet send alice.boo 1 --rpc <node>`.
@@ -252,7 +252,7 @@ The rules behind it:
 - **Passkeys belong to one hostname for good.** `NEXT_PUBLIC_RP_ID` must be the hostname friends open (no `https://`, no port), and a wallet made there opens only there. Pick the name you'll keep.
 - **HTTPS is required.** Browsers make passkeys only on HTTPS pages (or `localhost`), and an HTTPS page can't call a plain-`http` node. So the node needs HTTPS too.
 - **The wallet only talks to the nodes it was built for**, plus any node a user picks in its header (**Custom node…**). Change the variables and rebuild when your node's address changes.
-- **Every friend needs Tailscale** for a tailnet address. For people outside it, use `tailscale funnel` for both ports (Funnel serves ports 443, 8443 and 10000), or host it publicly.
+- **Every friend needs Tailscale** for a tailnet address. For anyone outside it, use `tailscale funnel` for both ports (Funnel serves ports 443, 8443 and 10000), or host it publicly.
 
 ### Host the wallet publicly
 

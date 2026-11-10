@@ -160,7 +160,7 @@ export function checkChain(file: string, raw: unknown): string[] {
     if (file !== `${c.chain_id}.json`) errors.push(`the file must be named ${c.chain_id}.json, after its chain_id`);
     if (!ours && soundsOfficial(c.chain_id)) errors.push("chain_id reads as Blockula's own: pick one of your chain's");
   }
-  if (text(errors, "name", c.name, MAX_NAME_BYTES, true) && !ours && soundsOfficial(c.name)) errors.push("name reads as Blockula itself, or as official: the directory lists chains people run, not the project's");
+  if (text(errors, "name", c.name, MAX_NAME_BYTES, true) && !ours && soundsOfficial(c.name)) errors.push("name reads as Blockula itself, or as official: the directory lists chains boos run, not the project's");
   if (typeof c.token !== "string" || !/^[A-Z][A-Z0-9]{1,7}$/.test(c.token)) errors.push("token must be 2–8 of A–Z and 0–9, starting with a letter (like JACK)");
   if (text(errors, "description", c.description, MAX_DESCRIPTION) && !ours && soundsOfficial(c.description)) errors.push("description reads as Blockula itself, or as official");
   if (typeof c.genesis_hash !== "string" || !/^[0-9a-f]{64}$/.test(c.genesis_hash)) errors.push("genesis_hash must be 64 lowercase hex characters (`/api/status`'s genesis_hash)");

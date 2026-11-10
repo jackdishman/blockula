@@ -137,11 +137,11 @@ test("the explorer links to the wallet, and the node's headers hold", async ({ p
   expect((await request.get("/wallet/tx/..%2f..%2fCargo.toml")).status()).toBe(400);
 });
 
-test("Add to Home Screen: the wallet's manifest is the chain's, its icons are served, People works", async ({ page, request }) => {
+test("Add to Home Screen: the wallet's manifest is the chain's, its icons are served, Boos works", async ({ page, request }) => {
   const watched = watchErrors(page);
   await watchCsp(page);
-  await page.goto("/wallet/people/");
-  await expect(page.getByRole("heading", { name: "People", exact: true })).toBeVisible();
+  await page.goto("/wallet/boos/");
+  await expect(page.getByRole("heading", { name: "Boos", exact: true })).toBeVisible();
   await expect(page.getByTestId("person").first()).toBeVisible({ timeout: 15_000 });
   const manifestHref = await page.locator('link[rel="manifest"]').getAttribute("href");
   const iconHref = await page.locator('link[rel="apple-touch-icon"]').getAttribute("href");

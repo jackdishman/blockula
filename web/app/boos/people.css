@@ -1,4 +1,4 @@
-/* People (app/people): a directory of accounts by name. Rows wrap on a phone, never scroll sideways. */
+/* Boos (app/boos): a directory of accounts by name. Rows wrap on a phone, never scroll sideways. */
 .name-strip { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px 14px; }
 .name-strip li { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; max-width: 100%; }
 .people-controls { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; margin-bottom: 8px; }

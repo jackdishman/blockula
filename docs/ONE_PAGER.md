@@ -1,10 +1,10 @@
 # 🧛 Blockula: run your own quantum-safe blockchain
 
-**What it is.** Blockula is a kit for running your own ledger: `blockula create` names a chain, gives it a ticker and starts it, and your friends' computers join it, with no hosting to pay for and nothing to buy ([docs/CREATE.md](CREATE.md)). Its signatures are built so that the coming generation of quantum computers can't forge them. It also aims to be the easiest chain to use, for people and AI agents alike. You sign in with a passkey (Face ID or Touch ID) instead of a seed phrase, pay `alice.boo` instead of `0x7f3a…`, and an agent can start using it from a single copy-paste prompt.
+**What it is.** Blockula is a kit for running your own ledger: `blockula create` names a chain, gives it a ticker and starts it, and your friends' computers join it, with no hosting to pay for and nothing to buy ([docs/CREATE.md](CREATE.md)). Its signatures are built so that the coming generation of quantum computers can't forge them. It also aims to be the easiest chain to use, for boos and AI agents alike. You sign in with a passkey (Face ID or Touch ID) instead of a seed phrase, pay `alice.boo` instead of `0x7f3a…`, and an agent can start using it from a single copy-paste prompt.
 
 ## Why now
 - **Quantum computers threaten today's chains.** Bitcoin and Ethereum sign with elliptic curves (ECDSA, BLS). A large enough quantum computer breaks those with Shor's algorithm. Attackers can record transactions today and forge them later.
-- **Crypto UX still loses people.** Seed phrases, hex addresses and unreadable explorers drive users away.
+- **Crypto UX still loses boos.** Seed phrases, hex addresses and unreadable explorers drive users away.
 - **Agents need money rails with guardrails.** An agent should be able to pay for things on a budget its owner set, enforced by the chain rather than by trust.
 
 ## How it works
@@ -31,7 +31,7 @@
   - `blockula join` syncs a full node, with the explorer browsable while it syncs.
   - `blockula validator register` registers a validator with a bond, and the chain's admin approves it.
   - The whole flow, step by step: [docs/CREATE.md](CREATE.md).
-- **Proof of Contribution**, built into every chain and run on the public testnet while it lasted: bounties (**Hunts**) on GitHub issues, and a contribution pool for any merged PR. Validators check claims against GitHub; random commit-reveal juries (**Séances**) score them; a person's claims share one pooled win rate (each after the first counting a quarter of the one before) and rewards vest with clawback; reputation (**Souls**) can't be bought. Agents take part as **Familiars** of a human sponsor.
+- **Proof of Contribution**, built into every chain and run on the public testnet while it lasted: bounties (**Hunts**) on GitHub issues, and a contribution pool for any merged PR. Validators check claims against GitHub; random commit-reveal juries (**Séances**) score them; a boo's claims share one pooled win rate (each after the first counting a quarter of the one before) and rewards vest with clawback; reputation (**Souls**) can't be bought. Agents take part as **Familiars** of a human sponsor.
 - **Validators are permissionless.** Anyone can register one with a self-bond, and at each epoch boundary the top validators by stake make the set (newcomers at most a third of it). A chain built from a genesis spec (as the public testnet was) has no admin key: nobody approves a validator, and every registration is visible in the explorer.
 - **Reviewed before release.** An internal four-track security and product review covered consensus, network/ops, client and product. Its findings were fixed and turned into regression tests. There's no third-party audit.
 

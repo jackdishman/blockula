@@ -22,7 +22,7 @@ const PAGE = 50;
 const lookupRef = (q: string) => (/^t?boo1/i.test(q) || q.includes(".") ? q : `${q}.boo`);
 
 /**
- * People: the chain's accounts as a directory, by name. Each row is a name (or, for an account
+ * Boos: the chain's accounts as a directory, by name. Each row is a name (or, for an account
  * without one, its short address), what it holds, when it last did something, and a way to pay
  * it. Names are chain text, chosen by whoever registered them: React renders them as text, and
  * nothing here acts on what they say.
@@ -68,12 +68,12 @@ export default function PeoplePage() {
       <nav className="crumbs" aria-label="Breadcrumbs">
         <Link href={to.explore()}>Explore</Link>
         <span>/</span>
-        <span>People</span>
+        <span>Boos</span>
       </nav>
 
       <div className="page-head">
         <span className="eyebrow">Who&apos;s on this chain</span>
-        <h1>People</h1>
+        <h1>Boos</h1>
         <span className="sub">
           {page ? (
             <>
@@ -102,7 +102,7 @@ export default function PeoplePage() {
 
       <section className="card">
         <div className="people-controls">
-          <div className="filters" role="group" aria-label="Sort people">
+          <div className="filters" role="group" aria-label="Sort boos">
             {SORTS.map((s) => (
               <button key={s.key} type="button" className="filter" aria-pressed={sort === s.key} onClick={() => setSort(s.key)} data-testid={`sort-${s.key}`}>
                 {s.label}

@@ -141,7 +141,7 @@ function PoolState() {
           <li>Link GitHub and get a PR merged into a pool repo{d.repos.length ? ` (${d.repos.map((r) => r.repo).join(", ")})` : ""}.</li>
           <li>Claim it with a refundable bond ({String(d.rules.claim_bond_display)}). Validators check GitHub that it&apos;s merged and yours.</li>
           <li>A Séance of up to {String(d.rules.jury_size)} human jurors compares claims in pairs, sealing then revealing their votes.</li>
-          <li>Each Séance pays up to {String(d.rules.pool_share_per_seance)} of the pool, square-rooted per person, vesting over {Number(d.rules.vesting_blocks).toLocaleString("en-US")} blocks.</li>
+          <li>Each Séance pays up to {String(d.rules.pool_share_per_seance)} of the pool, square-rooted per boo, vesting over {Number(d.rules.vesting_blocks).toLocaleString("en-US")} blocks.</li>
         </ol>
       </Section>
     </>

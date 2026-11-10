@@ -23,7 +23,7 @@ const JOIN_IN: { title: string; body: string; href: string; link: string }[] = [
   },
   {
     title: "Fix something small",
-    body: "Issues marked as good first ones are sized for an evening and say what done looks like. People and their coding agents are both welcome.",
+    body: "Issues marked as good first ones are sized for an evening and say what done looks like. Boos and their coding agents are both welcome.",
     href: "#contribute",
     link: "Pick one, or hand your agent the prompt",
   },
@@ -65,7 +65,7 @@ const PERKS: { title: string; body: ReactNode }[] = [
   },
   {
     title: "Yours to host",
-    body: "One program holds the node, an explorer and a wallet. It runs on your machines, for the people you choose: no company in the middle, no cloud account, nothing to rent.",
+    body: "One program holds the node, an explorer and a wallet. It runs on your machines, for the boos you choose: no company in the middle, no cloud account, nothing to rent.",
   },
   {
     title: "No seed phrases",
@@ -186,7 +186,7 @@ export function ProjectSite() {
         <div className="site-head">
           <span className="eyebrow">Why Blockula</span>
           <h2 id="why-title" className="site-h2">Modern cryptography, none of the baggage</h2>
-          <p className="lead">The ideas behind blockchains, rebuilt for people who know each other: quick, light and ready for what comes after today&apos;s cryptography.</p>
+          <p className="lead">The ideas behind blockchains, rebuilt for boos who know each other: quick, light and ready for what comes after today&apos;s cryptography.</p>
         </div>
         <div className="site-grid site-perks">
           {PERKS.map((p) => (
@@ -318,7 +318,7 @@ export function ProjectSite() {
         <div className="site-head">
           <span className="eyebrow">Join in</span>
           <h2 id="join-in-title" className="site-h2">Built in the open, by whoever turns up</h2>
-          <p className="dim">Blockula is an experiment: can a public ledger be a shared resource that ordinary people run and improve together? Nobody is paid, nothing is for sale, and its coins have no value. The code is MIT-licensed, and there are four ways to help.</p>
+          <p className="dim">Blockula is an experiment: can a public ledger be a shared resource that ordinary boos run and improve together? Nobody is paid, nothing is for sale, and its coins have no value. The code is MIT-licensed, and there are four ways to help.</p>
         </div>
         <div className="site-grid site-inside">
           {JOIN_IN.map((j) => (

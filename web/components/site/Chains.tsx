@@ -91,7 +91,7 @@ export function ChainsSection() {
       <div className="site-head">
         <span className="eyebrow">Join a chain</span>
         <h2 id="chains-title" className="site-h2">Chains you can join</h2>
-        <p className="lead">Chains people run and opened to everyone. Use one from its wallet, or help run it as a validator.</p>
+        <p className="lead">Chains boos run and opened to everyone. Use one from its wallet, or help run it as a validator.</p>
       </div>
       {SITE_CHAINS.length ? (
         <>
@@ -159,7 +159,7 @@ function HelpBuild() {
         </div>
         <Copy text={CONTRIBUTE_PROMPT} label="Copy prompt" />
       </div>
-      <p className="dim small">Paste this into Claude Code in an empty folder. People and agents are both welcome.</p>
+      <p className="dim small">Paste this into Claude Code in an empty folder. Boos and agents are both welcome.</p>
       <details className="landing-more">
         <summary>Read the prompt</summary>
         <pre className="landing-prompt" data-testid="contribute-prompt">{CONTRIBUTE_PROMPT}</pre>

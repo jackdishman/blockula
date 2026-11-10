@@ -33,9 +33,9 @@ The project doesn't run, check or vouch for these chains. Their coins have no va
 | `description` | required | One sentence, at most 160 characters |
 | `rpc` | required | A node's public `https://` origin, with no path or trailing slash. It must serve the explorer at `/` and the wallet at `/wallet/` (every node does). A DNS name, not an IP: passkeys need one |
 | `genesis_hash` | required | 64 lowercase hex. The site checks the node reports it, and the validator commands pin it |
-| `validators_wanted` | required | `true` if people outside your group may run validators |
+| `validators_wanted` | required | `true` if boos outside your group may run validators |
 | `p2p` | with `validators_wanted` | `host:port` your validators listen on, reachable from the internet (TCP 30300 by default) |
-| `contact` | required | A GitHub handle or an `https://` URL: where people ask to be admitted |
+| `contact` | required | A GitHub handle or an `https://` URL: where boos ask to be admitted |
 | `listed_at` | optional | `YYYY-MM-DD` |
 
 No other fields are taken.

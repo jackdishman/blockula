@@ -68,7 +68,7 @@ test("Start is a task list with this node's commands, and hides what a fresh cha
   await expect(prompt).toContainText("Call create_wallet, then faucet.");
   await expect(prompt).toContainText("Call list_hunts");
   await expect(prompt).toContainText("read AGENTS.md and CONTRIBUTING.md");
-  await expect(app).toContainText("What people use a chain like this for");
+  await expect(app).toContainText("What boos use a chain like this for");
   // A fresh chain has no Hunts and no pool: their nav links go; the pages stay.
   await expect(page.locator('nav a[href="#/hunts"]')).toBeHidden();
   await expect(page.locator('nav a[href="#/contribute"]')).toBeHidden();

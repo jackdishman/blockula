@@ -19,7 +19,7 @@ FANG is the native token of Blockula. It pays transaction fees, bonds validators
 ## What changed on 2026-11-08
 
 - **No founder allocation.** The founder's 10% went to the treasury (now 40%).
-- **No community-distribution bucket.** Its 32% went to the contribution endowment (now 47%), so FANG reaches people as pay for verified work, judged by juries, not as an airdrop with criteria to be decided later.
+- **No community-distribution bucket.** Its 32% went to the contribution endowment (now 47%), so FANG reaches boos as pay for verified work, judged by juries, not as an airdrop with criteria to be decided later.
 - Unchanged: no sale, the bootstrap delegation, the operators' and auditors' 3%, the issuance schedule, the fee burn, no admin keys, and no faucet on mainnet.
 
 ## 1. Genesis allocation
@@ -27,7 +27,7 @@ FANG is the native token of Blockula. It pays transaction fees, bonds validators
 | Bucket | % | FANG | Held by | Release (enforced on-chain) | Who moves it | Votes? |
 |---|---|---|---|---|---|---|
 | Community treasury | 40% | 400,000,000 | Keyless `treasury` account | Unlocks linearly over 4 years (100M a year). Holds the 10% once planned for the founder and the 5% once planned for a foundation, which governance may fund from here (section 10). Also receives 10% of issuance, name fees, and the bootstrap delegation as it unwinds | Governance only (`TreasurySpend`; large spends need ⅔) | No |
-| Contribution endowment | 47% | 470,000,000 | Keyless contribution pool | Released into the pool's spendable balance linearly over 10 years (47M a year), on top of 20% of issuance. Holds the 32% once planned for community distributions: FANG reaches people as pay for verified work, not as a giveaway | Séance juries (each Séance draws at most 25% of the pool) | No |
+| Contribution endowment | 47% | 470,000,000 | Keyless contribution pool | Released into the pool's spendable balance linearly over 10 years (47M a year), on top of 20% of issuance. Holds the 32% once planned for community distributions: FANG reaches boos as pay for verified work, not as a giveaway | Séance juries (each Séance draws at most 25% of the pool) | No |
 | Validator bootstrap delegation | 10% | 100,000,000 | Keyless `bootstrap` account | Delegated by formula at every epoch boundary: equal shares to every member of the next active set (so not jailed) not run by the founder, rebalanced each epoch. Returns to the treasury linearly over years 2–4. Its staking rewards go to the treasury each epoch; operators keep their commission on it, at most `bootstrap_commission_cap_bps` (10%; a validator charging more pays the rest of it to the treasury). Its stake doesn't count toward a validator's rank for a seat, or toward the governance quorum base | The protocol formula (`staking::bootstrap_epoch`) | No |
 | Genesis operators and security grants | 3% | 30,000,000 | Each recipient's own account, under a signed service agreement (genesis operators, auditors who accept FANG) | 6-month cliff, then linear to 2 years from genesis | The recipient, within the lock | Vested tokens only |
 | Community distributions, founder, foundation | 0% | 0 | | Kept as empty buckets so the testnets' genesis specs still rebuild | | |
@@ -133,7 +133,7 @@ Staking rewards are payment for validating and securing the network. They aren't
 ## 7. No founder allocation
 
 - **The founder gets nothing at genesis** (changed 2026-11-08; it was 10%, 100M FANG, on a 1-year cliff and 4-year vest). A project whose site says "no investors, nobody is selling you anything" shouldn't hand its maker a tenth of the supply, and a founder's allocation together with the founder's promotion is the pattern regulators read as an investment contract (section 9).
-- **The founder earns as anyone does:** commission as a validator (at most 2 seats, DEC-3, with their owners in `bootstrap_excluded` so the bootstrap delegation passes them over), and contribution-pool rewards judged by juries of other people. The genesis Soul ledger gives the founder 0.
+- **The founder earns as anyone does:** commission as a validator (at most 2 seats, DEC-3, with their owners in `bootstrap_excluded` so the bootstrap delegation passes them over), and contribution-pool rewards judged by juries of other boos. The genesis Soul ledger gives the founder 0.
 - **Pledges stay** (see "What the founder must not do"): no votes on proposals that pay the founder or the founder's company, and any sale of FANG the founder earns only under a pre-announced plan.
 
 ## 8. Deliberately absent

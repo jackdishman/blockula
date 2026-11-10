@@ -12,7 +12,7 @@ Or skip to **[Let your coding agent do it](#let-your-coding-agent-do-it)** and p
 
 ## What a validator does
 
-A Blockula chain is a shared ledger kept by a small group of computers, its **validators**. Every couple of seconds one of them proposes the next block (the latest batch of payments, names and so on), and the others check it and vote. When enough of them agree, the block is final: nobody can undo it. More validators run by more people means no single person can stop the chain or rewrite it.
+A Blockula chain is a shared ledger kept by a small group of computers, its **validators**. Every couple of seconds one of them proposes the next block (the latest batch of payments, names and so on), and the others check it and vote. When enough of them agree, the block is final: nobody can undo it. More validators run by more boos means no single boo can stop the chain or rewrite it.
 
 Your validator is a program, `blockula`, running on a computer that's always on. It holds one secret, **`validator.key`**, which it signs its votes with. To join, you lock some of the chain's coins as a **bond**, a promise to behave.
 
@@ -151,7 +151,7 @@ Keep the validator's own HTTP port (7070) closed: only 30300 (p2p) and 7171 (the
 
 Any always-on machine works: a spare laptop, a mini PC, a Raspberry Pi 4 or 5 with 4 GB, a Mac that never sleeps. What to know first:
 
-- **Your home IP becomes public**, published by the chain for good. People can find roughly where you are from it, and could aim traffic at your connection. If that bothers you, use Path C.
+- **Your home IP becomes public**, published by the chain for good. Anyone can find roughly where you are from it, and could aim traffic at your connection. If that bothers you, use Path C.
 - **Carrier-grade NAT doesn't work.** If your router's WAN (internet) address starts with `100.64`–`100.127`, your provider shares one IP between many homes, and nobody can reach your ports. Use Path A or C.
 - **A changing IP needs a name.** Most home IPs change now and then. Use a dynamic DNS name (many routers have it built in, or try DuckDNS) as your host, so it follows your IP.
 - **Your upload counts.** About 150 GB a month on a small set; check your plan has no low cap.

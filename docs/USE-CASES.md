@@ -1,6 +1,6 @@
 # What to do with your chain
 
-A small chain run by friends, a club, a class or a team. Here are eight things people can do on one today, with the first commands to try. Each assumes a chain [you made](CREATE.md), and `<node>` is one of its nodes (`http://localhost:7070` on the machine that runs it).
+A small chain run by friends, a club, a class or a team. Here are eight things boos can do on one today, with the first commands to try. Each assumes a chain [you made](CREATE.md), and `<node>` is one of its nodes (`http://localhost:7070` on the machine that runs it).
 
 The unit has no value on any of them. It's how the chain counts and charges fees, not money.
 
@@ -35,7 +35,7 @@ The validator steps are in [CREATE.md](CREATE.md#3-friends-become-validators). `
 ## 3. A club that votes
 
 **Who:** a club, a band, a reading group.
-**What:** someone puts a question to a vote ("Move meetings to Thursdays?"), members vote aye or nay, and the result is on the chain. A vote stays open a week. In the chain's first year, ⅔ of its validators can also pass a proposal as a council, so on a small chain the people running it decide.
+**What:** someone puts a question to a vote ("Move meetings to Thursdays?"), members vote aye or nay, and the result is on the chain. A vote stays open a week. In the chain's first year, ⅔ of its validators can also pass a proposal as a council, so on a small chain the boos running it decide.
 **Uses:** governance text proposals and votes.
 
 ```bash
@@ -49,7 +49,7 @@ A vote locks the amount you vote with until voting ends (longer with `--convicti
 ## 4. A team's bounty board
 
 **Who:** a team with a GitHub repo, or friends hacking on a side project.
-**What:** put bounties on GitHub issues. Whoever fixes one gets it once the PR merges, people or coding agents alike. The bounty sits in escrow on the chain until the creator awards it.
+**What:** put bounties on GitHub issues. Whoever fixes one gets it once the PR merges, boos or coding agents alike. The bounty sits in escrow on the chain until the creator awards it.
 **Uses:** Hunts, GitHub links, the MCP for agents.
 
 ```bash
@@ -76,7 +76,7 @@ Paste the grant code it gives you into the wallet's **Devices & agents → Give 
 
 ## 6. A hackathon sandbox
 
-**Who:** people building apps at a hackathon or in a workshop.
+**Who:** boos building apps at a hackathon or in a workshop.
 **What:** a chain with a faucet, so every team gets free units to build with: a tip jar, a ticket counter, a leaderboard that pays. The SDK runs in Node and the browser, and passkeys mean nobody handles a seed phrase.
 **Uses:** the SDK, passkey wallets, names, the HTTP API.
 
@@ -97,7 +97,7 @@ await wallet.send("alice.boo", "1", { memo: "great demo" });
 
 ## 7. A programs lab
 
-**Who:** people curious about programs that live on a ledger.
+**Who:** boos curious about programs that live on a ledger.
 **What:** upload a WebAssembly program, create it, call it, and see what it stored. Programs are experimental and off by default, so make the chain with them on.
 **Uses:** programs.
 
@@ -110,7 +110,7 @@ blockula program upload node/vm/tests/programs/counter.wasm --interface node/vm/
 
 ## 8. Practice running validators
 
-**Who:** people who want to learn how validators and staking work, with nothing at stake.
+**Who:** boos who want to learn how validators and staking work, with nothing at stake.
 **What:** run a validator, delegate to a friend's, watch rewards come in each epoch, get jailed for missing turns and unjail. Unbonding takes 21 days, the same as on a real network, so you learn what that means too.
 **Uses:** validators, staking, jailing.
 

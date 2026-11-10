@@ -356,7 +356,7 @@ function Welcome() {
             <span className="eyebrow">Your name, later</span>
             <h1>Claim your .boo name</h1>
             <p className="dim">
-              A name like <b>vlad.boo</b> points to your long address, so people can send to it. Names cost FANG{cheapest !== null ? `, from ${formatFang(cheapest)} for a year` : ""}, and this wallet {balance > 0n ? "doesn't have enough yet" : "has none yet"}. Once some reaches you, claim one from Home.
+              A name like <b>vlad.boo</b> points to your long address, so boos can send to it. Names cost FANG{cheapest !== null ? `, from ${formatFang(cheapest)} for a year` : ""}, and this wallet {balance > 0n ? "doesn't have enough yet" : "has none yet"}. Once some reaches you, claim one from Home.
             </p>
           </div>
           <button className="btn primary big center-self" onClick={() => setStep("done")}>Skip for now</button>

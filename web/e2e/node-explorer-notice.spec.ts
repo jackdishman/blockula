@@ -130,7 +130,7 @@ test("a pool with repositories says how it works and the most a Séance can pay"
   await expect(app.locator("h2", { hasText: "How it works" })).toBeVisible();
   await expect(app).not.toContainText("has no repositories yet");
   await expect(app.locator(".stat", { hasText: "most a Séance can pay" })).toContainText("100FANGmost a Séance can pay");
-  await expect(app.locator(".stat .sub")).toHaveText("25% of the pool, with claims from 16 or more people; less with fewer");
+  await expect(app.locator(".stat .sub")).toHaveText("25% of the pool, with claims from 16 or more boos; less with fewer");
   await expect(app).toContainText("with a small bond (1 FANG, more if you have several open), returned unless validators refute the claim or the jury marks it spam.");
 });
 
@@ -138,7 +138,7 @@ test("Learn says who pays for useful work, and that a pool without repositories 
   // Learn tells of Hunts and the pool only on a chain that has some (here, a pool repository).
   await open(page, OWN_CHAIN, "#/learn", [{ repo: "jackdishman/blockula", weight: 10 }]);
   const app = page.locator("#app");
-  await expect(app).toContainText("Useful work can be paid. Hunts are bounties on GitHub issues, paid by whoever posts them. The contribution pool pays for merged pull requests to repositories governance adds, judged by juries of people with Soul; it pays nothing until it has one, and its payments unlock slowly.");
+  await expect(app).toContainText("Useful work can be paid. Hunts are bounties on GitHub issues, paid by whoever posts them. The contribution pool pays for merged pull requests to repositories governance adds, judged by juries of boos with Soul; it pays nothing until it has one, and its payments unlock slowly.");
   await expect(app.getByRole("link", { name: "Hunts →" })).toHaveAttribute("href", "#/hunts");
   await expect(app.getByRole("link", { name: "The pool →" })).toHaveAttribute("href", "#/contribute");
   await expect(app).not.toContainText("Useful work gets paid");

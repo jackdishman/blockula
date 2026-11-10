@@ -63,7 +63,7 @@ export function ConnectSection() {
             <span className="dim">Like <code>https://jack.tail1234.ts.net</code>. Plain <code>http://</code> works only on this computer or a private network.</span>
           )}
         </p>
-        <p className="dim small">A node decides what its chain looks like to you, so open ones from people you know.</p>
+        <p className="dim small">A node decides what its chain looks like to you, so open ones from boos you know.</p>
       </div>
     </section>
   );
