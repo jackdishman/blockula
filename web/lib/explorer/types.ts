@@ -195,6 +195,14 @@ export interface ProgramMethodView {
 }
 
 /** `/api/program/{address}`: a deployed program's record and what follows from it. */
+/** `GET /api/programs` (node/src/programs/api.rs `programs`): every program, newest create first, a page at a time. */
+export interface ProgramsList {
+  programs: { address: string; creator: Label; created_at: number; wasm_hash: string; interface_hash: string; version: number; accepts_transfers: boolean; balance: string; balance_display: string; items: number }[];
+  next: string | null;
+  total: number;
+  height: number;
+}
+
 export interface DeployedProgramView {
   address: string;
   creator: Label;

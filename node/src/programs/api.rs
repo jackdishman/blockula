@@ -5,6 +5,7 @@
 //!
 //! | Route | Returns |
 //! |---|---|
+//! | `GET /api/programs?after=&limit=` | every program, newest create first, a page at a time |
 //! | `GET /api/program/{address}` | the record, its code and version digest, who may upgrade it once upgrades exist, its balance and storage totals, its methods, the proof path of its record |
 //! | `GET /api/program/{address}/storage?after=&limit=` | its storage entries in key order, a bounded page at a time |
 //! | `GET /api/code/{hash}` | a stored code's size, method names, uploader, deposit and references; `?wasm=1` adds the code |
@@ -170,6 +171,53 @@ pub(crate) async fn program(State(n): State<Node>, Path(address): Path<String>) 
         "proof_path": format!("/api/proof/{}/{}", ns::PROGRAMS, hex::encode(address.as_bytes())),
         "height": v.height,
     })))
+}
+
+/// The most programs a `/api/programs` page holds.
+pub const PROGRAMS_PAGE_MAX: usize = 100;
+
+#[derive(Deserialize)]
+pub struct ProgramsQuery {
+    /// The previous page's `next`: the address its last program had.
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+/// `GET /api/programs?after=&limit=`: every program on the chain, newest create first (ties by
+/// address), from just past `after`, at most `limit` (1 to [`PROGRAMS_PAGE_MAX`], default 50) at
+/// a time, ranked once per block (`ReadView::programs_recent`). Each row is the record's summary;
+/// `/api/program/{address}` has the rest. `next` is the next page's `after`, `null` at the end;
+/// an `after` that names no program starts from the newest. No name of a deployer's is in it.
+pub(crate) async fn programs(State(n): State<Node>, Query(q): Query<ProgramsQuery>) -> ApiResult {
+    let v = n.live.view();
+    let st = &v.state;
+    status_now(st).ok_or_else(dormant)?;
+    let list = v.programs_recent();
+    let limit = q.limit.unwrap_or(50).clamp(1, PROGRAMS_PAGE_MAX);
+    let start = q.after.as_deref().and_then(|a| list.iter().position(|x| x == a)).map_or(0, |i| i + 1);
+    let end = (start + limit).min(list.len());
+    let page = &list[start.min(end)..end];
+    let next = (end < list.len()).then(|| page.last().cloned()).flatten();
+    let rows: Vec<Value> = page
+        .iter()
+        .filter_map(|a| st.programs.records.get(a).map(|r| (a, &r.0)))
+        .map(|(a, r)| {
+            let balance = st.account(a).balance;
+            json!({
+                "address": a,
+                "creator": label(&v, &r.creator),
+                "created_at": r.created_at,
+                "wasm_hash": hex::encode(r.wasm_hash),
+                "interface_hash": hex::encode(r.interface_hash),
+                "version": r.version,
+                "accepts_transfers": r.accepts_transfers,
+                "balance": balance.to_string(),
+                "balance_display": fmt_fang(balance),
+                "items": r.items,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "programs": rows, "next": next, "total": list.len(), "height": v.height })))
 }
 
 /// The most entries a storage page holds (`api::ACCOUNT_LIST_LIMIT`, every list's page size).

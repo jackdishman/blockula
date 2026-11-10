@@ -12,7 +12,7 @@ import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
 import type { Locator, Page } from "@playwright/test";
 
 /** Node reads that answer 404 on purpose (not a multisig, a page about something that isn't there). */
-const EXPECTED_404 = [/\/api\/multisig\//, /\/api\/tx\/0{64}$/, /\/api\/account\/nosuch\.boo$/, /\/api\/hunt\/99$/, /\/api\/program\/boo1[0-9a-z]+$/];
+const EXPECTED_404 = [/\/api\/multisig\//, /\/api\/tx\/0{64}$/, /\/api\/account\/nosuch\.boo$/, /\/api\/hunt\/99$/, /\/api\/program\/boo1[0-9a-z]+$/, /\/api\/programs\?/];
 
 /** Errors the page logs, uncaught exceptions, and node reads that failed unexpectedly, from now on. */
 function watchErrors(page: Page) {
@@ -226,6 +226,12 @@ test.describe("every explorer page", () => {
     await visit(page, "/seance/2", (p) => p.getByText(/^Sealing votes until block/), errors);
   });
 
+  test("on a node without /api/programs, the Programs page lists recent creates and says so", async ({ page, node }) => {
+    node.listsPrograms = false;
+    await visit(page, "/programs", (p) => p.getByTestId("deployed-card").first(), errors);
+    await expect(page.locator('section[aria-labelledby="deployed-heading"] .sub')).toContainText("programs created in a window of recent blocks");
+  });
+
   test("a deployed program, its receipts, and the text its deployer chose", async ({ page, node }) => {
     // The program's page: what the chain holds (facts) apart from the names its deployer chose (claims, as text).
     await visit(page, `/program/${PROGRAM}`, (p) => p.getByTestId("program-record"), errors);
@@ -313,8 +319,8 @@ test.describe("every explorer page", () => {
 
     // The programs page lists it beside the built-in ones; its account page says it's a program.
     await visit(page, "/programs", (p) => p.getByRole("heading", { name: "Programs anyone deployed" }), errors);
-    // The page says what it lists: the creates in a window of recent blocks, not every program.
-    await expect(page.locator('section[aria-labelledby="deployed-heading"] .sub')).toContainText("programs created in a window of recent blocks");
+    // The page says what it lists: every program, from the node's list.
+    await expect(page.locator('section[aria-labelledby="deployed-heading"] .sub')).toContainText("Every program on this chain, newest first");
     const card = page.getByTestId("deployed-card").first();
     await expect(card).toBeVisible();
     await expect(card.locator("code.named", { hasText: HOSTILE_METHOD })).toBeVisible();
