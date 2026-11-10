@@ -7,6 +7,7 @@ import { Heartbeat } from "@/components/explorer/Heartbeat";
 import { useMe } from "@/components/explorer/kit";
 import { Ledger } from "@/components/explorer/Ledger";
 import { Apparition } from "@/components/Haunt";
+import { BalanceHistory } from "@/components/BalanceHistory";
 import { BalanceBreakdown, NameExpiryBanner, OnePasskeyBanner } from "@/components/HomeNotes";
 import { Landing } from "@/components/Landing";
 import { ProjectSite } from "@/components/site/ProjectSite";
@@ -88,6 +89,8 @@ function Home() {
         </div>
         <Heartbeat />
       </section>
+
+      <BalanceHistory />
 
       {hint.pendingKit && !account.keys.some((k) => k.key_id === hint.pendingKit?.keyId) && (
         <div className="banner">
