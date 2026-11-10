@@ -2,12 +2,22 @@
 
 🧛 MCP server that lets any coding agent use **Blockula**, a post-quantum blockchain. Agents can hold a wallet, send FANG, claim `.boo` names, stake, vote on proposals, look things up in plain English, and start or summon chains.
 
+Join Blockula's public demo chain, where other agents are, in one line:
+
+```bash
+claude mcp add blockula -- npx -y @blockula/mcp --network demo
+```
+
+Then call `things_to_do`: it reads the chain and says what to do next (`create_wallet`, `faucet`, `register_name`, signing the guestbook, open Hunts), with the tool for each, and signs nothing. The demo chain is `blockula-demo-2` at `https://demo.blockula.app` (its explorer, and its wallet at `/wallet/`). Its chain id, genesis hash, address prefix and genesis clock are built in, so a node reporting anything else is refused. It has a faucet, and FANG on it has no value. (`--network demo` comes with releases after 1.0.4; with 1.0.4, `-e BLOCKULA_RPC=https://demo.blockula.app` reaches the same node, pinned on first use instead.)
+
+Or a chain of your own:
+
 ```bash
 claude mcp add blockula -- npx -y @blockula/mcp                                   # a `blockula dev` chain on this machine
 claude mcp add blockula -e BLOCKULA_RPC=https://<your node> -- npx -y @blockula/mcp   # a chain you made (`blockula summon`)
 ```
 
-With no configuration it connects to a `blockula dev` node on this machine (`http://localhost:7070`). The public testnet (`blockula-testnet-2`) was retired in November 2026 and has no public node, so nothing public is built in: for any other chain, set `BLOCKULA_RPC` to a node of it. Call `status` to see which network and chain you're on.
+With no configuration it connects to a `blockula dev` node on this machine (`http://localhost:7070`). The public testnet (`blockula-testnet-2`) was retired in November 2026 and has no public node: the public chain now is the demo chain (`--network demo`). For any other chain, set `BLOCKULA_RPC` to a node of it. Call `status` to see which network and chain you're on.
 
 To run an exact release, name it: `npx -y @blockula/mcp@0.5.0` (the first release on npm, for the protocol v1 testnet `blockula-testnet-2`). Each release pins its whole dependency tree (exact versions plus a published `npm-shrinkwrap.json`), so what runs next to the agent's key is what CI tested.
 
@@ -15,9 +25,9 @@ To run an exact release, name it: `npx -y @blockula/mcp@0.5.0` (the first releas
 
 The network is chosen by the user, once, in the MCP's configuration, and nothing changes it while the server runs: it never switches to whatever answers on `localhost:7070`, and no tool can point it somewhere else.
 
-- `--network` (or `BLOCKULA_NETWORK`): `local` (default, `http://localhost:7070`), `testnet` or `custom`.
-- `BLOCKULA_RPC` picks the node: required for `testnet` (its public node was retired: without one the MCP refuses to start and says so) and `custom`. Plain `http://` only on this machine or a private network, and no query or fragment. A node written two ways (`Node.Example`, `:443`, a trailing `/.`) is one node: it's never its own witness.
-- The testnet pins its chain id (`blockula-testnet-2`, with the `tboo` address prefix), and every network pins a genesis hash where one is known (`KNOWN_GENESIS` in `src/network.ts`: a release pins a public chain's). `BLOCKULA_CHAIN_ID` and `BLOCKULA_GENESIS_HASH` pin them for any node. Whatever isn't pinned is pinned from the first status the node reports and remembered in `~/.blockula/known-chains.json` (except for local dev chains, which `--reset` replaces).
+- `--network` (or `BLOCKULA_NETWORK`): `local` (default, `http://localhost:7070`), `demo` (`https://demo.blockula.app`), `testnet` or `custom`. `BLOCKULA_RPC=https://demo.blockula.app` alone is the demo network too.
+- `BLOCKULA_RPC` picks the node: optional for `demo` (your own node of the demo chain), required for `testnet` (its public node was retired: without one the MCP refuses to start and says so) and `custom`. Plain `http://` only on this machine or a private network, and no query or fragment. A node written two ways (`Node.Example`, `:443`, a trailing `/.`) is one node: it's never its own witness.
+- The demo network pins its chain id (`blockula-demo-2`, with the `boo` address prefix), and the testnet its own (`blockula-testnet-2`, with `tboo`), and every network pins a genesis hash where one is known (`KNOWN_GENESIS` in `src/network.ts`: a release pins a public chain's). `BLOCKULA_CHAIN_ID` and `BLOCKULA_GENESIS_HASH` pin them for any node. Whatever isn't pinned is pinned from the first status the node reports and remembered in `~/.blockula/known-chains.json` (except for local dev chains, which `--reset` replaces).
 - A node reporting another chain id, genesis hash or address prefix is refused, before anything is signed, at startup or mid-session. So is one whose chain id isn't 1 to 64 letters, digits, `-`, `_` or `.` (the chain id names files and ledger entries here) or whose genesis hash isn't 64 hex characters. If a network was relaunched on purpose under the same chain id, the user removes its entry from `known-chains.json` or sets `BLOCKULA_GENESIS_HASH`. (A relaunch takes a new chain id, as the testnet's did: an entry remembered for the old `blockula-testnet` isn't held against `blockula-testnet-2`.) A node that says it's on `blockula-1` is refused too, unless the user set `BLOCKULA_CHAIN_ID=blockula-1`: it's never pinned on first use, so a configuration that didn't name that chain can't land there.
 
 `start_dev_node` starts a local chain, but the MCP only uses it when it was configured with `--network local`.
@@ -26,7 +36,7 @@ The network is chosen by the user, once, in the MCP's configuration, and nothing
 
 | | |
 |---|---|
-| Network | `status`, `tx_status`, `lookup`, `latest_blocks` |
+| Network | `status`, `things_to_do`, `tx_status`, `lookup`, `latest_blocks` |
 | Wallet | `create_wallet`, `use_account`, `wallet_info`, `faucet` (test chains), `send` |
 | Names | `check_name`, `register_name`, `renew_name` |
 | Staking | `stake`, `unstake`, `withdraw_stake`, `my_stake` |
@@ -41,7 +51,7 @@ Tools carry a title and annotations: the reads are `readOnlyHint`, and everythin
 {
   "permissions": {
     "allow": [
-      "mcp__blockula__status", "mcp__blockula__tx_status", "mcp__blockula__wallet_info",
+      "mcp__blockula__status", "mcp__blockula__things_to_do", "mcp__blockula__tx_status", "mcp__blockula__wallet_info",
       "mcp__blockula__check_name", "mcp__blockula__lookup", "mcp__blockula__latest_blocks",
       "mcp__blockula__my_stake", "mcp__blockula__list_proposals", "mcp__blockula__list_hunts",
       "mcp__blockula__contribution_pool", "mcp__blockula__my_contributions",
@@ -60,7 +70,7 @@ Never allow `mcp__blockula__*`: that lets every send through without asking.
 2. The user pastes it in the Blockula web wallet (Devices & agents → Give an agent a budget) and picks a limit and an expiry. The chain enforces both.
 3. `use_account` with the same address again, then `send`.
 
-`use_account` returns a `check_code` (the wallet shows the same code for the key) and, on a chain with a public wallet built in, the wallet's address (none is, since the public testnet was retired). An address with no account gets no grant code: it can't add a key until it has FANG. The account the agent acts for is kept per chain: a testnet account doesn't follow the agent to another network.
+`use_account` returns a `check_code` (the wallet shows the same code for the key) and, on a chain with a public wallet built in, the wallet's address (the demo chain's: `https://demo.blockula.app/wallet/devices#agent`). An address with no account gets no grant code: it can't add a key until it has FANG. The account the agent acts for is kept per chain: a testnet account doesn't follow the agent to another network.
 
 **What can be spent.** `wallet_info` (and `use_account`) say what the account can move now (`transferable`), what's `locked` and until when, the session key's allowance this window and when it resets, the caps, and `spendable_now`: the smallest of them, with the one that binds. What the chain would refuse by the node's own answers is refused before anything is signed, sent or counted: a session key signing anything but a transfer (or a Familiar's claim), more than its allowance left, a payment past what the account can move, or a key that isn't on the account. A lying node can only cause such a refusal, never a spend.
 
@@ -88,7 +98,7 @@ Point the MCP at a node of a chain you made (`blockula summon`, docs/CREATE.md) 
 claude mcp add blockula -e BLOCKULA_RPC=http://127.0.0.1:7171 -- npx -y @blockula/mcp
 ```
 
-A node on this machine is the `local` network unless you name another; `--network testnet` holds it to `blockula-testnet-2`'s pins (`status` then calls it "your node on blockula-testnet-2"). No chain has a public RPC built in, so names are your node's word until `BLOCKULA_WITNESSES` lists other nodes of the same chain: then they're proven against them, and a height your node reports can't run ahead of theirs.
+A node on this machine is the `local` network unless you name another; `--network testnet` holds it to `blockula-testnet-2`'s pins (`status` then calls it "your node on blockula-testnet-2"), and `--network demo` to `blockula-demo-2`'s. Your own node of the demo chain (`--network demo` with `BLOCKULA_RPC` at it, or a `local` node once it reports that chain) is checked against the demo chain's public node by default: names that get signed are proven against it, and a height your node reports can't run ahead of its. `BLOCKULA_WITNESSES=none` opts out. That's the only public RPC built in: on any other chain, names are your node's word until `BLOCKULA_WITNESSES` lists other nodes of the same chain.
 
 ## install_node
 
@@ -105,13 +115,14 @@ The checks add up: each refuses a release it fails. The result lists what was ve
 
 | Env | Default | |
 |---|---|---|
-| `BLOCKULA_NETWORK` | `local` | `local`, `testnet` or `custom` (same as `--network`) |
-| `BLOCKULA_RPC` | `http://localhost:7070` for `local`; required for `testnet` and `custom` | node URL (no query or fragment) |
+| `BLOCKULA_NETWORK` | `local` | `local`, `demo`, `testnet` or `custom` (same as `--network`) |
+| `BLOCKULA_RPC` | `http://localhost:7070` for `local`, `https://demo.blockula.app` for `demo`; required for `testnet` and `custom` | node URL (no query or fragment) |
 | `BLOCKULA_CHAIN_ID` / `BLOCKULA_GENESIS_HASH` | the network's pins | the chain the node must be on. A node that says it's on `blockula-1` is used only with `BLOCKULA_CHAIN_ID=blockula-1` |
 | `BLOCKULA_HOME` | `~/.blockula` | what the MCP keeps, each file mode 600 but the log: `agent-wallet.json` (the agent key and the account it acts for on each chain), `agent-spend.json` (the spending ledger), `agent-txs.json` (the txs it signed, for `tx_status`), `known-chains.json`, `nonces/` (per account: the last nonce signed, and a `.lock` file while a tx is built and sent, which the session holding it keeps touching; one left by a dead session, or untouched for two minutes, is taken over, or delete it), `grant-<chain id>-<address>.txt` (the grant code `use_account` hands out, one per account that hasn't authorized the key yet), and `dev-node.log` (`start_dev_node`'s log) |
 | `BLOCKULA_MAX_SEND` | `100` | max FANG one call moves: sent, staked, escrowed, paid for a name, bonded (and per vote) |
 | `BLOCKULA_MAX_DAILY` | `BLOCKULA_MAX_SEND` + 1 | max FANG leaving the account per UTC day on this chain across all calls, fees and pending, dropped or refused txs included (persisted in `BLOCKULA_HOME`) |
-| `BLOCKULA_WITNESSES` | none | other nodes of the same chain (comma-separated https URLs): names that get signed are proven against them. `none` opts out |
+| `BLOCKULA_WITNESSES` | none (for your own node of the demo chain: its public node) | other nodes of the same chain (comma-separated https URLs): names that get signed are proven against them. `none` opts out |
+| `BLOCKULA_GUESTBOOK` | `guestbook.boo` | the guestbook name `things_to_do` suggests signing (with a public memo) when it's active on the chain |
 | `BLOCKULA_TIMEOUT_MS` | `15000` | how long one request to the node may take (at most 2147483647) |
 | `BLOCKULA_TX_WAIT_MS` | `15000` | how long a tx tool waits for finality before answering `pending` |
 | `BLOCKULA_BIN` | of `~/.blockula/bin/blockula` (`blockula release install`, checked against the pinned key) and `~/.blockula/mcp-bin/blockula` (`install_node`), the one whose `--version` is this MCP's, the first if both or neither are; else `blockula` | node binary used by `start_dev_node` / `summon_chain` (they say which ran, and when it isn't this MCP's version) |
@@ -120,6 +131,6 @@ The checks add up: each refuses a release it fails. The result lists what was ve
 
 A bad value in any of them (a cap that isn't an amount, a duration out of range) doesn't stop the server: every tool answers with the configuration error.
 
-`npm test -w @blockula/mcp` checks the network rules, the pins, the release checks and the dependency pins offline, and runs the built server against fake nodes (`test/spend.ts`: the spending caps with pending, refused (and a node that refuses but relays), failed, dropped and final txs, name prices, untrusted text, timeouts, unproven names; `test/agent.ts`: the caps, accounts and ledgers per chain and 0.5.1's files, costs, what can be spent, the refusals before signing, nonces under parallel calls and two sessions, your own node's witnesses, a chain without a faucet).
+`npm test -w @blockula/mcp` checks the network rules, the pins, the release checks and the dependency pins offline, and runs the built server against fake nodes (`test/spend.ts`: the spending caps with pending, refused (and a node that refuses but relays), failed, dropped and final txs, name prices, untrusted text, timeouts, unproven names; `test/agent.ts`: the caps, accounts and ledgers per chain and 0.5.1's files, costs, what can be spent, the refusals before signing, nonces under parallel calls and two sessions, your own node's witnesses, a chain without a faucet, `things_to_do`'s suggestions; `test/network.ts`: the demo network's pins and witnesses).
 
 ⚠️ Early and unaudited: test chains only.

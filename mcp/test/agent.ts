@@ -312,6 +312,8 @@ const fake = {
   faucetHits: 0,
   hunts: [] as unknown[],
   githubVerified: false,
+  /** Names active on the fake chain, with their owners (/api/name). */
+  activeNames: new Map<string, string>(),
 };
 const acct = (a: string): Acct => fake.accounts.get(a) ?? { balance: 0n, nonce: 0, exists: false };
 const pendingOf = (a: string) => fake.pending.filter((t) => t.from === a).length;
@@ -382,6 +384,8 @@ const node: Server = createServer((req, res) => {
     if (path === "/fees") return reply(200, { height: height(), suggested: { flat: "10000", rate: "10000" }, account_creation_fee: "100000000" });
     if (path === "/params") return reply(200, { params: { name_price_3: "100000000000", name_price_4: "25000000000", name_price_5: "5000000000", name_renewal_bps: "2000" } });
     if (path === "/name/bob" || path === "/name/bob.boo") return reply(200, { name: "bob.boo", status: "active", available: false, owner: { address: BOB, name: "bob.boo" }, price: "5000000000", renewal_price: "1000000000" });
+    const active = path.startsWith("/name/") ? fake.activeNames.get(path.slice(6).replace(/\.boo$/, "")) : undefined;
+    if (active) return reply(200, { name: `${path.slice(6).replace(/\.boo$/, "")}.boo`, status: "active", available: false, owner: { address: active, name: null } });
     if (path.startsWith("/name/")) return reply(200, { name: `${path.slice(6)}.boo`, status: "available", available: true, price: "5000000000", renewal_price: "1000000000" });
     if (path.startsWith("/hunts")) return reply(200, fake.hunts);
     if (path.startsWith("/github/")) return reply(200, { handle: path.slice(8), verified: fake.githubVerified, reason: fake.githubVerified ? "ok" : "gist doesn't contain the account's boo1 address" });
@@ -680,6 +684,66 @@ assert.deepEqual([me.stored_at, statSync(me.stored_at).mode & 0o777, me.existed,
   await s.close();
   fake.status = {};
   console.log("✓ your own node of the testnet: no default witness (the public testnet was retired); a chain without a faucet says so; copy: treasury, public memos, Hunt awards and expiry, bonds, GitHub links; no self-sends or other networks' addresses; tool titles and annotations");
+}
+
+// ---- 8. things_to_do: suggestions from the chain's state, nothing signed ----
+
+{
+  const home = join(dir, "todo");
+  const [posted, hits] = [fake.posted.length, fake.faucetHits];
+  const todo = async (srv: Awaited<ReturnType<typeof server>>) => {
+    const r = await srv.call("things_to_do");
+    assert.ok(!r.error, r.text);
+    return r.json() as { network: string; things_to_do: { step: number; tool: string | null; args?: Record<string, string>; why: string; how?: string }[]; next?: string; note: string };
+  };
+  const tools = (t: Awaited<ReturnType<typeof todo>>) => t.things_to_do.map((x) => x.tool);
+  // A faucet chain, no wallet yet, on a dev chain on this machine: make a wallet, fill it, name it, and the demo chain is where the others are.
+  fake.status = { faucet: true };
+  fake.hunts = [];
+  let s = await server(home);
+  const ann = (await s.tools()).find((t) => t.name === "things_to_do");
+  assert.deepEqual([ann?.title, ann?.annotations?.readOnlyHint, ann?.annotations?.destructiveHint], ["Things to do", true, false]);
+  let t = await todo(s);
+  assert.deepEqual(tools(t), ["create_wallet", "faucet", "register_name", null], JSON.stringify(t));
+  assert.deepEqual(t.things_to_do.map((x) => x.step), [1, 2, 3, 4]);
+  assert.match(t.things_to_do[3].how ?? "", /--network demo/);
+  assert.match(t.note, /nothing was signed or sent/);
+  assert.ok(!existsSync(join(home, "agent-wallet.json")), "no wallet was made");
+  // A wallet with FANG and a name, a guestbook and the game active, two open Hunts.
+  const mine = (await s.call("create_wallet")).json().own_address as string;
+  assert.match((await s.call("create_wallet")).json().next_steps, /things_to_do/);
+  fake.accounts.set(mine, { balance: 5n * FANG, nonce: 0, exists: true });
+  fake.activeNames.set("guestbook", BOB);
+  fake.activeNames.set("trickortreat", BOB);
+  fake.hunts = [{ id: 1 }, { id: 2 }];
+  t = await todo(s);
+  assert.deepEqual(tools(t), ["register_name", "send", "send", "list_hunts", null], JSON.stringify(t));
+  const [, guest, trick, hunts] = t.things_to_do;
+  assert.deepEqual([guest.args?.to, guest.args?.amount, typeof guest.args?.memo], ["guestbook.boo", "0.1", "string"]);
+  assert.match(guest.why, /public and permanent/);
+  assert.deepEqual([trick.args?.to, trick.args?.amount], ["trickortreat.boo", "1"]);
+  assert.match(trick.why, /pays back 0 to 2/);
+  assert.match(hunts.why, /^2 Hunts are open/);
+  await s.close();
+  // Another guestbook name, a chain without a faucet and another network: the suggestions follow.
+  fake.status = { faucet: false };
+  fake.accounts.set(mine, { balance: 0n, nonce: 0, exists: true });
+  fake.activeNames.delete("trickortreat");
+  fake.activeNames.set("visitors", BOB);
+  fake.hunts = [];
+  s = await server(home, { BLOCKULA_GUESTBOOK: "visitors.boo", BLOCKULA_NETWORK: "custom" });
+  t = await todo(s);
+  assert.deepEqual(tools(t), ["register_name", "send"], JSON.stringify(t));
+  assert.equal(t.things_to_do[1].args?.to, "visitors.boo");
+  // The guestbook is this agent's own: no suggestion to pay itself.
+  fake.activeNames.set("visitors", mine);
+  t = await todo(s);
+  assert.deepEqual(tools(t), ["register_name"], JSON.stringify(t));
+  await s.close();
+  assert.deepEqual([fake.posted.length, fake.faucetHits], [posted, hits], "nothing was sent, and the faucet wasn't called");
+  fake.status = {};
+  fake.activeNames.clear();
+  console.log("✓ things_to_do: create_wallet, faucet, register_name, the guestbook (memo public), the game, open Hunts and the demo chain, each only when the chain's state calls for it; nothing signed");
 }
 
 node.close();

@@ -73,6 +73,7 @@ Borrowed from the explorers worth borrowing from, without copying any of them:
 | `/account/{name\|address}` | Balance, money flows by counterparty, keys and agent budgets, activity filterable by key and direction (and exportable as CSV), watch; Pay on someone else's, and Send, Receive and Request (a prefilled Send link with a QR code, which the payer reviews and signs) on your own |
 | `/trace/{name\|address}?follow=` | The money graph around an account; `follow` lists accounts expanded a hop further, so a trace is a shareable link |
 | `/name/{name}` | Status (active; expired, in its grace period, when only its owner can renew it; reserved; free), owner, expiry, a pending offer, and the owner's renew, offer and release actions (or the recipient's accept); or the price and a register button |
+| `/guestbook` | The guestbook: every payment to `guestbook.boo`'s owner with its memo, newest first (`/api/name/guestbook`, `/api/account/{owner}/txs`), and how to sign it from the wallet or an agent. Memos are strangers' text, shown inert |
 | `/programs` | The chain's built-in modules, each with its state, its calls and its actions |
 | `/programs/{names\|hunts\|pool\|validators\|accounts}` | One program |
 | `/program/{address}` | A program anyone deployed, read only: its record (creator, code and interface hashes, version digest, who could upgrade it, balance, storage), its methods as its deployer named them, the calls that named it; or, for a code's 64-character hash, what's stored |

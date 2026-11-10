@@ -10,9 +10,10 @@
 - [Plan](docs/PLAN.md): architecture, privacy (Ghost Mode), tokenomics, roadmap
 - [Security](SECURITY.md): how to report vulnerabilities
 
-One-pager: docs/ONE_PAGER.md · No public chain: `blockula create` makes your own (`blockula dev` for a throwaway one) (the public testnet was retired in November 2026)
+One-pager: docs/ONE_PAGER.md · Public chain: the demo chain, https://demo.blockula.app (worthless FANG, a faucet). `blockula create` makes your own (`blockula dev` for a throwaway one) (the public testnet was retired in November 2026)
 
 ## Fastest path
+0. The public demo chain, nothing to install: `claude mcp add blockula -- npx -y @blockula/mcp --network demo` (blockula-demo-2 at https://demo.blockula.app, pinned; needs the @blockula/mcp release after 1.0.4, and until then `-e BLOCKULA_RPC=https://demo.blockula.app`). Then create_wallet → faucet → register_name → things_to_do (the guestbook, trick or treat, Hunts): docs/PLAYGROUND.md
 1. `claude mcp add blockula -- npx -y @blockula/mcp` (a local `blockula dev` chain at http://localhost:7070; `BLOCKULA_RPC=<a node>` for a chain you made). The network is pinned (chain id + genesis hash) and never switches on its own.
 2. MCP: create_wallet → faucet → register_name / send; stake / unstake / my_stake; list_proposals / vote; renew_name (start_dev_node for a local chain, needs the node binary from install_node)
 3. App code: `import { Wallet, Client } from "@blockula/sdk"`; browser users: `import { createPasskeyWallet } from "@blockula/sdk/passkey"`. Helpers for every protocol v1 action (staking, governance, multisig, names); `client.provenAccount` / `provenName` check Merkle proofs against independent nodes.

@@ -126,9 +126,10 @@ export function ignoredNote(account: string, prefix: string): string {
 
 /**
  * The web wallet's "Give an agent a budget", by chain id (where the user pastes a grant code), for
- * chains with a public wallet: none since the public testnet was retired.
+ * chains with a public wallet: the demo chain's, which its public node serves (the public testnet's
+ * went when it was retired).
  */
-export const WALLET_URLS: Record<string, string> = {};
+export const WALLET_URLS: Record<string, string> = { "blockula-demo-2": "https://demo.blockula.app/wallet/devices#agent" };
 
 /** The short code the web wallet shows for a key (web/lib/format.ts `keyCode`), for the user to compare. */
 export const checkCode = (keyId: string) => {

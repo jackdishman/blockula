@@ -400,6 +400,24 @@ export class MockNode {
     };
   }
 
+  /**
+   * `/api/account/{id}/txs?before=<height>.<index>&limit=` (node/src/api.rs `account_txs`): its
+   * finalized transactions (sent by it or naming it), newest first, a page at a time.
+   */
+  private accountTxs(id: string, q: URLSearchParams) {
+    const address = this.resolve(id);
+    const limit = Math.min(Math.max(Number(q.get("limit") ?? 25) || 25, 1), 100);
+    const [bh, bi] = (q.get("before") ?? "").split(".").map(Number);
+    const rows = [...this.txs.values()]
+      .filter((t) => t.height != null && (t.from === address || t.to === address || t.names?.includes(address)))
+      .map((t) => ({ t, h: t.height as number, i: this.txsAt(t.height as number).indexOf(t) }))
+      .sort((a, b) => b.h - a.h || b.i - a.i)
+      .filter((r) => !q.get("before") || r.h < bh || (r.h === bh && r.i < bi));
+    const page = rows.slice(0, limit);
+    const last = page[page.length - 1];
+    return { txs: page.map((r) => this.txView(r.t)), next: rows.length > limit && last ? `${last.h}.${last.i}` : null, history_from: 1 };
+  }
+
   private keyAccounts(keyId: string) {
     const accounts = [...this.accounts.keys()]
       .filter((addr) => this.acct(addr).keys?.has(keyId))
@@ -643,6 +661,7 @@ export class MockNode {
       let m: RegExpMatchArray | null;
       if (req.method() === "GET" && path === "/status") return reply(200, this.status());
       if (req.method() === "GET" && path === "/genesis") return this.genesis ? reply(200, this.genesis) : reply(404, { error: "no genesis here" });
+      if (req.method() === "GET" && (m = path.match(/^\/account\/([^/]+)\/txs$/))) return reply(200, this.accountTxs(m[1], new URL(req.url()).searchParams));
       if (req.method() === "GET" && (m = path.match(/^\/account\/(.+)$/))) {
         this.beforeAccountRead?.(m[1]);
         return reply(200, this.account(m[1]));

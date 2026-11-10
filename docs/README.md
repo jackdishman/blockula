@@ -6,11 +6,13 @@
 |---|---|
 | [CREATE.md](CREATE.md) | Create your own chain with `blockula create`: friends join and become validators, the apps, what it costs |
 | [BUILD-ON-IT.md](BUILD-ON-IT.md) | Make the chain yours: Claude and the MCP, changing the explorer and wallet with Claude Code, the SDK, programs and governance, HTTPS, hosting the wallet for friends, the contributor prompt |
+| [PLAYGROUND.md](PLAYGROUND.md) | Things for your agent to do on the demo chain: a name, the guestbook, trick or treat, paying other agents, an allowance from your wallet |
 | [USE-CASES.md](USE-CASES.md) | Eight things friends, a club, a class or a team can do on their chain, with the first commands |
 | [RUN-A-NODE.md](RUN-A-NODE.md) | A full node or a validator as a service, and pointing the wallet, SDK and MCP at your own node |
 | [BECOME-A-VALIDATOR.md](BECOME-A-VALIDATOR.md) | Validate someone else's chain, step by step for beginners: in the cloud (Fly.io or a $5 VPS), at home, or at home behind a cheap relay, and a prompt for your coding agent |
 | [REFERENCE.md](REFERENCE.md) | Chains by hand (`summon`, `run`, `join`), public servers and genesis specs, the hardened HTTP API, the CLI wallet, validators and staking, Hunts and the contribution pool |
 | [ONE_PAGER.md](ONE_PAGER.md) | What Blockula is, on one page |
+| [PITCH.md](PITCH.md) | How to say what Blockula is, to whom and where (a draft) |
 
 ## Running a chain
 

@@ -5,7 +5,7 @@
 // no `javascript:` link), and read v1's rules right: dropped vs failed receipts, tips, names
 // signed as names, expired and reserved names, hunts' cancel rule, staking's groups.
 import type { Tx } from "@blockula/sdk";
-import { HOSTILE, HOSTILE_ABORT, HOSTILE_EVENT, HOSTILE_METHOD, LONG_KEY, LONG_POP, PHONE, PROGRAM, seedWorld, type World } from "./explorer-world";
+import { GUESTBOOK, GUESTBOOK_LONG, HOSTILE, HOSTILE_ABORT, HOSTILE_EVENT, HOSTILE_METHOD, LONG_KEY, LONG_POP, PHONE, PROGRAM, seedWorld, type World } from "./explorer-world";
 import { RPC } from "./env";
 import { addressOf, VALIDATOR } from "./mock-node";
 import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
@@ -47,7 +47,7 @@ const receipt = (p: Page) => p.locator(".receipt .headline");
 test("no explorer page server-renders a style attribute (the CSP would block it)", async ({ request, node }) => {
   test.skip(!!process.env.E2E_DEV, "next dev relaxes the CSP");
   const w = seedWorld(node);
-  const paths = ["/explore", `/tx/${w.ids.sent}`, `/tx/${w.ids.dropped}`, "/account/vlad.boo", "/block/101", "/trace/vlad.boo", "/name/castle", "/name/tomb", "/programs", "/programs/hunts", "/programs/validators", "/programs/pool", "/programs/names", "/programs/accounts", "/boos", "/hunt/0", "/claim/1", "/seance/2", "/governance", `/program/${PROGRAM}`, `/program/${w.wasm_hash}`, `/tx/${w.ids.programCall}`, `/tx/${w.ids.programFailed}`];
+  const paths = ["/explore", `/tx/${w.ids.sent}`, `/tx/${w.ids.dropped}`, "/account/vlad.boo", "/block/101", "/trace/vlad.boo", "/name/castle", "/name/tomb", "/programs", "/programs/hunts", "/programs/validators", "/programs/pool", "/programs/names", "/programs/accounts", "/boos", "/guestbook", "/hunt/0", "/claim/1", "/seance/2", "/governance", `/program/${PROGRAM}`, `/program/${w.wasm_hash}`, `/tx/${w.ids.programCall}`, `/tx/${w.ids.programFailed}`];
   for (const path of paths) {
     const res = await request.get(path);
     expect(res.status(), path).toBe(200);
@@ -396,6 +396,48 @@ test.describe("the explorer from an account holder's side", () => {
     await watchCsp(page);
     me = (await createWallet(page)).account;
     w = seedWorld(node, me);
+  });
+
+  test("the guestbook: unclaimed, then empty, then signed, with every memo shown as text", async ({ page, node }) => {
+    const heading = (p: Page) => p.getByRole("heading", { name: "The guestbook" });
+    // The Boos page links to it.
+    await visit(page, "/boos", (p) => p.getByRole("heading", { name: "Boos", exact: true }), errors);
+    await page.getByTestId("boos-guestbook").click();
+    await expect(page).toHaveURL(/\/guestbook\/?$/);
+
+    // Nobody has the name: the chain's owner is told how to claim it.
+    await visit(page, "/guestbook", heading, errors);
+    await expect(page.getByTestId("guestbook-empty")).toContainText("Nobody has claimed guestbook.boo on this chain yet");
+    await expect(page.getByTestId("guestbook-empty").getByRole("link", { name: "register guestbook.boo" })).toHaveAttribute("href", /\/name\/guestbook\/?$/);
+    // Both ways to sign: the wallet's Send, filled in, and an agent, in words.
+    await expect(page.getByTestId("guestbook-send")).toHaveAttribute("href", /\/send\/?\?to=guestbook\.boo&amount=0\.1$/);
+    await expect(page.getByTestId("guestbook-sign")).toContainText("Ask your agent");
+
+    // Claimed, and nobody has signed.
+    node.names.set("guestbook", GUESTBOOK);
+    await visit(page, "/guestbook", (p) => p.getByTestId("guestbook-empty"), errors);
+    await expect(page.getByTestId("guestbook-empty")).toHaveText("No signatures yet. Be the first.");
+
+    // Signed: payments that ran and paid it, newest first; not what it sent, what failed or what's still waiting.
+    const { signed } = w.addGuestbook();
+    await visit(page, "/guestbook", (p) => p.getByTestId("guestbook-list"), errors);
+    await expect(page.getByTestId("guestbook-untrusted")).toContainText("written by whoever sent it");
+    await expect(page.getByTestId("guestbook-count")).toHaveText("5 signatures");
+    const rows = page.getByTestId("signature");
+    await expect(rows.getByTestId("signature-from")).toHaveText(["renfield.boo", "lucy.boo", "mina.boo", `${w.stranger.slice(0, 10)}…${w.stranger.slice(-6)}`, "vlad.boo"]);
+    await expect(page.getByTestId("guestbook-list")).not.toContainText("not a signature");
+    // A name links by name, an unnamed sender by address; each row has its receipt.
+    await expect(rows.nth(4).getByTestId("signature-from")).toHaveAttribute("href", /\/account\/vlad\.boo\/?$/);
+    await expect(rows.nth(3).getByTestId("signature-from")).toHaveAttribute("href", new RegExp(`/account/${w.stranger}/?$`));
+    await expect(rows.nth(4).getByTestId("signature-tx")).toHaveAttribute("href", new RegExp(`/tx/${signed.vlad}/?$`));
+    // Strangers' memos: markup as text, hiding characters gone, long ones cut short, none without a note.
+    await expect(rows.nth(3).getByTestId("signature-memo")).toHaveText(`“${HOSTILE}”`);
+    await expect(rows.nth(0).getByTestId("signature-memo")).toHaveText("“hello dlrow there”");
+    const long = (await rows.nth(1).getByTestId("signature-memo").textContent()) ?? "";
+    expect(long.endsWith("…”")).toBe(true);
+    expect([...long].length).toBeLessThan(GUESTBOOK_LONG.length);
+    await expect(rows.nth(2)).toContainText("signed without a word");
+    await expect(page.getByTestId("guestbook-list").locator("a[href^='http']")).toHaveCount(0);
   });
 
   test("their own receipts, account and names", async ({ page }) => {

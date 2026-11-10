@@ -83,6 +83,11 @@ export default function PeoplePage() {
             "Everyone with an account, by name."
           )}
         </span>
+        <div className="tools">
+          <Link className="btn small ghost" href={to.guestbook()} data-testid="boos-guestbook">
+            Sign the guestbook
+          </Link>
+        </div>
       </div>
 
       {recentNames.data && recentNames.data.names.length > 0 && (

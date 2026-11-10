@@ -27,6 +27,11 @@ export const PHISH_MEMO = "Blockula support: verify your wallet at https://block
 export const HOSTILE_METHOD = "<script>window.__pwned=4</script>";
 export const HOSTILE_EVENT = '"><img src=x onerror=window.__pwned=5>';
 export const HOSTILE_ABORT = 'oops</code><img src=x onerror="window.__pwned=6">';
+/** The account guestbook.boo points to, once a test opens the guestbook (`addGuestbook`). */
+export const GUESTBOOK = addressOf("c8".repeat(32));
+/** A guestbook signature that runs long (the wall cuts it short) and hides text with bidi and control characters. */
+export const GUESTBOOK_LONG = `${"Fang you very much! ".repeat(12)}the end`;
+export const GUESTBOOK_SNEAKY = "hello\u202edlrow\u0007 there";
 /** A deployed program (protocol v2). */
 export const PROGRAM = addressOf("e1".repeat(32));
 
@@ -273,5 +278,28 @@ export function seedWorld(node: MockNode, vlad: string = addressOf("c1".repeat(3
   const addPayout = () =>
     tx("call_program", vlad, callAction, { fee: 2_574_060n, maxFee: 18_455_665n, names: [PROGRAM], summary: `${short(vlad)} called program ${short(PROGRAM)}`, program: section("call", { fee: [65_910n, 2_508_150n], fuel: [10_000_000, 32_600, 41_000], changes: [{ account: vlad, change: "19200000" }, { account: PROGRAM, change: "-1000000000" }, { account: mina, change: "900000000" }], storage: { bytes_delta: -128, bonded: "0", refunded: "19200000" }, burned: "100000000" }) });
 
-  return { vlad, ids, wasm_hash, interface_hash, addPayout, ...ADDR };
+  /**
+   * guestbook.boo, claimed, with signatures (payments to it with memos, one signed to the name) and what isn't one: a payment it
+   * sent, one that failed and one still waiting. Made on request, like `addPayout`: more blocks in the world would push the
+   * oldest past the activity scan. Returns the ids, newest signature first.
+   */
+  const addGuestbook = () => {
+    node.names.set("guestbook", GUESTBOOK);
+    node.credit(GUESTBOOK, "1");
+    const signed = {
+      vlad: pay(vlad, GUESTBOOK, "0.1", { toName: "guestbook.boo", memo: "First! 🦇" }),
+      stranger: pay(stranger, GUESTBOOK, "0.1", { memo: HOSTILE }),
+      silent: pay(mina, GUESTBOOK, "0.1"),
+      long: pay(lucy, GUESTBOOK, "0.1", { memo: GUESTBOOK_LONG }),
+      sneaky: pay(renfield, GUESTBOOK, "0.2", { memo: GUESTBOOK_SNEAKY }),
+    };
+    const not = {
+      sent: pay(GUESTBOOK, mina, "0.05", { memo: "not a signature: it sent this" }),
+      failed: pay(renfield, GUESTBOOK, "0.1", { status: "failed", error: "insufficient balance", memo: "not a signature: it failed" }),
+      waiting: pay(lucy, GUESTBOOK, "0.1", { status: "pending", memo: "not a signature yet: still waiting" }),
+    };
+    return { signed, not };
+  };
+
+  return { vlad, ids, wasm_hash, interface_hash, addPayout, addGuestbook, ...ADDR };
 }

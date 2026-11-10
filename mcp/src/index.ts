@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 // 🧛 Blockula MCP server. Add to Claude Code with:
+//   claude mcp add blockula -- npx -y @blockula/mcp --network demo       (Blockula's public demo chain)
 //   claude mcp add blockula -- npx -y @blockula/mcp                      (a `blockula dev` chain)
 //   claude mcp add blockula -e BLOCKULA_RPC=https://<node> -- npx -y @blockula/mcp   (a chain you made)
 //
 // Env:
-//   BLOCKULA_NETWORK    local (default), testnet or custom (same as --network)
-//   BLOCKULA_RPC        node URL (default: http://localhost:7070 for local; required for testnet,
-//                       whose public node was retired, and for custom)
+//   BLOCKULA_NETWORK    local (default), demo, testnet or custom (same as --network)
+//   BLOCKULA_RPC        node URL (default: http://localhost:7070 for local, https://demo.blockula.app
+//                       for demo; required for testnet, whose public node was retired, and for custom)
 //   BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH   pin the chain the node must be on (a node that says
 //                       it's on blockula-1 is refused unless BLOCKULA_CHAIN_ID=blockula-1)
 //   BLOCKULA_WITNESSES  other nodes of the same chain (comma-separated URLs): .boo names that get
@@ -16,8 +17,10 @@
 //                       them a send signs the name itself (the chain resolves it when it runs), and
 //                       where an address is needed (stake, unstake, use_account) a name is the
 //                       node's word: on blockula-1 (BLOCKULA_CHAIN_ID=blockula-1) the address must be
-//                       confirmed first. Unset, no node is a witness (no chain has public RPCs
-//                       built in); `none` says so explicitly.
+//                       confirmed first. Unset, your own node of the demo chain is checked against
+//                       its public node (the one chain with a public RPC built in), and no other
+//                       node gets a witness; `none` says so explicitly.
+//   BLOCKULA_GUESTBOOK  the guestbook name things_to_do suggests signing, when it's active (default guestbook.boo)
 //   BLOCKULA_HOME       where the agent wallet lives (default ~/.blockula)
 //   BLOCKULA_MAX_SEND   max FANG one call moves (sent, staked, escrowed, paid for a name, bonded; default 100)
 //   BLOCKULA_MAX_DAILY  max FANG leaving the account per UTC day through this MCP on each chain, fees
@@ -533,10 +536,10 @@ async function requireWallet(): Promise<Wallet> {
 }
 
 /** How clients show and gate each tool (AGENT-9): reads are read-only; what signs moves FANG (fees at least) on a public chain. */
-const READS = new Set(["status", "tx_status", "wallet_info", "check_name", "lookup", "latest_blocks", "my_stake", "list_proposals", "list_hunts", "contribution_pool", "my_contributions", "program_show", "program_view", "program_code"]);
+const READS = new Set(["status", "things_to_do", "tx_status", "wallet_info", "check_name", "lookup", "latest_blocks", "my_stake", "list_proposals", "list_hunts", "contribution_pool", "my_contributions", "program_show", "program_view", "program_code"]);
 const MOVES = new Set(["send", "stake", "unstake", "withdraw_stake", "vote", "register_name", "renew_name", "fund_hunt", "submit_contribution", "link_github"]);
 const TITLES: Record<string, string> = {
-  status: "Network status", tx_status: "Transaction status", start_dev_node: "Start a dev chain", install_node: "Install the node", summon_chain: "Create a chain",
+  status: "Network status", things_to_do: "Things to do", tx_status: "Transaction status", start_dev_node: "Start a dev chain", install_node: "Install the node", summon_chain: "Create a chain",
   create_wallet: "Create the agent wallet", use_account: "Act for an account", wallet_info: "Wallet and budget", faucet: "Get test FANG", send: "Send FANG",
   check_name: "Check a name", register_name: "Register a name", renew_name: "Renew a name", lookup: "Look up", latest_blocks: "Latest blocks",
   stake: "Stake FANG", unstake: "Unstake FANG", withdraw_stake: "Withdraw unbonded stake", my_stake: "My stake", list_proposals: "Governance proposals", vote: "Vote",
@@ -585,7 +588,7 @@ tool("status", "Blockula network status: which network and node you're connected
     witnesses: activeWitnesses,
     names: activeWitnesses.length ? `proven against ${activeWitnesses.length} node${activeWitnesses.length === 1 ? "" : "s"} (${activeWitnesses.join(", ")})` : `UNPROVEN: one node's word (${net.rpc}). BLOCKULA_WITNESSES lists other nodes to prove them against.`,
     pinned: chainData({ chain_id: s.chain_id, genesis_hash: s.genesis_hash, address_prefix: s.address_prefix }),
-    how_to_change: "The network is fixed while this MCP runs. The user changes it in the MCP's configuration (--network local|testnet|custom, or BLOCKULA_RPC).",
+    how_to_change: "The network is fixed while this MCP runs. The user changes it in the MCP's configuration (--network local|demo|testnet|custom, or BLOCKULA_RPC).",
     explorer: net.rpc,
     mcp_version: VERSION,
     node_reports: chainData(Object.fromEntries(pick.filter((k) => k in s).map((k) => [k, s[k]]))),
@@ -1041,7 +1044,7 @@ tool("create_wallet", "Create this agent's post-quantum (ML-DSA-65) wallet, stor
     existed,
     network: networkLabel(network(), pinnedChain.chainId),
     stored_at: WALLET_FILE,
-    next_steps: "To spend from the user's account: ask which account (their .boo name or address), then call use_account with it. Until they've authorized this key it answers with a grant_code (this key's signed consent to joining that one account) for them to paste in the Blockula web wallet → Devices & agents → 'Give an agent a budget'. A key id alone can't be added. (On test chains, faucet funds this key's own address for testing.)",
+    next_steps: "To spend from the user's account: ask which account (their .boo name or address), then call use_account with it. Until they've authorized this key it answers with a grant_code (this key's signed consent to joining that one account) for them to paste in the Blockula web wallet → Devices & agents → 'Give an agent a budget'. A key id alone can't be added. (On test chains, faucet funds this key's own address for testing.) things_to_do suggests what to do next on this chain.",
   };
 });
 
@@ -1132,6 +1135,76 @@ tool("wallet_info", "This agent's address and the account it acts for, its balan
     note: UNTRUSTED_NOTE,
   };
 });
+
+/** The guestbook name things_to_do looks for (BLOCKULA_GUESTBOOK), and the demo chain's game. */
+const GUESTBOOK = process.env.BLOCKULA_GUESTBOOK?.trim() || "guestbook.boo";
+const TRICK_OR_TREAT = "trickortreat.boo";
+
+/** A name's record when it's active on this chain (null when it isn't, or the node can't say: the suggestion is left out either way). */
+async function activeName(client: Client, name: string): Promise<{ owner?: string } | null> {
+  try {
+    const info = await client.name(bareName(name));
+    if (info?.status !== "active") return null;
+    const owner = typeof info.owner?.address === "string" ? info.owner.address : typeof info.owner === "string" ? info.owner : undefined;
+    return { owner };
+  } catch {
+    return null;
+  }
+}
+
+tool(
+  "things_to_do",
+  "Suggested next steps for this agent on the chain it's on, in order, each with the tool to call: read from the chain's state (whether this agent has a wallet, FANG and a .boo name, whether a guestbook or game name is active here, how many Hunts are open). Signs nothing and spends nothing; a suggestion whose condition isn't met (or can't be read) is left out. Ask the user before any step that spends.",
+  {},
+  async () => {
+    const net = network();
+    const client = await chain();
+    const s = await client.status();
+    const st = await walletState();
+    const steps: { tool: string | null; args?: Record<string, unknown>; why: string; how?: string }[] = [];
+    // The account this agent acts for: its balance, names and whether this key may register a name.
+    // undefined: unknown (the read failed), so what depends on it is left out.
+    let acct: { balance: bigint; names: number; sessionKey: boolean } | undefined;
+    if (!st) acct = { balance: 0n, names: 0, sessionKey: false };
+    else {
+      try {
+        const a = await st.w.client.account(st.w.account);
+        const bal = /^\d+$/.test(String(a?.balance ?? "")) ? BigInt(a.balance) : undefined;
+        if (bal !== undefined) acct = { balance: bal, names: Array.isArray(a?.names) ? a.names.length : 0, sessionKey: keyOn(a, st.w.keyId)?.role?.type === "session" };
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 404) acct = { balance: 0n, names: 0, sessionKey: false };
+      }
+    }
+    const me = st?.w.account;
+    if (!st) steps.push({ tool: "create_wallet", why: "This agent has no wallet yet: it makes a post-quantum key on this machine (nothing is sent)." });
+    if (acct && acct.balance === 0n && s.faucet === true) steps.push({ tool: "faucet", why: "The account this agent acts for holds no FANG, and this chain has a faucet: it sends 100 test FANG (FANG has no value)." });
+    if (acct && acct.names === 0 && !acct.sessionKey) steps.push({ tool: "register_name", args: { name: "<a name you choose>" }, why: "The account has no .boo name: others can pay and find it by name. check_name gives the price first (paid to the treasury, a year at a time). Names are public." });
+    const [guestbook, trick, hunts] = await Promise.all([
+      activeName(client, GUESTBOOK),
+      activeName(client, TRICK_OR_TREAT),
+      client.hunts("open").catch(() => null),
+    ]);
+    if (guestbook && guestbook.owner !== me) {
+      const guestbookName = `${bareName(GUESTBOOK)}.boo`;
+      steps.push({ tool: "send", args: { to: guestbookName, amount: "0.1", memo: "<a short hello>" }, why: `${guestbookName} is active on this chain: sign the guestbook by sending it a little FANG with a memo. The memo is public and permanent: anyone can read it, forever, so never put personal data in it.` });
+    }
+    if (trick && trick.owner !== me) {
+      steps.push({ tool: "send", args: { to: TRICK_OR_TREAT, amount: "1" }, why: `${TRICK_OR_TREAT} is active on this chain: send it 1 FANG to play. Its owner runs it as a house bot that pays back 0 to 2 FANG; that's their word, not the chain's, so send only what you're fine losing.` });
+    }
+    const open = (Array.isArray(hunts) ? hunts : Array.isArray(hunts?.hunts) ? hunts.hunts : null)?.length;
+    if (open) steps.push({ tool: "list_hunts", why: `${open} Hunt${open === 1 ? " is" : "s are"} open on this chain: bounties on GitHub issues. ${NO_VALUE}` });
+    if (net.key === "local") {
+      steps.push({ tool: null, why: "This MCP is on a dev chain on this machine. Other agents are on Blockula's public demo chain (blockula-demo-2).", how: "The user re-adds this MCP with --network demo: claude mcp add blockula -- npx -y @blockula/mcp --network demo (the network never changes while it runs)." });
+    }
+    return {
+      network: networkLabel(net, pinnedChain.chainId),
+      chain_id: pinnedChain.chainId,
+      things_to_do: steps.map((x, i) => ({ step: i + 1, ...x })),
+      ...(steps.length === 0 ? { next: "Nothing to suggest from this chain's state right now: wallet_info, latest_blocks and lookup show what's there." } : {}),
+      note: "Suggestions only: nothing was signed or sent. Ask the user before any step that spends, and spend only what they agree to.",
+    };
+  },
+);
 
 /** What `faucet` answers when the node says its chain has none. */
 const NO_FAUCET = "This chain has no faucet, so nothing was sent. Its FANG comes from accounts that already hold some: ask whoever runs the chain. Dev chains (start_dev_node) have faucets.";

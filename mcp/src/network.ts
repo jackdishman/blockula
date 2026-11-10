@@ -11,7 +11,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
-export type NetworkKey = "testnet" | "local" | "custom";
+export type NetworkKey = "demo" | "testnet" | "local" | "custom";
+
+/** The names `--network` / BLOCKULA_NETWORK take. */
+export const NETWORK_NAMES: NetworkKey[] = ["local", "demo", "testnet", "custom"];
 
 /**
  * The chain id Blockula's mainnet was to have: no chain runs under it, so nothing is used under it
@@ -46,9 +49,13 @@ export interface Network {
 }
 
 export const LOCAL_RPC = "http://localhost:7070";
+/** The public node of Blockula's demo chain (chains/blockula-demo-2.json). */
+export const DEMO_RPC = "https://demo.blockula.app";
+/** The demo chain's id (its genesis is in KNOWN_GENESIS, its clock in KNOWN_CLOCKS). */
+export const DEMO_CHAIN_ID = "blockula-demo-2";
 /** Why `--network testnet` needs BLOCKULA_RPC: the public testnet has no public node any more. */
 export const TESTNET_RETIRED =
-  "the public testnet (blockula-testnet-2) was retired in November 2026 and has no public node: run your own chain (`blockula dev`, then --network local; or `blockula summon`, then BLOCKULA_RPC=<its node>), or set BLOCKULA_RPC to a blockula-testnet-2 node you run";
+  "the public testnet (blockula-testnet-2) was retired in November 2026 and has no public node: the public chain now is the demo chain (--network demo, blockula-demo-2 at https://demo.blockula.app). Or run your own chain (`blockula dev`, then --network local; or `blockula summon`, then BLOCKULA_RPC=<its node>), or set BLOCKULA_RPC to a blockula-testnet-2 node you run";
 /**
  * Nothing reads this: the MCP has no mainnet network. It stays because
  * `scripts/pin-network.sh --mainnet --rpc` writes it and `scripts/test-pin-network.sh` checks
@@ -61,7 +68,7 @@ export const MAINNET_RPCS: string[] = [];
  * genesis hash, whatever network it was configured as. A release adds a chain's here
  * (scripts/pin-network.sh).
  */
-export const KNOWN_GENESIS: Record<string, string> = { "blockula-testnet-2": "b004e2f91b63429fc009088b16ec02b6d5388a03642699ae3dc6e325939f19b2" };
+export const KNOWN_GENESIS: Record<string, string> = { "blockula-testnet-2": "b004e2f91b63429fc009088b16ec02b6d5388a03642699ae3dc6e325939f19b2", "blockula-demo-2": "e712d9376917f0c9d10c164fa7c1a53fef7c8dc1c24100e7924037d0250f705e" };
 
 /**
  * The genesis clock of chains whose genesis is known (`created_at_ms` and `block_time_ms` of the
@@ -69,7 +76,7 @@ export const KNOWN_GENESIS: Record<string, string> = { "blockula-testnet-2": "b0
  * refuses a node reporting a height the chain can't have reached by this machine's clock, before
  * anything is signed (audit review-r3-clients-2; `Client.checkSigningHeight`).
  */
-export const KNOWN_CLOCKS: Record<string, GenesisClock> = { "blockula-testnet-2": { createdAtMs: 1792328803000, blockTimeMs: 1000 } };
+export const KNOWN_CLOCKS: Record<string, GenesisClock> = { "blockula-testnet-2": { createdAtMs: 1792328803000, blockTimeMs: 1000 }, "blockula-demo-2": { createdAtMs: 1794193062992, blockTimeMs: 2000 } };
 
 /** A chain's genesis clock: its genesis.json's `created_at_ms` and `block_time_ms`. */
 export interface GenesisClock {
@@ -95,16 +102,24 @@ export const KNOWN_NETWORKS: Record<Exclude<NetworkKey, "custom">, Omit<Network,
   // prefix (DEC-7) and, in KNOWN_GENESIS, its genesis. The public testnet was retired in November
   // 2026: no public RPC is built in, so it takes BLOCKULA_RPC (TESTNET_RETIRED).
   testnet: { key: "testnet", label: "testnet", pin: { chainId: "blockula-testnet-2", prefix: "tboo" }, remember: true },
+  // Blockula's demo chain (chains/blockula-demo-2.json; deploy/host-chain.sh): the public chain
+  // since the testnet was retired. Its chain id, the `boo` prefix and, in KNOWN_GENESIS and
+  // KNOWN_CLOCKS, its genesis and clock are built in. A test chain: FANG on it has no value, and
+  // it isn't blockula-1, so blockula-1's confirmations don't apply to it.
+  demo: { key: "demo", label: "demo chain", rpc: DEMO_RPC, pin: { chainId: DEMO_CHAIN_ID, prefix: "boo" }, remember: true },
   local: { key: "local", label: "local dev node", rpc: LOCAL_RPC, pin: {}, remember: false },
 };
 
-/** The public RPCs of the chains whose public RPCs are built in, by chain id: none since the public testnet was retired. */
-const PUBLIC_RPCS: Record<string, string[]> = {};
+/**
+ * The public RPCs of the chains whose public RPCs are built in, by chain id: the demo chain's (the
+ * public testnet's went when it was retired). Your own node of the demo chain is checked against it.
+ */
+const PUBLIC_RPCS: Record<string, string[]> = { [DEMO_CHAIN_ID]: [DEMO_RPC] };
 
 /**
  * The witnesses a node of `chainId` gets when BLOCKULA_WITNESSES is unset: the chain's public RPCs,
  * unless the node is one of them. So your own node's answers about names and heights are checked
- * against the public ones (OPERATOR-6). None for chains without public RPCs (dev chains, and the
+ * against the public ones (OPERATOR-6). None for the public node itself, nor for chains without public RPCs (dev chains, and the
  * chains people make themselves: there, BLOCKULA_WITNESSES lists other nodes).
  */
 export function defaultWitnesses(chainId: string | undefined, rpc: string): string[] {
@@ -114,7 +129,7 @@ export function defaultWitnesses(chainId: string | undefined, rpc: string): stri
 }
 
 /** The known network a chain id is, when it's one (for labels). */
-const PUBLIC_LABEL: Record<string, string> = { "blockula-testnet-2": "blockula-testnet-2" };
+const PUBLIC_LABEL: Record<string, string> = { "blockula-testnet-2": "blockula-testnet-2", [DEMO_CHAIN_ID]: DEMO_CHAIN_ID };
 
 /**
  * What `status` calls the network: once the node's chain is known, a node on this machine that
@@ -217,9 +232,9 @@ export function networkArg(argv: string[]): string | undefined {
  */
 export function resolveNetwork(env: Record<string, string | undefined>, argv: string[] = []): Network {
   const named = (networkArg(argv) ?? env.BLOCKULA_NETWORK)?.trim().toLowerCase() || undefined;
-  if (named !== undefined && !["testnet", "local", "custom"].includes(named)) {
+  if (named !== undefined && !(NETWORK_NAMES as string[]).includes(named)) {
     const hint = named === "mainnet" ? `: there's no mainnet network, and a node that says it's on ${BLOCKULA_1} is used only with BLOCKULA_CHAIN_ID=${BLOCKULA_1}` : "";
-    throw new Error(`unknown network "${named}" (testnet, local or custom)${hint}`);
+    throw new Error(`unknown network "${named}" (local, demo, testnet or custom)${hint}`);
   }
   const rpc = env.BLOCKULA_RPC?.trim() ? checkRpcUrl(env.BLOCKULA_RPC.trim()) : undefined;
   let key: NetworkKey;
