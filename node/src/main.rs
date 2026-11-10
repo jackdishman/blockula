@@ -652,6 +652,18 @@ mod cli_tests {
     }
 
     /// `--programs` asks `dev` and `summon` for a chain with programs on from block 1 (WBS S6b), and
+    /// `create --fast` (short durations for playgrounds) parses, and is off unless asked.
+    #[test]
+    fn create_fast_parses() {
+        use clap::Parser;
+        let fast = |extra: &[&str]| match super::Cli::try_parse_from(["blockula", "create", "--name", "Fast Test", "--yes"].iter().chain(extra)).unwrap().cmd {
+            super::Cmd::Create { args } => args.fast,
+            _ => unreachable!(),
+        };
+        assert!(fast(&["--fast"]));
+        assert!(!fast(&[]));
+    }
+
     /// `--program-views` and `--view-max-fuel` reach the HTTP options (the view fuel is at most what a
     /// transaction may declare, and at least 1).
     #[test]

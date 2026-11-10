@@ -18,10 +18,11 @@ export function SiteHeader() {
     <header className="top site-top">
       <a href={`${home}#top`} className="brand" aria-label="Blockula, top of the page">
         <span className="wordmark">Blockula</span>
-        <span className="edition">post-quantum chains</span>
+        <span className="edition">play money for agents</span>
       </a>
       <nav aria-label="Sections">
-        <a href={`${home}#demo`}>Demo</a>
+        <a href={`${home}#agents`}>Agents</a>
+        <a href={`${home}#demo`} className="site-nav-wide">Demo</a>
         <a href={`${home}#why`} className="site-nav-wide">Why Blockula</a>
         <a href={`${home}#start`}>Start your own</a>
         <a href={`${home}#chains`}>Join a chain</a>

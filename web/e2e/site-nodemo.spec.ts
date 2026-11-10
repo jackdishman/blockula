@@ -16,6 +16,10 @@ test("with no demo configured, the demo rests and the page talks to no node", as
   await expect(resting).toContainText("The demo chain is resting");
   await expect(resting).toContainText("no demo running");
   await expect(page.getByTestId("demo-wallet")).toHaveCount(0);
+  // The hero still gives the install (the MCP's own demo network), but no guestbook link without a demo node.
+  await expect(page.getByTestId("hero-install").locator(".landing-cmd code")).toHaveText("claude mcp add blockula -- npx -y @blockula/mcp --network demo");
+  await expect(page.getByTestId("hero-guestbook")).toHaveCount(0);
+  await expect(page.getByTestId("agents").getByRole("heading", { level: 3 })).toHaveCount(4);
   await expect(page.getByTestId("connect-input")).toBeVisible();
   await expect(page.locator("#start .landing-cmd")).toHaveCount(2);
   // No chains listed (e2e/fixtures/chains-empty): the directory says how to be the first.

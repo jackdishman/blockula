@@ -1,7 +1,7 @@
 // The MCP's program tools (docs/PROGRAMS-V0.md §8.5), offline: the built server over stdio against a
 // fake node that serves real answers recorded from `blockula dev --programs` (the SDK's
 // test/program-fixtures.json) and rewrites them the way a stranger's program or a lying node would.
-// Read only: no tool signs a program transaction. Everything a program or its deployer chose (method,
+// The read tools (call_program, the one that signs, is test/program-calls.ts). Everything a program or its deployer chose (method,
 // argument, event and export names, an abort message, return data) must reach the agent as `untrusted_*`,
 // cleaned, never as a key of the MCP's own and never in a tool description; and the digest it shows is the
 // one the code, interface and version compute. `npm test -w @blockula/mcp` builds first.
@@ -197,7 +197,8 @@ try {
     assert.deepEqual([t.annotations?.readOnlyHint, t.annotations?.destructiveHint], [true, false], `${name} is annotated read-only`);
     assert.ok(t.title && t.annotations?.title === t.title, `${name} has a title`);
   }
-  assert.ok(!tools.some((t) => /^(upload|create|call)_(code|program)$|^program_(call|upload|create|pause)$/.test(t.name)), "no tool signs a program transaction");
+  // One tool signs a program transaction, call_program (test/program-calls.ts: the agent's own account only); none uploads, creates or pauses.
+  assert.ok(!tools.some((t) => /^(upload|create)_(code|program)$|^program_(call|upload|create|pause)$|^programs_pause$/.test(t.name)), "no tool uploads, creates or pauses");
 
   // program_show: the record, the methods as untrusted_method, the digest recomputed, one node's word said so.
   let r = await s.call("program_show", { address: PROGRAM });
@@ -428,4 +429,4 @@ try {
   node.close();
   rmSync(dir, { recursive: true, force: true });
 }
-console.log("✓ the MCP's program tools are read only and keep what programs say apart");
+console.log("✓ the MCP's program read tools keep what programs say apart");

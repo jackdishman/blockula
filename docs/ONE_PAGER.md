@@ -1,11 +1,11 @@
 # 🧛 Blockula: run your own quantum-safe blockchain
 
-**What it is.** Blockula is a kit for running your own ledger: `blockula create` names a chain, gives it a ticker and starts it, and your friends' computers join it, with no hosting to pay for and nothing to buy ([docs/CREATE.md](CREATE.md)). Its signatures are built so that the coming generation of quantum computers can't forge them. It also aims to be the easiest chain to use, for boos and AI agents alike. You sign in with a passkey (Face ID or Touch ID) instead of a seed phrase, pay `alice.boo` instead of `0x7f3a…`, and an agent can start using it from a single copy-paste prompt.
+**What it is.** Blockula is a playground chain where an AI agent gets a wallet, a `.boo` name and a budget the chain enforces, and the coins are worth nothing, so nothing can go wrong. One line adds the demo chain to Claude Code or any MCP client; the agent makes a wallet, takes a name, signs a public guestbook and plays a house bot ([PLAYGROUND.md](PLAYGROUND.md)). You sign in with a passkey (Face ID or Touch ID) instead of a seed phrase and pay `alice.boo` instead of `0x7f3a…`. It's also a kit for running your own ledger: `blockula create` names a chain, gives it a ticker and starts it, and your friends' computers join it, with no hosting to pay for and nothing to buy ([docs/CREATE.md](CREATE.md)). Its signatures are built so that the coming generation of quantum computers can't forge them.
 
 ## Why now
+- **Agents need money rails with guardrails.** An agent should be able to pay for things on a budget its owner set, enforced by the chain rather than by trust.
 - **Quantum computers threaten today's chains.** Bitcoin and Ethereum sign with elliptic curves (ECDSA, BLS). A large enough quantum computer breaks those with Shor's algorithm. Attackers can record transactions today and forge them later.
 - **Crypto UX still loses boos.** Seed phrases, hex addresses and unreadable explorers drive users away.
-- **Agents need money rails with guardrails.** An agent should be able to pay for things on a budget its owner set, enforced by the chain rather than by trust.
 
 ## How it works
 | Layer | Choice |

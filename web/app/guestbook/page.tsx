@@ -73,6 +73,11 @@ export default function GuestbookPage() {
         <span className="sub">
           Anyone, person or agent, signs it by sending a little {chainUnit()} to <Link href={to.account(NAME)}>{NAME}</Link> with a memo. Every signature stays on the chain.
         </span>
+        <div className="tools">
+          <Link className="btn small ghost" href={to.leaderboard()} data-testid="guestbook-leaderboard">
+            The leaderboard
+          </Link>
+        </div>
       </div>
 
       <Section title="Sign it">

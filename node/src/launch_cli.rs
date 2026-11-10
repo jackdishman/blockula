@@ -80,6 +80,9 @@ pub struct CreateArgs {
     /// Programs on from block 1 (experimental WebAssembly programs)
     #[arg(long)]
     pub programs: bool,
+    /// Short durations for a playground or a class: unbonding in minutes, votes in a minute
+    #[arg(long)]
+    pub fast: bool,
     /// Serve the explorer over HTTPS on your tailnet (`tailscale serve`; Tailscale only)
     #[arg(long)]
     pub https: bool,
@@ -109,6 +112,8 @@ pub struct Plan {
     /// The bond in drops, when it isn't summon's default.
     pub min_bond: Option<u64>,
     pub programs: bool,
+    /// Short unbonding, voting and timelock durations (`ChainParams::dev_overrides`), for playgrounds.
+    pub fast: bool,
     pub https: bool,
 }
 
@@ -134,11 +139,13 @@ impl Plan {
     }
 
     pub fn summon_opts(&self) -> SummonOpts {
+        let epoch_blocks = chain::summon_epoch_blocks(self.block_time_ms);
         let o = SummonOpts {
             faucet: self.faucet,
             block_time_ms: self.block_time_ms,
             http_port: Some(chain::SUMMON_HTTP_PORT),
-            epoch_blocks: chain::summon_epoch_blocks(self.block_time_ms),
+            epoch_blocks,
+            params: if self.fast { crate::params::ChainParams::dev_overrides(self.block_time_ms, epoch_blocks) } else { Default::default() },
             min_bond: self.min_bond,
             host: self.host.clone(),
             token: Some(self.token.clone()).filter(|t| t != DEFAULT_TOKEN),
@@ -182,6 +189,20 @@ impl Plan {
         format!("blockula run --home {}{bind}", display_home(home))
     }
 
+    /// What `--fast` makes of the waiting periods, in minutes and seconds (mirrors `summon`'s "dev durations" line).
+    pub fn fast_durations(&self) -> String {
+        let epoch = chain::summon_epoch_blocks(self.block_time_ms);
+        let o = crate::params::ChainParams::dev_overrides(self.block_time_ms, epoch);
+        let t = |k: &str| fmt_span(o[k].saturating_mul(self.block_time_ms));
+        format!(
+            "unstaking takes {} · a vote lasts {} · a passed proposal waits {} · proposal deposit {}",
+            t("unbonding_blocks"),
+            t("voting_blocks"),
+            t("timelock_blocks"),
+            crate::types::fmt_fang(o["proposal_deposit"]).replace(" FANG", &format!(" {}", self.token)),
+        )
+    }
+
     fn bond_display(&self) -> String {
         let drops = self.min_bond.unwrap_or(if self.faucet { 50 } else { 10_000 } * DROPS_PER_FANG);
         crate::types::fmt_fang(drops).replace(" FANG", &format!(" {}", self.token))
@@ -203,11 +224,24 @@ impl Plan {
         out.push(("Faucet", if self.faucet { format!("on, 100 {} at a time", self.token) } else { format!("off: you hand out {} yourself", self.token) }));
         out.push(("Validator bond", self.bond_display()));
         out.push(("Programs", if self.programs { "on from block 1 (experimental)".into() } else { "off".into() }));
+        if self.fast {
+            out.push(("Fast durations", self.fast_durations()));
+        }
         if self.https {
             out.push(("HTTPS", "on your tailnet, with tailscale serve".into()));
         }
         out.push(("Wallet", if self.https { format!("{}, and for friends at https://<this machine>.<your tailnet>.ts.net/wallet/", self.wallet_url()) } else { self.wallet_url() }));
         out
+    }
+}
+
+/// A span of milliseconds as "10 minutes" or "20 seconds".
+fn fmt_span(ms: u64) -> String {
+    let s = ms.div_ceil(1000);
+    if s >= 60 && s.is_multiple_of(60) {
+        format!("{} minute{}", s / 60, if s == 60 { "" } else { "s" })
+    } else {
+        format!("{s} second{}", if s == 1 { "" } else { "s" })
     }
 }
 
@@ -407,6 +441,7 @@ pub fn plan_from_flags(a: &CreateArgs, m: &Machine) -> Result<Plan> {
         faucet: !a.no_faucet,
         min_bond: a.min_bond.as_deref().map(parse_bond).transpose()?,
         programs: a.programs,
+        fast: a.fast,
         https: a.https,
     })
 }
@@ -476,6 +511,8 @@ pub fn plan_by_asking<R: BufRead, W: Write>(p: &mut Prompter<R, W>, a: &CreateAr
     };
     let programs = a.programs || p.confirm("Programs (experimental WebAssembly programs anyone can run)?", false)?;
 
+    let fast = a.fast || p.confirm("Fast mode, for a playground or a class (unstaking and votes take minutes, not weeks)?", false)?;
+
     writeln!(p.out, "\n4/4  Apps")?;
     writeln!(p.out, "  ✓ The explorer is built into the node. Open it in Safari to add it to the Dock (Mac) or the Home Screen (iPhone).")?;
     let https = match reach {
@@ -486,7 +523,7 @@ pub fn plan_by_asking<R: BufRead, W: Write>(p: &mut Prompter<R, W>, a: &CreateAr
             false
         }
     };
-    Ok(Plan { name, description, token, chain_id, reach, host, block_time_ms, faucet, min_bond, programs, https })
+    Ok(Plan { name, description, token, chain_id, reach, host, block_time_ms, faucet, min_bond, programs, fast, https })
 }
 
 /// `<home>/README.md`: what to keep once the chain is made.
@@ -727,7 +764,7 @@ mod tests {
     fn enter_takes_every_default() {
         let m = Machine { tailscale_ip: Some("100.64.0.7".into()), lan_ip: Some("192.168.1.20".into()) };
         // A name, then Enter for everything else.
-        let (plan, out) = ask("Jack in the Block\n\n\n\n\n\n\n\n\n\n\n", &CreateArgs::default(), &m);
+        let (plan, out) = ask("Jack in the Block\n\n\n\n\n\n\n\n\n\n\n\n", &CreateArgs::default(), &m);
         let plan = plan.unwrap();
         assert_eq!(plan, Plan {
             name: "Jack in the Block".into(),
@@ -740,6 +777,7 @@ mod tests {
             faucet: true,
             min_bond: None,
             programs: false,
+            fast: false,
             https: true,
         });
         assert!(out.contains("Tailscale") && out.contains("(found 100.64.0.7)") && out.contains("(found 192.168.1.20)"), "{out}");
@@ -751,7 +789,7 @@ mod tests {
     fn wrong_answers_are_asked_again() {
         // Without Tailscale the default is this machine; 4 picks the internet, which asks for an
         // address and turns the faucet off by default.
-        let script = "\nJack in the Block\nJA CK\nJACK\nJack's friends' ledger.\nNot An Id\n\n9\n4\n\nhttp://x.org\nledger.example.org\n1\n\n0\n500\ny\n";
+        let script = "\nJack in the Block\nJA CK\nJACK\nJack's friends' ledger.\nNot An Id\n\n9\n4\n\nhttp://x.org\nledger.example.org\n1\n\n0\n500\ny\n\n";
         let (plan, out) = ask(script, &CreateArgs::default(), &NO_NET);
         let plan = plan.unwrap();
         assert_eq!((plan.token.as_str(), plan.reach, plan.host.as_deref()), ("JACK", Reach::Internet, Some("ledger.example.org")));
@@ -765,8 +803,8 @@ mod tests {
     #[test]
     fn flags_skip_their_questions() {
         let a = CreateArgs { name: Some("Jack in the Block".into()), token: Some("jack".into()), reach: Some(Reach::Local), block_time_ms: Some(2_000), programs: true, ..Default::default() };
-        // Only the description, the chain id, the faucet and the bond are asked.
-        let (plan, out) = ask("\n\n\n\n", &a, &NO_NET);
+        // Only the description, the chain id, the faucet, the bond and fast mode are asked.
+        let (plan, out) = ask("\n\n\n\n\n", &a, &NO_NET);
         let plan = plan.unwrap();
         assert_eq!((plan.token.as_str(), plan.host.clone(), plan.block_time_ms, plan.programs, plan.https), ("JACK", None, 2_000, true, false));
         assert!(!out.contains("Chain name") && !out.contains("A block every") && !out.contains("Pick 1–"), "{out}");
@@ -785,6 +823,53 @@ mod tests {
         assert!(plan_from_flags(&CreateArgs { name: Some("X Y".into()), reach: Some(Reach::Local), https: true, ..Default::default() }, &m).is_err());
         let local = plan_from_flags(&CreateArgs { name: Some("X Y".into()), ..Default::default() }, &NO_NET).unwrap();
         assert_eq!((local.reach, local.host), (Reach::Local, None));
+    }
+
+    /// `--fast` is one plain question (off by default), a flag skips it, and the chain it makes has
+    /// the short genesis params while one without has the defaults.
+    #[test]
+    fn fast_chains_have_short_durations() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct W {
+            #[command(flatten)]
+            a: CreateArgs,
+        }
+        assert!(W::try_parse_from(["x", "--name", "A B", "--fast", "--yes"]).unwrap().a.fast);
+        assert!(!W::try_parse_from(["x", "--name", "A B", "--yes"]).unwrap().a.fast);
+        // Asked, the default is no; yes turns it on; the flag skips the question.
+        let a = CreateArgs { name: Some("Jack in the Block".into()), reach: Some(Reach::Local), ..Default::default() };
+        let (plan, out) = ask("\n\n\n\n\n\n\n\n\n\n\n\n", &a, &NO_NET);
+        assert!(!plan.unwrap().fast && out.contains("Fast mode"), "{out}");
+        let (plan, out) = ask("\n\n\n\n\n\n\ny\n", &a, &NO_NET);
+        let plan = plan.map_err(|e| format!("{e}: {out}")).unwrap();
+        assert!(plan.fast);
+        let (plan, out) = ask("\n\n\n\n\n\n\n\n", &CreateArgs { fast: true, ..a.clone() }, &NO_NET);
+        assert!(plan.unwrap().fast && !out.contains("Fast mode"), "{out}");
+        assert!(plan_from_flags(&CreateArgs { fast: true, ..a.clone() }, &NO_NET).unwrap().fast);
+        assert!(!plan_from_flags(&a, &NO_NET).unwrap().fast);
+
+        let base = plan_from_flags(&a, &NO_NET).unwrap();
+        let make = |plan: &Plan, tag: &str| {
+            let home = std::env::temp_dir().join(format!("blockula-create-fast-{tag}-{}-{}", chain::now_ms(), std::process::id()));
+            Chain::summon(&home, &plan.summon_opts()).unwrap();
+            let g = Genesis::load(&home.join("genesis.json")).unwrap();
+            std::fs::remove_dir_all(home).ok();
+            g
+        };
+        let slow = make(&base, "slow");
+        let d = crate::params::ChainParams::defaults(&crate::chain::Params { block_time_ms: 5_000, epoch_blocks: slow.epoch_blocks, ..Default::default() });
+        let c = slow.chain_params().unwrap();
+        assert_eq!((c.unbonding_blocks, c.voting_blocks, c.timelock_blocks, c.proposal_deposit), (d.unbonding_blocks, d.voting_blocks, d.timelock_blocks, d.proposal_deposit));
+
+        let fast_plan = Plan { fast: true, ..base };
+        let fast = make(&fast_plan, "fast");
+        let c = fast.chain_params().unwrap();
+        // 5-second blocks, 10-minute epochs: unstaking in 10 minutes, a vote in 1, a timelock of 20 seconds.
+        assert_eq!((fast.epoch_blocks, c.unbonding_blocks, c.voting_blocks, c.timelock_blocks, c.lock_period_blocks), (120, 120, 12, 4, 4));
+        assert_eq!((c.governance_spend_height, c.proposal_deposit), (0, 10 * DROPS_PER_FANG));
+        assert!(c.unbonding_blocks < d.unbonding_blocks && c.voting_blocks < d.voting_blocks);
+        assert!(fast_plan.summary().iter().any(|(k, v)| *k == "Fast durations" && v.contains("unstaking takes 10 minutes") && v.contains("a vote lasts 1 minute") && v.contains("waits 20 seconds")), "{:?}", fast_plan.summary());
     }
 
     /// The `value` query parameter of a listing link, decoded.
@@ -821,6 +906,7 @@ mod tests {
             faucet: true,
             min_bond: None,
             programs: false,
+            fast: false,
             https: false,
         };
         Chain::summon(&home, &plan.summon_opts()).unwrap();
@@ -886,6 +972,7 @@ mod tests {
             faucet: false,
             min_bond: Some(500 * DROPS_PER_FANG),
             programs: false,
+            fast: false,
             https: false,
         };
         Chain::summon(&home, &plan.summon_opts()).unwrap();

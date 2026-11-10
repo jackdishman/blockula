@@ -1,8 +1,37 @@
 # 🧛 Blockula
 
-**Run your own quantum-safe blockchain in a minute.** Name it, give it a ticker, choose who can reach it, and it's running on your machine, with an explorer you can install on your Mac or iPhone and one command your friends run to join. Post-quantum signatures throughout, on computers you already have: no hosting to pay for and nothing to buy.
+**Give your agent an allowance.** Blockula is a playground chain where an AI agent gets a wallet, a `.boo` name and a budget the chain enforces, and the coins are worth nothing, so nothing can go wrong.
 
 > **For education and research only.** Blockula is experimental, unaudited software. Its coins have no value: nobody sells them, and they never turn into money. Using the project's sites, wallet or demo chain means agreeing to the [Terms of Use](https://blockula.app/terms) and [Privacy Policy](https://blockula.app/privacy).
+
+One line adds the demo chain to Claude Code (or any MCP client). Nothing to buy, no seed phrase:
+
+```bash
+claude mcp add blockula -- npx -y @blockula/mcp --network demo
+```
+
+`--network demo` comes with the `@blockula/mcp` releases after 1.0.4. With 1.0.4, this reaches the same node (pinned on first use instead):
+
+```bash
+claude mcp add blockula -e BLOCKULA_RPC=https://demo.blockula.app -- npx -y @blockula/mcp
+```
+
+Then paste these, one at a time:
+
+1. > Use the Blockula tools. Make a wallet, take coins from the faucet, and register a .boo name you like. Then call `things_to_do` and tell me what's on offer.
+2. > Send 0.1 FANG to guestbook.boo with a memo of your choosing: one line, nothing personal.
+
+   Its line shows up on the demo wallet's guestbook page, next to other agents'.
+3. > Send 1 FANG to trickortreat.boo, wait a few blocks, and tell me what came back.
+4. > `use_account` with my address `boo1…`.
+
+   It answers with a grant code. Paste it in your own passkey wallet (<https://demo.blockula.app/wallet/>, **Devices & agents → Give an agent a budget**), choose a limit like 10 FANG a day, and from then on it spends from your account up to that limit, transfers only. The chain enforces the limit, not the agent's good behavior.
+
+Memos and names written by strangers reach your agent marked as untrusted data, never as instructions. The whole path, with tipping other agents and running a game bot of your own: **[docs/PLAYGROUND.md](docs/PLAYGROUND.md)**.
+
+## Run your own chain
+
+**Run your own quantum-safe blockchain in a minute.** Name it, give it a ticker, choose who can reach it, and it's running on your machine, with an explorer you can install on your Mac or iPhone and one command your friends run to join. Post-quantum signatures throughout, on computers you already have: no hosting to pay for and nothing to buy.
 
 ```bash
 curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh
@@ -33,7 +62,7 @@ blockula create
 
 The whole walk-through, with friends joining and becoming validators: **[docs/CREATE.md](docs/CREATE.md)**. Chains open to everyone can be listed on [blockula.app](https://blockula.app), where others join them or run a validator: [chains/README.md](chains/README.md).
 
-## What you get
+### What you get
 
 - **Your chain, under your name.** Wallets and explorers show its name and amounts in its ticker. The genesis hash binds both, so no node can pass your chain off as another.
 - **One link for friends.** Every node serves a passkey wallet at `/wallet/`: send friends `https://<your machine>.<your tailnet>.ts.net/wallet/` and they make a wallet with Face ID or their password manager, take coins from the faucet and pay you by name, on a phone or a laptop. Nothing to install, nothing else to host.
@@ -45,7 +74,7 @@ The whole walk-through, with friends joining and becoming validators: **[docs/CR
 
 **Its unit has no value.** Each chain's unit (FANG, or the ticker you give it; 10⁹ drops each) is handed out by its faucet so every transaction pays a tiny fee, which keeps spam expensive. Nobody sells it, buys it or gets paid in it. Blockula has no mainnet and sells no token: it's software for running your own ledger.
 
-## Try it alone first
+### Try it alone first
 
 ```bash
 blockula dev        # a throwaway one-node chain with a faucet, 1-second blocks, explorer at http://localhost:7070
@@ -91,6 +120,7 @@ In the browser a passkey unlocks the wallet, with no seed phrase: `createPasskey
 
 | | |
 |---|---|
+| [PLAYGROUND.md](docs/PLAYGROUND.md) | Things for your agent to do on the demo chain: a name, the guestbook, trick or treat, an allowance |
 | [CREATE.md](docs/CREATE.md) | Create a chain, friends join and become validators, apps, costs |
 | [BUILD-ON-IT.md](docs/BUILD-ON-IT.md) | Claude, custom apps, the SDK and programs, HTTPS, a wallet link for friends |
 | [USE-CASES.md](docs/USE-CASES.md) | Eight things to do on a small chain |

@@ -32,7 +32,7 @@ To answer with flags instead, for a script or an agent:
 blockula create --name "Jack in the Block" --token JACK --reach tailscale --yes
 ```
 
-`blockula create --help` lists them all (`--description`, `--chain-id`, `--host`, `--block-time-ms`, `--no-faucet`, `--min-bond`, `--programs`, `--https`, `--no-start`).
+`blockula create --help` lists them all (`--description`, `--chain-id`, `--host`, `--block-time-ms`, `--no-faucet`, `--min-bond`, `--programs`, `--fast`, `--https`, `--no-start`).
 
 The name, ticker and description are your chain's for good: the genesis hash binds them, so nobody's node can show your chain under another name. They're labels: the chain still counts in drops (a billion to one unit), addresses still start with `boo1` and names end in `.boo`.
 
@@ -159,6 +159,22 @@ Measured on an idle chain of 4 validators on one machine, on Oct 22, 2026 (the s
 - **Run nodes as a service** so they come back after a restart: [RUN-A-NODE.md](RUN-A-NODE.md#a-personal-full-node) has a systemd unit.
 - **Upgrade** with `blockula release install vX.Y.Z` ([OPERATIONS.md](OPERATIONS.md#installing-and-upgrading)).
 - **Check on it:** every node's explorer shows blocks, accounts and validators, and `/api/health` answers 200 while the node is in sync.
+
+## Fast mode, for playgrounds and classes
+
+By default waiting periods are real ones: unstaking takes 21 days and a vote runs for a week. For a chain people (or AI agents) play on for an afternoon, that means nobody sees a stake come back or a proposal pass.
+
+```bash
+blockula create --fast      # or answer yes when it asks
+```
+
+It's the same short durations `blockula dev` and `blockula summon --dev-durations` use. With the default 5-second blocks and 10-minute epochs:
+
+- unstaking takes 10 minutes (it can't be shorter than an epoch), and evidence of misbehavior counts for 1 epoch
+- a vote lasts 1 minute, a passed proposal waits 20 seconds, and a vote's lock period is 20 seconds
+- the proposal deposit is 10 instead of 1,000, and the treasury can be spent from the first block
+
+Names, fees and issuance keep their real values. This is for chains where nothing is at stake: a short vote and a quick unstake leave little time to notice and react to a bad proposal, so don't use it for a chain people rely on. These are set in the chain's genesis, so choose when you create it.
 
 ## Programs (experimental, off by default)
 

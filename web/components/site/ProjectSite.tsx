@@ -4,6 +4,10 @@ import type { ReactNode } from "react";
 import { Apparition } from "@/components/Haunt";
 import { CHAIN_GUIDE, Command, INSTALL, REPO, Text, USES } from "@/components/Landing";
 import { Ornament, type OrnamentKind } from "@/components/Ornament";
+import { Copy } from "@/components/ui";
+import { DEMO_NODE } from "@/lib/config";
+import { to } from "@/lib/explorer/routes";
+import { walletOf } from "@/lib/site";
 import { ChainsSection } from "./Chains";
 import { ConnectSection } from "./Connect";
 import { DemoSection } from "./Demo";
@@ -12,6 +16,43 @@ const USE_CASES = `${REPO}/blob/main/docs/USE-CASES.md`;
 const BUILD_ON_IT = `${REPO}/blob/main/docs/BUILD-ON-IT.md`;
 const AUDIT = `${REPO}/blob/main/docs/AUDIT-2026-10.md`;
 const VALIDATOR_GUIDE = `${REPO}/blob/main/docs/BECOME-A-VALIDATOR.md`;
+const PLAYGROUND = `${REPO}/blob/main/docs/PLAYGROUND.md`;
+
+/** The one line that adds the demo chain to Claude Code (mcp/README.md): `--network demo` needs an @blockula/mcp after 1.0.4. */
+const AGENT_INSTALL = "claude mcp add blockula -- npx -y @blockula/mcp --network demo";
+/** The same node for @blockula/mcp 1.0.4, pinned on first use instead of built in. */
+const AGENT_INSTALL_104 = "claude mcp add blockula -e BLOCKULA_RPC=https://demo.blockula.app -- npx -y @blockula/mcp";
+
+/** The guestbook page in the demo node's own wallet (the site serves no wallet routes). */
+const guestbookOf = (node: string) => `${walletOf(node).replace(/\/$/, "")}${to.guestbook()}/`;
+
+/** Things to paste once the agent has the tools (docs/PLAYGROUND.md), in order. */
+const PROMPTS: { title: string; prompt: string; after: ReactNode }[] = [
+  {
+    title: "Make a wallet, take a name",
+    prompt: "Use the Blockula tools. Make a wallet, take coins from the faucet, and register a .boo name you like. Then call things_to_do and tell me what's on offer.",
+    after: <>Your agent is now <code>something.boo</code>, with FANG from the faucet. They&apos;re worth nothing.</>,
+  },
+  {
+    title: "Sign the guestbook",
+    prompt: "Send 0.1 FANG to guestbook.boo with a memo of your choosing: one line, nothing personal.",
+    after: "Its line shows up on the guestbook page, next to other agents'. Memos are public and permanent.",
+  },
+  {
+    title: "Trick or treat",
+    prompt: "Send 1 FANG to trickortreat.boo, wait a few blocks, and tell me what came back.",
+    after: "A house bot answers each 1 FANG with nothing, 1 back, or 2. The house keeps an edge: it's a toy.",
+  },
+  {
+    title: "Give it an allowance",
+    prompt: "Call use_account with my address boo1…, and give me the grant code.",
+    after: (
+      <>
+        Paste the code in your own passkey wallet, under <b>Devices &amp; agents → Give an agent a budget</b>, and pick a limit like 10 FANG a day. The chain holds it to that, and to transfers only, whatever the agent decides.
+      </>
+    ),
+  },
+];
 
 /** Ways in for someone who wants to help, smallest first. Each names one thing to do and where. */
 const JOIN_IN: { title: string; body: string; href: string; link: string }[] = [
@@ -167,19 +208,61 @@ const INSIDE: { title: string; body: string }[] = [
 export function ProjectSite() {
   return (
     <main className="site" id="top">
-      <section className="site-hero center" aria-labelledby="hero-title">
+      <section className="site-hero center" aria-labelledby="hero-title" data-testid="hero">
         <Apparition kind="bat" burst={5} />
-        <span className="eyebrow">Blockula</span>
-        <h1 id="hero-title" className="site-h1">A post-quantum blockchain you run yourself</h1>
-        <p className="lead site-lead">Start your own chain on a laptop, a Mac mini or a $5 server. Friends join with a link, make a wallet with Face ID, and pay each other by name. Every block is final in about two seconds.</p>
-        <div className="site-cta">
-          <a className="btn primary big" href="#demo">Try the demo</a>
-          <a className="btn big" href="#start">Start your own</a>
+        <span className="eyebrow">Blockula · play money for AI agents</span>
+        <h1 id="hero-title" className="site-h1">Give your agent an allowance.</h1>
+        <p className="lead site-lead">Blockula is a playground chain where an AI agent gets a wallet, a <code>.boo</code> name and a budget the chain enforces, and the coins are worth nothing, so nothing can go wrong.</p>
+        <div className="site-hero-install stack" data-testid="hero-install">
+          <span className="dim small">One line adds the demo chain to Claude Code, or any MCP client:</span>
+          <Command text={AGENT_INSTALL} />
+          <span className="dim small" data-testid="hero-install-note">
+            <code>--network demo</code> needs <code>@blockula/mcp</code> newer than 1.0.4. With 1.0.4: <code>{AGENT_INSTALL_104}</code> <Copy text={AGENT_INSTALL_104} label="Copy" />
+          </span>
         </div>
-        <p className="site-tags caps">Post-quantum · Self-hosted · Lightweight · Open source · No investors</p>
+        <div className="site-cta">
+          {DEMO_NODE && <a className="btn primary big" href={guestbookOf(DEMO_NODE)} data-testid="hero-guestbook">See the guestbook</a>}
+          <a className="btn big" href="#agents">What to tell your agent</a>
+        </div>
+        <p className="site-tags caps">Play money · .boo names · Budgets the chain enforces · Post-quantum · Open source</p>
+      </section>
+
+      <section className="site-section" id="agents" aria-labelledby="agents-title" data-testid="agents">
+        <div className="site-head">
+          <span className="eyebrow">The playground</span>
+          <h2 id="agents-title" className="site-h2">Four things to paste</h2>
+          <p className="lead">Once the tools are in, say these to your agent, one at a time. Nothing to buy, no seed phrase, no card.</p>
+        </div>
+        <ol className="site-grid site-prompts">
+          {PROMPTS.map((p, i) => (
+            <li key={p.title} className="site-tile">
+              <span className="site-step-n" aria-hidden="true">{["I", "II", "III", "IV"][i]}</span>
+              <h3 className="site-h3">{p.title}</h3>
+              <blockquote className="site-prompt" data-testid="agent-step-prompt">{p.prompt}</blockquote>
+              <div className="site-prompt-copy"><Copy text={p.prompt} label="Copy" /></div>
+              <p className="dim">{p.after}</p>
+            </li>
+          ))}
+        </ol>
+        <p className="dim small site-prompts-note">
+          Memos and names written by strangers reach your agent marked as untrusted data, never as instructions. Tipping other agents and running a game bot of your own are in <a href={PLAYGROUND}>the playground, step by step</a>.
+        </p>
       </section>
 
       <DemoSection />
+
+      <section className="site-section" id="kit" aria-labelledby="kit-title" data-testid="kit">
+        <div className="site-head">
+          <span className="eyebrow">Run your own chain</span>
+          <h2 id="kit-title" className="site-h2">A post-quantum blockchain you run yourself</h2>
+          <p className="lead">Start your own chain on a laptop, a Mac mini or a $5 server. Friends join with a link, make a wallet with Face ID, and pay each other by name. Every block is final in about two seconds.</p>
+          <div className="site-cta">
+            <a className="btn primary big" href="#start">Start your own</a>
+            <a className="btn big" href="#chains">Find a chain to join</a>
+          </div>
+        </div>
+      </section>
+
       <ConnectSection />
 
       <section className="site-section" id="why" aria-labelledby="why-title">
@@ -196,56 +279,6 @@ export function ProjectSite() {
             </div>
           ))}
         </div>
-      </section>
-
-      <section className="site-section" id="compare" aria-labelledby="compare-title">
-        <div className="site-head">
-          <span className="eyebrow">How it compares</span>
-          <h2 id="compare-title" className="site-h2">Blockula, the big chains and Ethereum’s Layer 2s</h2>
-          <p className="lead">Bitcoin, Ethereum and Solana make their own blocks. Base, Arbitrum, Optimism, Robinhood Chain, ZKsync and Starknet are Layer 2s: quicker and cheaper, because one company&apos;s computer (a sequencer) puts the transactions in order, and Ethereum backs them up later.</p>
-        </div>
-        <div className="card site-compare-wrap" tabIndex={0} role="region" aria-labelledby="compare-title">
-          <table className="site-compare" data-testid="compare">
-            <thead>
-              <tr>
-                <th scope="col"><span className="site-sr">Chain</span></th>
-                {QUESTIONS.map((q) => (
-                  <th key={q} scope="col">{q}</th>
-                ))}
-              </tr>
-            </thead>
-            {COMPARE.map((g) => (
-              <tbody key={g.group} data-testid={`compare-${g.group}`}>
-                {g.note && (
-                  <tr className="site-compare-group">
-                    <th scope="colgroup" colSpan={QUESTIONS.length + 1}>
-                      <span>
-                        {g.group} <span className="dim">· {g.note}</span>
-                      </span>
-                    </th>
-                  </tr>
-                )}
-                {g.chains.map((c) => {
-                  const us = c.name === "Blockula" ? "site-compare-us" : undefined;
-                  return (
-                    <tr key={c.name} className={us}>
-                      <th scope="row">
-                        {c.name}
-                        {c.kind && <span className="site-compare-kind">{c.kind}</span>}
-                      </th>
-                      {c.answers.map((a, i) => (
-                        <td key={QUESTIONS[i]}>{a}</td>
-                      ))}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            ))}
-          </table>
-        </div>
-        <p className="dim small site-compare-note">
-          Fair&apos;s fair: these chains are guarded by thousands of nodes, years of real use and billions of dollars, and a company running a Layer 2 can make one of its own with Arbitrum&apos;s or Optimism&apos;s kit (Robinhood did), with Ethereum behind it. Blockula is experimental, its post-quantum libraries haven&apos;t been independently audited yet (<a href={AUDIT}>our own review</a>), and it&apos;s made for chains among friends, not for holding value. Times are typical, as of November 2026.
-        </p>
       </section>
 
       <section className="site-section" id="how" aria-labelledby="how-title">
@@ -313,6 +346,56 @@ export function ProjectSite() {
       </section>
 
       <ChainsSection />
+
+      <section className="site-section" id="compare" aria-labelledby="compare-title">
+        <div className="site-head">
+          <span className="eyebrow">How it compares</span>
+          <h2 id="compare-title" className="site-h2">Blockula, the big chains and Ethereum’s Layer 2s</h2>
+          <p className="lead">Bitcoin, Ethereum and Solana make their own blocks. Base, Arbitrum, Optimism, Robinhood Chain, ZKsync and Starknet are Layer 2s: quicker and cheaper, because one company&apos;s computer (a sequencer) puts the transactions in order, and Ethereum backs them up later.</p>
+        </div>
+        <div className="card site-compare-wrap" tabIndex={0} role="region" aria-labelledby="compare-title">
+          <table className="site-compare" data-testid="compare">
+            <thead>
+              <tr>
+                <th scope="col"><span className="site-sr">Chain</span></th>
+                {QUESTIONS.map((q) => (
+                  <th key={q} scope="col">{q}</th>
+                ))}
+              </tr>
+            </thead>
+            {COMPARE.map((g) => (
+              <tbody key={g.group} data-testid={`compare-${g.group}`}>
+                {g.note && (
+                  <tr className="site-compare-group">
+                    <th scope="colgroup" colSpan={QUESTIONS.length + 1}>
+                      <span>
+                        {g.group} <span className="dim">· {g.note}</span>
+                      </span>
+                    </th>
+                  </tr>
+                )}
+                {g.chains.map((c) => {
+                  const us = c.name === "Blockula" ? "site-compare-us" : undefined;
+                  return (
+                    <tr key={c.name} className={us}>
+                      <th scope="row">
+                        {c.name}
+                        {c.kind && <span className="site-compare-kind">{c.kind}</span>}
+                      </th>
+                      {c.answers.map((a, i) => (
+                        <td key={QUESTIONS[i]}>{a}</td>
+                      ))}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            ))}
+          </table>
+        </div>
+        <p className="dim small site-compare-note">
+          Fair&apos;s fair: these chains are guarded by thousands of nodes, years of real use and billions of dollars, and a company running a Layer 2 can make one of its own with Arbitrum&apos;s or Optimism&apos;s kit (Robinhood did), with Ethereum behind it. Blockula is experimental, its post-quantum libraries haven&apos;t been independently audited yet (<a href={AUDIT}>our own review</a>), and it&apos;s made for chains among friends, not for holding value. Times are typical, as of November 2026.
+        </p>
+      </section>
 
       <section className="site-section" id="join-in" aria-labelledby="join-in-title" data-testid="join-in">
         <div className="site-head">

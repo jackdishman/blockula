@@ -46,12 +46,27 @@ async function demoChain(page: Page, opts: { wallet?: string | null } = {}) {
   return reads;
 }
 
-test("the demo chain's live stats, its wallet a click away, and the agent prompt for it", async ({ page }) => {
+test("agents first: the one line, the install and the guestbook; then the demo chain live, the kit and the comparison", async ({ page }) => {
   await watchCsp(page);
   const reads = await demoChain(page);
   await page.goto("/");
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText("A post-quantum blockchain you run yourself");
-  await expect(page.getByRole("link", { name: "Try the demo" })).toHaveAttribute("href", "#demo");
+  // The hero leads with agents: the one line, the install for the demo chain, the guestbook.
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Give your agent an allowance.");
+  const hero = page.getByTestId("hero");
+  await expect(hero).toContainText("a wallet, a .boo name and a budget the chain enforces, and the coins are worth nothing");
+  await expect(page.getByTestId("hero-install").locator(".landing-cmd code")).toHaveText("claude mcp add blockula -- npx -y @blockula/mcp --network demo");
+  await expect(page.getByTestId("hero-install-note")).toContainText("claude mcp add blockula -e BLOCKULA_RPC=https://demo.blockula.app -- npx -y @blockula/mcp");
+  await expect(page.getByTestId("hero-install-note")).toContainText("newer than 1.0.4");
+  await expect(page.getByTestId("hero-guestbook")).toHaveAttribute("href", `${DEMO_NODE}/wallet/guestbook/`);
+  await expect(hero.getByRole("link", { name: "What to tell your agent" })).toHaveAttribute("href", "#agents");
+  await expect(page.getByRole("navigation", { name: "Sections" }).getByRole("link", { name: "Agents" })).toHaveAttribute("href", "#agents");
+  const agents = page.getByTestId("agents");
+  await expect(agents.getByRole("heading", { level: 3 })).toHaveText(["Make a wallet, take a name", "Sign the guestbook", "Trick or treat", "Give it an allowance"]);
+  await expect(agents.getByTestId("agent-step-prompt").nth(1)).toHaveText("Send 0.1 FANG to guestbook.boo with a memo of your choosing: one line, nothing personal.");
+  await expect(agents.getByRole("link", { name: "The playground, step by step" })).toHaveAttribute("href", "https://github.com/jackdishman/blockula/blob/main/docs/PLAYGROUND.md");
+  await expect(agents).toContainText("untrusted data, never as instructions");
+  // The kit comes second.
+  await expect(page.getByTestId("kit").getByRole("heading", { level: 2 })).toHaveText("A post-quantum blockchain you run yourself");
   await expect(page.getByRole("link", { name: "Start your own" }).first()).toHaveAttribute("href", "#start");
 
   const demo = page.getByTestId("demo-live");
@@ -94,6 +109,14 @@ test("the demo chain's live stats, its wallet a click away, and the agent prompt
   await expect(page.getByTestId("imprint-note")).toContainText("for education and research only");
   await expect(page.getByTestId("imprint-terms").getByRole("link", { name: "Terms of Use" })).toHaveAttribute("href", "/terms");
   await expect(page.getByTestId("imprint-terms").getByRole("link", { name: "Privacy Policy" })).toHaveAttribute("href", "/privacy");
+
+  // Agents first, then the demo, then the kit; the comparison comes after the kit's sections.
+  const order = await page.evaluate(() => Array.from(document.querySelectorAll("main > section[id]"), (e) => e.id));
+  const at = (id: string) => order.indexOf(id);
+  for (const id of ["agents", "demo", "kit", "start", "chains", "compare", "join-in"]) expect(at(id), id).toBeGreaterThanOrEqual(0);
+  expect(at("agents")).toBeLessThan(at("demo"));
+  expect(at("demo")).toBeLessThan(at("kit"));
+  for (const kit of ["kit", "why", "how", "start", "chains"]) expect(at(kit), kit).toBeLessThan(at("compare"));
 
   // No wallet chrome, and nothing the project never says.
   await expect(page.getByTestId("network-badge")).toHaveCount(0);

@@ -80,14 +80,16 @@ Keep the theme. Vampires, `.boo`, FANG, Hunts, Séances and Familiars are the mo
 
 ## What the pitch needs from the product
 
-Done on the `automation/agent-playground` branch: a named demo network in the MCP, `things_to_do`, a guestbook page, a trick-or-treat house bot.
+Built:
 
-Proposed, not built (each is the maintainer's call):
+- **A named demo network in the MCP** (`--network demo`) and `things_to_do`, so an agent joins in one line and always has a next move.
+- **The guestbook, a trick-or-treat house bot and a leaderboard** (`/guestbook`, `/leaderboard`, [examples/](../examples/README.md)).
+- **Fast chains.** `blockula create --fast`: unstaking in 10 minutes, a vote in 1, a deposit of 10. A class can finish a vote in a lesson.
+- **Agents call programs with their own key.** The MCP's `call_program`: from the agent's own account only, never a user's; bound to the program's version digest; under the same caps as `send`. Strangers can add games without a bot running somewhere.
+- **A front page that leads with agents.** The README and blockula.app open with the one line; the kit is second.
 
-- **Fast chains.** `blockula create --fast`: unbonding in an hour, votes open ten minutes, small deposits. The defaults copy a mainnet's (21 days, a week, 1,000), and an agent's session lasts minutes. A class can't finish a vote in a lesson.
-- **Agents call programs with their own key.** The MCP signs no program transaction, which is right for a user's account. An agent's own account on a chain with a faucet has nothing to lose: allow `call_program` there, under the same per-call and daily caps as `send`. Programs are the one way strangers can add games without a bot running somewhere.
-- **A front page that leads with agents.** The README and blockula.app open with the kit. Open with the one line and the guestbook; put the kit second.
-- **Retire the mainnet shelf from the docs index.** Move TOKENOMICS, MAINNET-DESIGN, GENESIS_CEREMONY and AUDIT_SCOPE under `docs/design-history/`.
-- **Hunts for agents on the demo chain.** A handful of small `familiar-friendly` Hunts on this repo, awarded by the maintainer, so `list_hunts` returns something. Skip Séances until there are jurors.
-- **A leaderboard.** Names by guestbook signatures, trick-or-treat winnings, Hunts won. Agents' owners share ranks.
-- **The house bots hosted** next to the demo validators, so the games are always open.
+Still to do (each is the maintainer's call, and each acts on the live demo chain):
+
+- **Claim `guestbook.boo` and `trickortreat.boo`** on the demo chain, and host the bot next to the demo validators, so the games are always open.
+- **Hunts for agents.** A handful of small `familiar-friendly` Hunts on this repo, awarded by the maintainer, so `list_hunts` returns something. Skip Séances until there are jurors.
+- **Publish `@blockula/mcp`** after 1.0.4, and upgrade the demo node so it serves `/wallet/guestbook/`.

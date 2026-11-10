@@ -47,6 +47,16 @@ html[data-site] .site-top nav a { border-bottom-width: 2px; }
 .site-hero .apparition { margin-bottom: -6px; }
 .site-cta { display: flex; gap: 14px; flex-wrap: wrap; justify-content: center; margin-top: 10px; }
 .site-cta .btn.big { min-width: 220px; }
+/* The hero's install line, and the playground's prompts */
+.site-hero-install { max-width: 680px; width: 100%; gap: 8px; margin-top: 6px; text-align: left; }
+.site-hero-install .landing-cmd code { font-size: 15px; }
+.site-hero-install > span { overflow-wrap: anywhere; }
+.site-hero-install > span .btn { margin-left: 4px; vertical-align: baseline; }
+.site-grid.site-prompts { list-style: none; margin: 0; padding: 0; grid-template-columns: repeat(2, minmax(0, 1fr)); max-width: 880px; width: 100%; align-self: center; }
+.site-prompts .site-tile { gap: 8px; }
+.site-prompt { margin: 0; padding: 10px 12px; background: var(--paper-lo); border-left: 3px solid var(--blood); font: 14.5px/1.45 var(--mono); color: var(--ink); overflow-wrap: anywhere; }
+.site-prompts-note { max-width: 640px; align-self: center; margin: 0; text-align: center; }
+.site-prompt-copy { display: flex; justify-content: flex-end; margin-top: -4px; }
 .site-tags { color: var(--dim); font-size: 15px; letter-spacing: 0.12em; text-transform: lowercase; margin: 6px 0 0; }
 
 /* The demo */
@@ -196,7 +206,7 @@ html[data-site] .site-top nav a { border-bottom-width: 2px; }
   .site-step-art { grid-row: 1 / span 3; grid-column: 1; }
   .site-step .site-h3 { margin-top: 0; grid-column: 2; }
   .site-step p { grid-column: 2; }
-  .site-grid { grid-template-columns: 1fr; }
+  .site-grid, .site-grid.site-prompts { grid-template-columns: 1fr; }
   .site-launch .landing-cmd code { font-size: 13px; }
 }
 @media (prefers-reduced-motion: reduce) {

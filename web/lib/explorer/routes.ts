@@ -5,6 +5,8 @@ export const to = {
   boos: () => "/boos",
   /** The guestbook: signatures paid to guestbook.boo (lib/explorer/guestbook.ts). */
   guestbook: () => "/guestbook",
+  /** The leaderboards: guestbook signers, trick or treat players, Soul (lib/explorer/leaderboard.ts). */
+  leaderboard: () => "/leaderboard",
   block: (height: number | string) => `/block/${encodeURIComponent(String(height))}`,
   tx: (id: string) => `/tx/${encodeURIComponent(id)}`,
   account: (nameOrAddress: string) => `/account/${encodeURIComponent(nameOrAddress)}`,
@@ -26,5 +28,5 @@ export const searchHref = (hit: { type: string; id: string }) =>
 
 /** Explorer pages are wide (charts, tables); the wallet's own pages are a narrow column. */
 export function isExplorerPath(path: string) {
-  return /^\/(explore|boos|guestbook|block|tx|account|trace|programs?|hunt|claim|seance)(\/|$)/.test(path) || /^\/name\/[^/]+/.test(path);
+  return /^\/(explore|boos|guestbook|leaderboard|block|tx|account|trace|programs?|hunt|claim|seance)(\/|$)/.test(path) || /^\/name\/[^/]+/.test(path);
 }

@@ -32,6 +32,8 @@ export const GUESTBOOK = addressOf("c8".repeat(32));
 /** A guestbook signature that runs long (the wall cuts it short) and hides text with bidi and control characters. */
 export const GUESTBOOK_LONG = `${"Fang you very much! ".repeat(12)}the end`;
 export const GUESTBOOK_SNEAKY = "hello\u202edlrow\u0007 there";
+/** The account trickortreat.boo points to, once a test opens the leaderboard (`addLeaderboard`). */
+export const TRICKORTREAT = addressOf("ca".repeat(32));
 /** A deployed program (protocol v2). */
 export const PROGRAM = addressOf("e1".repeat(32));
 
@@ -301,5 +303,32 @@ export function seedWorld(node: MockNode, vlad: string = addressOf("c1".repeat(3
     return { signed, not };
   };
 
-  return { vlad, ids, wasm_hash, interface_hash, addPayout, addGuestbook, ...ADDR };
+  /**
+   * trickortreat.boo, claimed, with players: mina paid 1 and won 3 (+2), renfield only won 1 (+1), the stranger paid 2 and won 1
+   * (-1), vlad paid 1 twice and won nothing (-2); lucy's dust, a failed play and a waiting one count for nothing, and the bot's
+   * own transfer to itself is ignored. Also a second guestbook signature by vlad (call `addGuestbook` first), so he tops that
+   * board. Made on request, like `addGuestbook`.
+   */
+  const addLeaderboard = () => {
+    const bot = TRICKORTREAT;
+    node.names.set("trickortreat", bot);
+    node.credit(bot, "10");
+    const ids = [
+      pay(mina, bot, "1", { memo: HOSTILE }),
+      pay(bot, mina, "3", { memo: "treat! <b>hi</b>" }),
+      pay(vlad, bot, "1"),
+      pay(vlad, bot, "1"),
+      pay(stranger, bot, "2"),
+      pay(bot, stranger, "1"),
+      pay(bot, renfield, "1"),
+      pay(lucy, bot, "0.5", { memo: "not a play: dust" }),
+      pay(lucy, bot, "1", { status: "failed", error: "insufficient balance", memo: "not a play: it failed" }),
+      pay(lucy, bot, "1", { status: "pending", memo: "not a play yet: still waiting" }),
+      pay(bot, bot, "5"),
+    ];
+    const again = pay(vlad, GUESTBOOK, "0.1", { memo: "Me again" });
+    return { ids, again };
+  };
+
+  return { vlad, ids, wasm_hash, interface_hash, addPayout, addGuestbook, addLeaderboard, ...ADDR };
 }

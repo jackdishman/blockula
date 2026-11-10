@@ -5,7 +5,7 @@
 // no `javascript:` link), and read v1's rules right: dropped vs failed receipts, tips, names
 // signed as names, expired and reserved names, hunts' cancel rule, staking's groups.
 import type { Tx } from "@blockula/sdk";
-import { GUESTBOOK, GUESTBOOK_LONG, HOSTILE, HOSTILE_ABORT, HOSTILE_EVENT, HOSTILE_METHOD, LONG_KEY, LONG_POP, PHONE, PROGRAM, seedWorld, type World } from "./explorer-world";
+import { GUESTBOOK, GUESTBOOK_LONG, HOSTILE, HOSTILE_ABORT, HOSTILE_EVENT, HOSTILE_METHOD, LONG_KEY, LONG_POP, PHONE, PROGRAM, seedWorld, TRICKORTREAT, type World } from "./explorer-world";
 import { RPC } from "./env";
 import { addressOf, VALIDATOR } from "./mock-node";
 import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
@@ -47,7 +47,7 @@ const receipt = (p: Page) => p.locator(".receipt .headline");
 test("no explorer page server-renders a style attribute (the CSP would block it)", async ({ request, node }) => {
   test.skip(!!process.env.E2E_DEV, "next dev relaxes the CSP");
   const w = seedWorld(node);
-  const paths = ["/explore", `/tx/${w.ids.sent}`, `/tx/${w.ids.dropped}`, "/account/vlad.boo", "/block/101", "/trace/vlad.boo", "/name/castle", "/name/tomb", "/programs", "/programs/hunts", "/programs/validators", "/programs/pool", "/programs/names", "/programs/accounts", "/boos", "/guestbook", "/hunt/0", "/claim/1", "/seance/2", "/governance", `/program/${PROGRAM}`, `/program/${w.wasm_hash}`, `/tx/${w.ids.programCall}`, `/tx/${w.ids.programFailed}`];
+  const paths = ["/explore", `/tx/${w.ids.sent}`, `/tx/${w.ids.dropped}`, "/account/vlad.boo", "/block/101", "/trace/vlad.boo", "/name/castle", "/name/tomb", "/programs", "/programs/hunts", "/programs/validators", "/programs/pool", "/programs/names", "/programs/accounts", "/boos", "/guestbook", "/leaderboard", "/hunt/0", "/claim/1", "/seance/2", "/governance", `/program/${PROGRAM}`, `/program/${w.wasm_hash}`, `/tx/${w.ids.programCall}`, `/tx/${w.ids.programFailed}`];
   for (const path of paths) {
     const res = await request.get(path);
     expect(res.status(), path).toBe(200);
@@ -438,6 +438,49 @@ test.describe("the explorer from an account holder's side", () => {
     expect([...long].length).toBeLessThan(GUESTBOOK_LONG.length);
     await expect(rows.nth(2)).toContainText("signed without a word");
     await expect(page.getByTestId("guestbook-list").locator("a[href^='http']")).toHaveCount(0);
+  });
+
+  test("the leaderboard: unclaimed names, then empty boards, then ranked, with names shown as text", async ({ page, node }) => {
+    const heading = (p: Page) => p.getByRole("heading", { name: "The leaderboard" });
+    // The guestbook links to it.
+    await visit(page, "/guestbook", (p) => p.getByRole("heading", { name: "The guestbook" }), errors);
+    await page.getByTestId("guestbook-leaderboard").click();
+    await expect(page).toHaveURL(/\/leaderboard\/?$/);
+
+    // Neither name is claimed here; the Soul board comes from the node's own list.
+    await visit(page, "/leaderboard", (p) => p.getByTestId("souls-list"), errors);
+    await expect(heading(page)).toBeVisible();
+    await expect(page.getByTestId("signers-empty")).toHaveText("Nobody has claimed guestbook.boo on this chain yet.");
+    await expect(page.getByTestId("players-empty")).toHaveText("Nobody has claimed trickortreat.boo on this chain yet.");
+    await expect(page.getByTestId("souls-list").getByTestId("board-who")).toHaveText(["mina.boo", "lucy.boo", "renfield.boo"]);
+    await expect(page.getByTestId("souls-points")).toHaveText(["12", "9", "6"]);
+
+    // Claimed, nothing yet.
+    node.names.set("guestbook", GUESTBOOK);
+    node.names.set("trickortreat", TRICKORTREAT);
+    await visit(page, "/leaderboard", (p) => p.getByTestId("signers-empty"), errors);
+    await expect(page.getByTestId("signers-empty")).toHaveText("No signatures yet.");
+    await expect(page.getByTestId("players-empty")).toHaveText("Nobody has played yet.");
+
+    // Ranked.
+    w.addGuestbook();
+    w.addLeaderboard();
+    await visit(page, "/leaderboard", (p) => p.getByTestId("signers-list"), errors);
+    await expect(page.getByTestId("players-list")).toBeVisible();
+    await expect(page.getByTestId("signers-scope")).toContainText("From the latest 6 signatures (5 signers)");
+    const stranger = `${w.stranger.slice(0, 10)}…${w.stranger.slice(-6)}`;
+    await expect(page.getByTestId("signers-list").getByTestId("board-who")).toHaveText(["vlad.boo", "renfield.boo", "lucy.boo", "mina.boo", stranger]);
+    await expect(page.getByTestId("signers-count")).toHaveText(["2 signatures", "1 signature", "1 signature", "1 signature", "1 signature"]);
+    // Trick or treat: by net; lucy's dust, failure and waiting play and the bot's own transfer don't count.
+    await expect(page.getByTestId("players-list").getByTestId("board-who")).toHaveText(["mina.boo", "renfield.boo", stranger, "vlad.boo"]);
+    await expect(page.getByTestId("players-net")).toHaveText(["+2", "+1", "-1", "-2"]);
+    await expect(page.getByTestId("players-detail")).toHaveText(["1 play, won 3", "0 plays, won 1", "1 play, won 1", "2 plays, won 0"]);
+    // Names link by name, unnamed accounts by address; memos are never shown.
+    await expect(page.getByTestId("signers-list").getByTestId("board-who").first()).toHaveAttribute("href", /\/account\/vlad\.boo\/?$/);
+    await expect(page.getByTestId("signers-list").getByTestId("board-who").nth(4)).toHaveAttribute("href", new RegExp(`/account/${w.stranger}/?$`));
+    await expect(page.locator("main")).not.toContainText("onerror");
+    await expect(page.locator("main")).not.toContainText("treat!");
+    await expect(page.locator("main").locator("a[href^='http']")).toHaveCount(0);
   });
 
   test("their own receipts, account and names", async ({ page }) => {
