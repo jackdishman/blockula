@@ -215,9 +215,13 @@ function funded(n: Node, rpc: string, byte: number, balance = 1_000n * FANG, opt
   assert.throws(() => new Client("http://own.node", { network: "testnet", prefix: "boo" }), /contradicts/);
   assert.throws(() => new Client({ network: "moon" as never }), /unknown network/);
   assert.doesNotThrow(() => new Client("http://own.node", { network: "testnet", genesisHash: NETWORKS.testnet.genesisHash!.toUpperCase() }));
-  // No mainnet preset: the SDK knows blockula-testnet-2 (by its pins) and a local dev chain.
-  assert.deepEqual(Object.keys(NETWORKS), ["testnet", "local"]);
-  assert.throws(() => new Client("https://rpc.example", { network: "mainnet" as never }), /unknown network "mainnet" \(testnet or local\)/);
+  // No mainnet preset: the SDK knows the demo chain, blockula-testnet-2 (by its pins) and a local dev chain.
+  assert.deepEqual(Object.keys(NETWORKS), ["demo", "testnet", "local"]);
+  assert.throws(() => new Client("https://rpc.example", { network: "mainnet" as never }), /unknown network "mainnet" \(demo, testnet or local\)/);
+  // The demo chain has a public node built in, and pins everything before the first request.
+  const demo = new Client({ network: "demo" });
+  assert.deepEqual([demo.rpc, demo.network, demo.prefix], ["https://demo.blockula.app", "demo", "boo"]);
+  assert.ok(Wallet.generate(demo).address.startsWith("boo1"));
   assert.equal((Client as unknown as Record<string, unknown>).mainnet, undefined, "no Client.mainnet()");
   assert.equal(Client.local().rpc, "http://localhost:7070");
   assert.equal(new Client("http://x.example", 5 as never).rpc, "http://x.example", "a bad options value is ignored as before");
@@ -231,6 +235,11 @@ function funded(n: Node, rpc: string, byte: number, balance = 1_000n * FANG, opt
   assert.equal(NETWORKS.testnet.genesisHash, KNOWN_GENESIS[NETWORKS.testnet.chainId!]);
   assert.deepEqual(NETWORKS.testnet.genesisClock, KNOWN_CLOCKS[NETWORKS.testnet.chainId!]);
   assert.equal(NETWORKS.local.rpc, KNOWN_NETWORKS.local.rpc);
+  assert.equal(NETWORKS.demo.rpc, KNOWN_NETWORKS.demo.rpc);
+  assert.equal(NETWORKS.demo.chainId, KNOWN_NETWORKS.demo.pin.chainId);
+  assert.equal(NETWORKS.demo.prefix, KNOWN_NETWORKS.demo.pin.prefix);
+  assert.equal(NETWORKS.demo.genesisHash, KNOWN_GENESIS[NETWORKS.demo.chainId!]);
+  assert.deepEqual(NETWORKS.demo.genesisClock, KNOWN_CLOCKS[NETWORKS.demo.chainId!]);
 }
 console.log("✓ network presets pin everything up front (tboo1… before any request) and match the MCP's networks");
 

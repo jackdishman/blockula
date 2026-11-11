@@ -1,15 +1,45 @@
+# Deny by default: only the node, served-wallet inputs and image entrypoint are sent.
+**
+!rust-toolchain.toml
+!package.json
+!package-lock.json
+!node/
+!node/**
+!sdk-ts/
+!sdk-ts/**
+!web/
+!web/**
+!mcp/
+mcp/**
+!mcp/package.json
+!scripts/
+scripts/**
+!scripts/wallet-built.mjs
+!deploy/
+deploy/**
+!deploy/Dockerfile
+!deploy/entrypoint.sh
+
+# Never copy host build products, local configuration, keys or private fuzz findings.
 **/target
 **/node_modules
 **/.next
+**/.next-*
 **/dist
-web
-sdk-ts
-mcp
-.scratch-home
-.git
-# Never in an image build context: private working material and fuzz findings (SECURITY.md),
-# which stay on the maintainer's machine. The node image doesn't build node/fuzz.
-.context
-.claude
+**/out
+**/test-results
+**/playwright-report
+**/*.tsbuildinfo
+**/.env*
+**/.git
+**/.context
+**/.claude
+**/.scratch-home
+**/secrets
+**/*.key
+**/wallet.json
+**/*-wallet.json
 **/private
 node/fuzz
+node/ghost/fuzz
+node/vm/fuzz

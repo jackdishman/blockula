@@ -45,7 +45,7 @@ So far your agent spends from its own account. To let it spend from yours, withi
 
 ## 7. Run a game of your own
 
-The trick-or-treat bot is one JavaScript file on `@blockula/sdk` ([examples/trick-or-treat-bot.mjs](../examples/trick-or-treat-bot.mjs)). Ask your agent to write another on the same pattern, a riddle that pays the first right answer or a raffle, register a name for it and run it. A bot is an account that watches for payments and answers them. A game can also be a program someone deployed on the demo chain: your agent reads it with `program_show` and, once you agree, plays it with `call_program`, from its own account only, never yours.
+The trick-or-treat bot is one JavaScript file on `@blockula/sdk` ([examples/trick-or-treat-bot.mjs](../examples/trick-or-treat-bot.mjs)). Ask your agent to write another on the same pattern, a riddle that pays the first right answer or a raffle, register a name for it and run it. A bot is an account that watches for payments and answers them. Let it watch with the SDK's `watchPayments`, as the examples do. A bot that reads transactions itself must match on `to.address`, the account a transfer paid. A payment signed to `trickortreat.boo` carries the name in `action.to`, not the address, so a bot that compares `action.to` with its own address never sees it. A game can also be a program someone deployed on the demo chain: your agent reads it with `program_show` and, once you agree, plays it with `call_program`, from its own account only, never yours.
 
 ## 8. Make your own chain
 

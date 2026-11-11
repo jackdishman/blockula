@@ -3,20 +3,24 @@
 // chain's id and genesis hash, ticks are kept per chain, steps the chain shows done tick themselves,
 // a friend's invite link opens a welcome, and Learn draws the chain's tokenomics from its parameters.
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { expect, test, type Page } from "@playwright/test";
 
 const ORIGIN = "https://my-node.blockula.test";
 const HTML = readFileSync(path.join(__dirname, "../../node/src/explorer.html"), "utf8");
+// Match the node's hash-based policy: adding an external encoder or a second script must fail.
+const SCRIPT_HASH = createHash("sha256").update(HTML.split("<script>")[1].split("</script>")[0]).digest("base64");
+const CSP = `default-src 'none'; script-src 'sha256-${SCRIPT_HASH}' 'strict-dynamic'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src data: 'self'; manifest-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`;
 const HASH = "158f5fc57712e5148b572fd8f52b294287d419e6571e557ebd2359c1810e397e";
 const VALIDATOR = "boo1qrwpfntxrs2u9dqlevlgrujjmchfxp5y6qh5qyju2s53zucs4pgq4vps32";
 const TREASURY = "boo1wgpg29zsxm82xmrtqs3g286hdx36c2zsy8zpfhgtsd7k67nxz34qzv3qn5";
 
-type World = { name?: string; faucet?: boolean; validators?: number; programs?: boolean; txs?: boolean; hunts?: number };
+type World = { wallet?: boolean; name?: string; faucet?: boolean; validators?: number; programs?: boolean; txs?: boolean; hunts?: number };
 
 /** A chain made with `blockula create --name "Jack in the Block" --token JACK`, a block in. */
 function api(p: string, w: World): unknown {
-  if (p === "/status") return { name: w.name ?? "Jack in the Block", token: "JACK", chain_id: "jack-in-the-block", genesis_hash: HASH, faucet: w.faucet ?? true, height: 3, block_time_ms: 5000, epoch: 0, active_validators: w.validators ?? 1, mempool: 0, supply: "1100000000000000000", supply_display: "1100000000 JACK", burned: "65200", burned_display: "0.0000652 JACK", accounts: w.txs ? 3 : 2, names: 0, head_age_ms: 500, history_from: 1, validators: [{ address: VALIDATOR, name: "🧛 validator", short: "boo1qrwpfn…4vps32" }] };
+  if (p === "/status") return { wallet: w.wallet ? "/wallet/" : null, name: w.name ?? "Jack in the Block", token: "JACK", chain_id: "jack-in-the-block", genesis_hash: HASH, faucet: w.faucet ?? true, height: 3, block_time_ms: 5000, epoch: 0, active_validators: w.validators ?? 1, mempool: 0, supply: "1100000000000000000", supply_display: "1100000000 JACK", burned: "65200", burned_display: "0.0000652 JACK", accounts: w.txs ? 3 : 2, names: 0, head_age_ms: 500, history_from: 1, validators: [{ address: VALIDATOR, name: "🧛 validator", short: "boo1qrwpfn…4vps32" }] };
   if (p === "/genesis") return { chain_id: "jack-in-the-block", allocations: [{ address: VALIDATOR, amount: "1000000000000000000" }, { address: TREASURY, amount: "100000000000000000", label: "treasury" }], validators: [{ address: VALIDATOR }] };
   if (p === "/fees") return { account_creation_fee: "100000000", account_creation_fee_display: "0.1 JACK", suggested: { flat: "10000", rate: "10000" }, tip_cap_multiple: 20, ...(w.programs ? { fuel: { status: "on", state_bytes: 591 } } : {}) };
   if (p === "/params") return { params: { account_creation_fee: "100000000", issuance_initial_ppm: "60000", issuance_decay_ppm: "150000", issuance_floor_ppm: "15000", issuance_stakers_bps: "7000", issuance_pool_bps: "2000", tip_cap_multiple: "20" }, genesis: { block_time_ms: 5000, epoch_blocks: 120, epochs_per_year: 52596 }, issuance: { year: 0, rate_ppm: 0, base_supply: "0", per_epoch: "0" }, supply: "1100000000000000000", burned: "65200" };
@@ -31,7 +35,7 @@ function api(p: string, w: World): unknown {
 async function open(page: Page, hash: string, w: World = {}) {
   const errors: string[] = [];
   page.on("pageerror", (e) => errors.push(e.message));
-  await page.route(`${ORIGIN}/`, (r) => r.fulfill({ contentType: "text/html", body: HTML }));
+  await page.route(`${ORIGIN}/`, (r) => r.fulfill({ contentType: "text/html", headers: { "Content-Security-Policy": CSP }, body: HTML }));
   await page.route(`${ORIGIN}/api/**`, (r) => {
     const u = new URL(r.request().url());
     if (u.pathname === "/api/health") return r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true }) });
@@ -151,4 +155,46 @@ test("Learn draws the chain's tokenomics from its parameters", async ({ page }) 
   await expect(tok).toContainText("This chain's JACK has no value; it only prices spam.");
   // No Hunts on this chain: Learn doesn't send people to them.
   await expect(page.locator("#app")).not.toContainText("Useful work can be paid");
+});
+
+// Known encoding of `${ORIGIN}/wallet/`, produced by the wallet encoder whose independent
+// Nayuki known-answer vectors live in lib/qr.test.mjs. A wrong destination changes the path.
+const WALLET_QR_PATH_HASH = "6b6fa60eb586fd3ea3d1215f84cd4e5d0f8e82e0c0e953224394fa081cae4d65";
+for (const scheme of ["light", "dark"] as const) {
+  for (const width of [1280, 390]) {
+    test(`invite wallet QR encodes the wallet link under CSP (${scheme}, ${width}px)`, async ({ page }, testInfo) => {
+      await page.emulateMedia({ colorScheme: scheme });
+      await page.setViewportSize({ width, height: 844 });
+      const requests: string[] = [];
+      page.on("request", (request) => requests.push(request.url()));
+      const errors = await open(page, "#/start/invite", { wallet: true });
+      const welcome = page.locator("#app .invite").first();
+      const qr = welcome.getByRole("img", { name: "QR code: open this node’s wallet", exact: true });
+      await expect(qr).toBeVisible();
+      await expect(welcome.getByRole("link", { name: "Open the wallet", exact: true })).toHaveAttribute("href", `${ORIGIN}/wallet/`);
+      await expect(qr).toHaveAttribute("viewBox", "0 0 37 37");
+      const modules = await qr.locator("path").getAttribute("d");
+      expect(createHash("sha256").update(modules!).digest("hex")).toBe(WALLET_QR_PATH_HASH);
+      // Fixed black/white, including a four-module quiet zone, stays camera-readable in either theme.
+      await expect(qr.locator("rect")).toHaveAttribute("fill", "#fff");
+      await expect(qr.locator("path")).toHaveAttribute("fill", "#000");
+      const bounds = await qr.boundingBox();
+      expect(bounds!.width).toBeGreaterThanOrEqual(160);
+      expect(bounds!.x).toBeGreaterThanOrEqual(0);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      expect(await page.locator("script:not([src])").count()).toBe(1);
+      expect(requests.filter((url) => !url.startsWith(`${ORIGIN}/`) && !/^https:\/\/fonts\.(googleapis|gstatic)\.com\//.test(url) && !url.startsWith("data:"))).toEqual([]);
+      expect(errors).toEqual([]);
+      await welcome.screenshot({ path: testInfo.outputPath(`invite-qr-${scheme}-${width}.png`) });
+    });
+  }
+}
+
+test("invite hides wallet QR when this binary has no wallet", async ({ page }) => {
+  const errors = await open(page, "#/start/invite", { wallet: false });
+  await expect(page.getByRole("img", { name: "QR code: open this node’s wallet" })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "Open the wallet", exact: true })).toHaveCount(0);
+  await expect(page.locator("#app .invite").first()).toContainText(`blockula wallet new --rpc ${ORIGIN}`);
+  expect(errors).toEqual([]);
 });

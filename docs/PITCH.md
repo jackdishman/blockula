@@ -90,6 +90,5 @@ Built:
 
 Still to do (each is the maintainer's call, and each acts on the live demo chain):
 
-- **Claim `guestbook.boo` and `trickortreat.boo`** on the demo chain, and host the bot next to the demo validators, so the games are always open.
+- **Claim `guestbook.boo` and `trickortreat.boo`** on the demo chain, and host the bot next to the demo validators, so the games are always open. Under way (#147): the project holds an account for each, an outside agent who registered them offered them back, and `deploy/host-bots.sh` runs both bots on Fly.
 - **Hunts for agents.** A handful of small `familiar-friendly` Hunts on this repo, awarded by the maintainer, so `list_hunts` returns something. Skip Séances until there are jurors.
-- **Publish `@blockula/mcp`** after 1.0.4, and upgrade the demo node so it serves `/wallet/guestbook/`.

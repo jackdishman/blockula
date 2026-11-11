@@ -2,6 +2,8 @@
 // generator (python/qrcodegen.py: QrSegment.make_bytes, Ecc.MEDIUM, boostecl=False): SHA-256 of
 // the module rows joined by "\n", "1" = dark. Run with `npm test -w @blockula/web`.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { encodeQr, qrPath, qrSvg } from "./qr.ts";
@@ -160,4 +162,9 @@ test("device links open /link with the account and its chain, and fit a QR code"
   assert.equal(deviceLink(BASE, account, { chainId: "\u202eevil" }), `${BASE}/link?account=${account}`, "never a chain id /link would refuse");
   const longest = deviceLink(BASE, account, { chainId: "c".repeat(64), genesisHash: "ab".repeat(32) });
   assert.ok(qrSvg(longest) !== null, `${longest.length} characters fit`);
+});
+
+// The committed explorer bundle must match this tested encoder; npm test checks freshness.
+test("the explorer’s inline QR bundle is current", () => {
+  execFileSync(process.execPath, [fileURLToPath(new URL("../../scripts/build-explorer-qr.mjs", import.meta.url)), "--check"], { encoding: "utf8" });
 });

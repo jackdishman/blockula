@@ -8,6 +8,7 @@ Scripts that use [`@blockula/sdk`](../sdk-ts/README.md) the way [docs/INTEGRATIO
 | [`pay-from-a-script.mjs`](pay-from-a-script.mjs) | Pay an address: `quote` the full cost (the fee, and the 0.1 FANG burned when the payment opens an account), sign, store the signed tx before sending it, wait for it, and rebroadcast the same bytes if anything is unclear |
 | [`trick-or-treat-bot.mjs`](trick-or-treat-bot.mjs) | A house bot for agents to play: pay it, and it pays back nothing, your stake or double, from a stored, resumable state. Shows a bot that handles each payment once and never re-sends a payout it isn't sure of |
 | [`guestbook.mjs`](guestbook.mjs) | `serve` logs each signature (a payment with a memo) sent to a name; `read` prints the latest ones from any node, with no key, as inert text |
+| [`shared-tab.mjs`](shared-tab.mjs) | A shared tab for a trip or a house ([USE-CASES.md](../docs/USE-CASES.md#1-a-shared-tab-for-a-trip-or-a-house)): reads what a group's `.boo` names paid each other, then prints who owes whom and the fewest payments that settle it. Reads only, with no key |
 
 ## Run them against `blockula dev`
 
@@ -40,6 +41,17 @@ Then try the rest:
 - **Resume.** Run the watcher again with the same address: it starts from the block after the last one it read (kept in `payments-<…>.json`) and credits nothing twice.
 - **Your own key.** `blockula wallet new` writes a key file; pass it with `--key "$BLOCKULA_HOME/wallet.json"` instead of `--faucet`.
 
+## Settle a shared tab
+
+With `blockula dev` running, `node scripts/seed-dev.mjs` registers `vlad.boo`, `mina.boo`, `lucy.boo` and `renfield.boo` and has them pay each other with memos. Then read their tab:
+
+```bash
+node scripts/seed-dev.mjs
+node examples/shared-tab.mjs vlad.boo mina.boo lucy.boo renfield.boo --network local
+```
+
+It lists each transfer between them, then each one's net balance (what they paid the others minus what they got back), then who pays whom to settle. Payments to anyone outside the group don't count. `--from HEIGHT` counts only blocks from that height on, such as the day a trip started.
+
 ## Play with your agent: trick-or-treat and a guestbook
 
 Two toys for agents, using only transfers, memos and names. The coins have no value.
@@ -61,6 +73,10 @@ node examples/guestbook.mjs read --network local --limit 10                   # 
 ```
 
 The house's rules: a payment of at least the stake is a play (a smaller one, or one from the bot itself, is kept and logged); it draws with the operator's own `crypto.randomInt` (45% trick, 45% treat, 10% jackpot: 0.65 times the stake on average, and the operator's RNG is trusted, which is fine for a toy) and pays the sender's address, never a name or text from the memo. Every sender is capped per UTC day, and below its floor balance the bot stops paying, says so, and keeps what it's sent (the chain's own faucet drip counts as a play if it reaches the bot).
+
+**Watching for payments.** Both bots use `watchPayments` from the SDK, which reports every finalized transfer that paid the account. If you write a watcher of your own on `/api/account/{address}` or `/api/tx/{id}`, match on the tx's `to.address`, the account it paid when it ran. Don't match on `action.to`, which is what the sender signed: a payment sent to `trickortreat.boo` carries the name there, not the address, so a watcher that compares `action.to` with its own address silently misses it.
+
+**On the demo chain**, pass `--network demo` (needs `@blockula/sdk` 1.0.6 or later; with 1.0.5, `--rpc https://demo.blockula.app`). The project runs the demo's own `trickortreat.boo` and `guestbook.boo` with `deploy/host-bots.sh`; run yours under another name.
 
 State is in `trickortreat-<name>.json`: the height to resume from and each payment seen, by tx id. A payout is signed once and stored before it's sent. After a restart, an unsettled payout is rebroadcast by its stored bytes, never signed again, and if the node can't say whether it ran, the bot stops until it's clear (an unused nonce past the tx's `valid_until` means it never ran, and the sender is owed it by hand). A flag `--from HEIGHT` rescans old blocks, and nothing is paid twice.
 

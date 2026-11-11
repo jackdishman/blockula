@@ -105,6 +105,11 @@ Things to ask it:
 - "Show amounts in the wallet with two decimals."
 - "Add a 'Send to a friend' button on the explorer's account page that opens the wallet's Send with the name filled in."
 
+The explorer's invite QR reuses `web/lib/qr.ts`, the wallet's offline encoder. After
+changing that encoder, run `npm run build:explorer-qr` and commit the generated block
+in `node/src/explorer.html`. `npm test -w @blockula/web` checks it is current. It stays
+inside the explorer's one CSP-hashed inline script; no QR service or extra script is fetched.
+
 ### See your changes
 
 - **The wallet:** `npm run build -w @blockula/sdk` once, then `npm run dev -w @blockula/web` and open http://localhost:3000. It talks to the node on this machine. To see it as your node serves it, at `/wallet/`, run `npm run build:wallet` and build the node as below.

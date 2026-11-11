@@ -57,6 +57,12 @@ while IFS= read -r hit; do
 done < <(grep -nE 'container: *"node:' .github/workflows/release.yml || true)
 [ "$(grep -cE 'container: *"node:' .github/workflows/release.yml)" -ge 2 ] || bad "release.yml's wallet and reproduce-wallet jobs must run in WALLET_IMAGE"
 
+# The container embeds the same served-wallet export as release binaries.
+while IFS= read -r image; do
+  [ "$image" = "$wallet_image" ] || bad "Dockerfile's wallet image isn't WALLET_IMAGE ($wallet_image): $image"
+done < <(sed -nE 's/^FROM (node:[^ ]+).*/\1/p' deploy/Dockerfile)
+grep -qE '^FROM node:[^ ]+ AS wallet$' deploy/Dockerfile || bad "Dockerfile must build the served wallet in its pinned Node.js stage"
+
 # --locked on every cargo build/test/clippy/run/install in CI, scripts and the image.
 while IFS= read -r hit; do
   printf '%s' "$hit" | grep -q -- '--locked' || bad "cargo without --locked: $hit"

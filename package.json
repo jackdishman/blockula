@@ -5,6 +5,7 @@
   "scripts": {
     "build": "npm run build:wallet && cargo build --release --manifest-path node/Cargo.toml && npm run build -w @blockula/mcp",
     "build:wallet": "npm run build -w @blockula/sdk && npm run build:served -w @blockula/web && node scripts/wallet-built.mjs",
+    "build:explorer-qr": "node scripts/build-explorer-qr.mjs",
     "build:haunt": "esbuild web/lib/ascii/standalone.ts --bundle --minify --format=iife --target=es2020 --legal-comments=none --outfile=node/src/haunt.js",
     "dev": "cargo run --release --manifest-path node/Cargo.toml -- dev",
     "test": "cargo test --manifest-path node/Cargo.toml && npm test -w @blockula/sdk",

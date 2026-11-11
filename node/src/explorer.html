@@ -144,6 +144,11 @@
   .copy { flex:none; border:0; padding:6px 10px; background:var(--ink); color:var(--paper-hi); font:400 14px var(--caps); letter-spacing:.06em; cursor:pointer; }
   .copy:hover { background:var(--blood); }
   .invite { border:5px double var(--blood); }
+  .wallet-invite { display:flex; flex-wrap:wrap; gap:16px 24px; align-items:center; margin:14px 0; }
+  .wallet-invite-copy { flex:1 1 180px; min-width:0; }
+  .wallet-invite-qr { flex:0 1 192px; max-width:100%; margin:0; }
+  .wallet-invite-qr svg { display:block; width:192px; max-width:100%; height:auto; background:#fff; }
+  .wallet-invite-qr figcaption { margin-top:6px; font-size:15px; color:var(--dim); }
   .uses { margin:0; padding-left:22px; } .uses li { margin:6px 0; }
   /* Tokenomics: inline SVG built from /api/params, /api/status, /api/fees and /api/genesis */
   .tok { display:grid; grid-template-columns:repeat(auto-fit, minmax(min(100%, 380px), 1fr)); gap:22px 28px; margin-top:12px; }
@@ -190,6 +195,36 @@
 <main id="app"><div class="loading">Rising from the grave…</div></main>
 <footer><span id="imprint">Post-quantum signatures · ML-DSA-65 · Not audited, test chains only</span> · <span id="notice">Test FANG has no value</span> · <span id="terms">For education and research only · <a href="https://blockula.app/terms">Terms</a> · <a href="https://blockula.app/privacy">Privacy</a></span><button type="button" class="motion-toggle" data-motion-toggle hidden></button></footer>
 <script>
+// BEGIN GENERATED INVITE QR (npm run build:explorer-qr)
+/**
+ * A small, dependency-free QR Code encoder (ISO/IEC 18004), just enough for payment links:
+ * byte mode, error correction level M, versions 1-40, automatic mask selection.
+ *
+ * Kept self-contained on purpose: a wallet shouldn't pull a third-party package into the page
+ * that renders where people send money. Adapted from Project Nayuki's QR Code generator library
+ * (notice below), and lib/qr.test.mjs checks the output against it.
+ *
+ * Copyright (c) Project Nayuki. (MIT License)
+ * https://www.nayuki.io/page/qr-code-generator-library
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of
+ * this software and associated documentation files (the "Software"), to deal in
+ * the Software without restriction, including without limitation the rights to
+ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ * - The above copyright notice and this permission notice shall be included in
+ *   all copies or substantial portions of the Software.
+ * - The Software is provided "as is", without warranty of any kind, express or
+ *   implied, including but not limited to the warranties of merchantability,
+ *   fitness for a particular purpose and noninfringement. In no event shall the
+ *   authors or copyright holders be liable for any claim, damages or other
+ *   liability, whether in an action of contract, tort or otherwise, arising from,
+ *   out of or in connection with the Software or the use or other dealings in the
+ *   Software.
+ */
+var ExplorerQr=(()=>{var b=Object.defineProperty;var v=Object.getOwnPropertyDescriptor;var k=Object.getOwnPropertyNames;var F=Object.prototype.hasOwnProperty;var C=(s,t,e)=>t in s?b(s,t,{enumerable:!0,configurable:!0,writable:!0,value:e}):s[t]=e;var E=(s,t)=>{for(var e in t)b(s,e,{get:t[e],enumerable:!0})},A=(s,t,e,n)=>{if(t&&typeof t=="object"||typeof t=="function")for(let r of k(t))!F.call(s,r)&&r!==e&&b(s,r,{get:()=>t[r],enumerable:!(n=v(t,r))||n.enumerable});return s};var B=s=>A(b({},"__esModule",{value:!0}),s);var m=(s,t,e)=>C(s,typeof t!="symbol"?t+"":t,e);var $={};E($,{qrSvg:()=>y});var w=[-1,10,16,26,18,24,16,18,22,22,26,30,22,22,24,24,28,28,26,26,26,26,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28],M=[-1,1,1,1,2,2,4,4,4,5,5,5,8,9,9,10,10,11,13,14,16,17,17,18,20,21,23,25,26,28,29,31,33,35,37,38,40,43,45,47,49],L=0;function S(s,t={}){let e=new TextEncoder().encode(s),n=1;for(;;n++){if(n>40)throw new RangeError("Too much data for a QR code");if(4+(n<10?8:16)+e.length*8<=x(n)*8)break}let r=R(Q(e,n),n);return new p(n).build(r,t.mask)}function y(s,t=4){try{let e=S(s);return{size:e.length+2*t,d:P(e,t)}}catch(e){if(e instanceof RangeError)return null;throw e}}function P(s,t=4){let e="";for(let n=0;n<s.length;n++)for(let r=0;r<s.length;){if(!s[n][r]){r++;continue}let i=r;for(;r<s.length&&s[n][r];)r++;e+=`M${i+t} ${n+t}h${r-i}v1h${i-r}z`}return e}function g(s){let t=(16*s+128)*s+64;if(s>=2){let e=Math.floor(s/7)+2;t-=(25*e-10)*e-55,s>=7&&(t-=36)}return t}function x(s){return Math.floor(g(s)/8)-w[s]*M[s]}function Q(s,t){let e=[],n=(a,o)=>{for(let l=o-1;l>=0;l--)e.push(a>>>l&1)};n(4,4),n(s.length,t<10?8:16);for(let a of s)n(a,8);let r=x(t)*8;n(0,Math.min(4,r-e.length)),n(0,(8-e.length%8)%8);for(let a=236;e.length<r;a^=253)n(a,8);let i=[];for(let a=0;a<e.length;a+=8)i.push(e.slice(a,a+8).reduce((o,l)=>o<<1|l,0));return i}function R(s,t){let e=M[t],n=w[t],r=Math.floor(g(t)/8),i=e-r%e,a=Math.floor(r/e),o=_(n),l=[];for(let c=0,h=0;c<e;c++){let u=s.slice(h,h+a-n+(c<i?0:1));h+=u.length;let z=D(u,o);c<i&&u.push(0),l.push(u.concat(z))}let f=[];for(let c=0;c<l[0].length;c++)l.forEach((h,u)=>{(c!==a-n||u>=i)&&f.push(h[c])});return f}function d(s,t){let e=0;for(let n=7;n>=0;n--)e=e<<1^(e>>>7)*285,e^=(t>>>n&1)*s;return e}function _(s){let t=new Array(s).fill(0);t[s-1]=1;let e=1;for(let n=0;n<s;n++){for(let r=0;r<s;r++)t[r]=d(t[r],e),r+1<s&&(t[r]^=t[r+1]);e=d(e,2)}return t}function D(s,t){let e=t.map(()=>0);for(let n of s){let r=n^e.shift();e.push(0),t.forEach((i,a)=>e[a]^=d(i,r))}return e}var H=[(s,t)=>(s+t)%2===0,(s,t)=>t%2===0,s=>s%3===0,(s,t)=>(s+t)%3===0,(s,t)=>(Math.floor(s/3)+Math.floor(t/2))%2===0,(s,t)=>s*t%2+s*t%3===0,(s,t)=>(s*t%2+s*t%3)%2===0,(s,t)=>((s+t)%2+s*t%3)%2===0],p=class{constructor(t){m(this,"size");m(this,"version");m(this,"m");m(this,"fn");this.version=t,this.size=t*4+17,this.m=Array.from({length:this.size},()=>new Array(this.size).fill(!1)),this.fn=Array.from({length:this.size},()=>new Array(this.size).fill(!1))}build(t,e){this.drawFunctionPatterns(),this.drawCodewords(t);let n=e??-1;if(n<0){let r=1/0;for(let i=0;i<8;i++){this.applyMask(i),this.drawFormatBits(i);let a=this.penalty();a<r&&([r,n]=[a,i]),this.applyMask(i)}}return this.applyMask(n),this.drawFormatBits(n),this.m.map(r=>r.slice())}set(t,e,n){this.m[e][t]=n,this.fn[e][t]=!0}drawFunctionPatterns(){let t=this.size;for(let r=0;r<t;r++)this.set(6,r,r%2===0),this.set(r,6,r%2===0);this.drawFinder(3,3),this.drawFinder(t-4,3),this.drawFinder(3,t-4);let e=this.alignmentPositions(),n=e.length;for(let r=0;r<n;r++)for(let i=0;i<n;i++)if(!(r===0&&i===0||r===0&&i===n-1||r===n-1&&i===0))for(let a=-2;a<=2;a++)for(let o=-2;o<=2;o++)this.set(e[r]+o,e[i]+a,Math.max(Math.abs(o),Math.abs(a))!==1);this.drawFormatBits(0),this.drawVersion()}drawFinder(t,e){for(let n=-4;n<=4;n++)for(let r=-4;r<=4;r++){let i=t+r,a=e+n;if(i<0||i>=this.size||a<0||a>=this.size)continue;let o=Math.max(Math.abs(r),Math.abs(n));this.set(i,a,o!==2&&o!==4)}}alignmentPositions(){if(this.version===1)return[];let t=Math.floor(this.version/7)+2,e=Math.floor((this.version*8+t*3+5)/(t*4-4))*2,n=[6];for(let r=this.size-7;n.length<t;r-=e)n.splice(1,0,r);return n}drawFormatBits(t){let e=L<<3|t,n=e;for(let o=0;o<10;o++)n=n<<1^(n>>>9)*1335;let r=(e<<10|n)^21522,i=o=>(r>>>o&1)!==0,a=this.size;for(let o=0;o<=5;o++)this.set(8,o,i(o));this.set(8,7,i(6)),this.set(8,8,i(7)),this.set(7,8,i(8));for(let o=9;o<15;o++)this.set(14-o,8,i(o));for(let o=0;o<8;o++)this.set(a-1-o,8,i(o));for(let o=8;o<15;o++)this.set(8,a-15+o,i(o));this.set(8,a-8,!0)}drawVersion(){if(this.version<7)return;let t=this.version;for(let n=0;n<12;n++)t=t<<1^(t>>>11)*7973;let e=this.version<<12|t;for(let n=0;n<18;n++){let r=(e>>>n&1)!==0,i=this.size-11+n%3,a=Math.floor(n/3);this.set(i,a,r),this.set(a,i,r)}}drawCodewords(t){let e=0;for(let n=this.size-1;n>=1;n-=2){n===6&&(n=5);let r=(n+1&2)===0;for(let i=0;i<this.size;i++){let a=r?this.size-1-i:i;for(let o=0;o<2;o++){let l=n-o;this.fn[a][l]||e>=t.length*8||(this.m[a][l]=(t[e>>>3]>>>7-(e&7)&1)!==0,e++)}}}}applyMask(t){let e=H[t];for(let n=0;n<this.size;n++)for(let r=0;r<this.size;r++)!this.fn[n][r]&&e(r,n)&&(this.m[n][r]=!this.m[n][r])}penalty(){let t=this.size,e=this.m,n=0;for(let a of[!1,!0])for(let o=0;o<t;o++){let l=!1,f=0,c=[0,0,0,0,0,0,0];for(let h=0;h<t;h++){let u=a?e[h][o]:e[o][h];u===l?(f++,f===5?n+=3:f>5&&n++):(this.addHistory(f,c),l||(n+=this.finderLike(c)*40),l=u,f=1)}l&&(this.addHistory(f,c),f=0),this.addHistory(f+t,c),n+=this.finderLike(c)*40}for(let a=0;a<t-1;a++)for(let o=0;o<t-1;o++){let l=e[a][o];l===e[a][o+1]&&l===e[a+1][o]&&l===e[a+1][o+1]&&(n+=3)}let r=0;for(let a of e)for(let o of a)o&&r++;let i=t*t;return n+=(Math.ceil(Math.abs(r*20-i*10)/i)-1)*10,n}addHistory(t,e){e[0]===0&&(t+=this.size),e.pop(),e.unshift(t)}finderLike(t){let e=t[1],n=e>0&&t[2]===e&&t[3]===e*3&&t[4]===e&&t[5]===e;return(n&&t[0]>=e*4&&t[6]>=e?1:0)+(n&&t[6]>=e*4&&t[0]>=e?1:0)}};return B($);})();
+// END GENERATED INVITE QR
 // The animated ASCII backdrop (moon, fog, bats), bundled from web/lib/ascii. This script adds it, not a
 // tag in the page: the CSP trusts only this script (by hash), and 'strict-dynamic' extends that trust to
 // the scripts it adds, never to markup.
@@ -1037,6 +1072,14 @@ views.code = async function (hash) {
   </div>`;
 };
 
+// The same QR encoder as the wallet, bundled above: black on white, including its
+// four-module quiet zone. The link stays usable if an unusually long origin cannot fit.
+function walletInviteQr(url) {
+  const qr = ExplorerQr.qrSvg(url, 4);
+  if (!qr) return '<p class="dim">This link is too long for a QR code. Copy it instead.</p>';
+  return `<figure class="wallet-invite-qr"><svg viewBox="0 0 ${qr.size} ${qr.size}" role="img" aria-label="QR code: open this node’s wallet" shape-rendering="crispEdges"><rect width="${qr.size}" height="${qr.size}" fill="#fff"/><path d="${qr.d}" fill="#000"/></svg><figcaption>Scan to open the wallet on your phone.</figcaption></figure>`;
+}
+
 // ---- Start here (#/start, and #/start/invite for a friend who was sent the link): what to do on this
 // chain, one command each, filled in with this node's origin and the chain's id and genesis hash. Ticks
 // are kept in this browser per genesis hash; steps the chain itself shows done tick themselves. ----
@@ -1142,7 +1185,7 @@ function startPage(s, ctx, invited) {
   const plainHttp = !loopback() && location.protocol === "http:";
   const welcome = invited ? card(`<span class="eyebrow">Invitation</span><h1>You've been invited to ${name}</h1>
     <p>A ledger a few boos run together. Its ${esc(UNIT)} has no value: it only prices spam.</p>
-    ${wallet ? `<p class="cta-row"><a class="wallet-cta" href="${esc(wallet)}">Open the wallet</a><span class="dim">Make a wallet with a passkey${s.faucet ? `, take 100 ${esc(UNIT)} from the faucet` : ""} and pay someone by name. Nothing to install.</span></p>
+    ${wallet ? `<div class="wallet-invite"><div class="wallet-invite-copy"><p class="cta-row"><a class="wallet-cta" href="${esc(wallet)}">Open the wallet</a></p><p class="dim">Make a wallet with a passkey${s.faucet ? `, take 100 ${esc(UNIT)} from the faucet` : ""} and pay someone by name. Nothing to install.</p></div>${walletInviteQr(wallet)}</div>
     <p class="dim">Or with the command line:</p>` : ""}
     <ol class="tasks">
       <li class="task"><span></span><h3>Install Blockula</h3><div class="body">${cmd(INSTALL)}</div></li>

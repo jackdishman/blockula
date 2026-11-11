@@ -10,12 +10,6 @@ One line adds the demo chain to Claude Code (or any MCP client). Nothing to buy,
 claude mcp add blockula -- npx -y @blockula/mcp --network demo
 ```
 
-`--network demo` comes with the `@blockula/mcp` releases after 1.0.4. With 1.0.4, this reaches the same node (pinned on first use instead):
-
-```bash
-claude mcp add blockula -e BLOCKULA_RPC=https://demo.blockula.app -- npx -y @blockula/mcp
-```
-
 Then paste these, one at a time:
 
 1. > Use the Blockula tools. Make a wallet, take coins from the faucet, and register a .boo name you like. Then call `things_to_do` and tell me what's on offer.
