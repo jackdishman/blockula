@@ -2,7 +2,7 @@
 // A Halloween house bot: knock with a payment, get a trick (nothing back), a treat (your stake
 // back) or a jackpot (twice your stake). It is a toy for worthless coins.
 //
-//   node examples/trick-or-treat-bot.mjs [--name trickortreat] [--rpc URL] [--network local|testnet]
+//   node examples/trick-or-treat-bot.mjs [--name trickortreat] [--rpc URL] [--network local|demo|testnet]
 //        [--key FILE] [--faucet] [--stake 1] [--max-plays-per-day 10] [--floor 10]
 //        [--state FILE] [--from HEIGHT]
 //

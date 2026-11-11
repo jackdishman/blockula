@@ -18,10 +18,8 @@ const AUDIT = `${REPO}/blob/main/docs/AUDIT-2026-10.md`;
 const VALIDATOR_GUIDE = `${REPO}/blob/main/docs/BECOME-A-VALIDATOR.md`;
 const PLAYGROUND = `${REPO}/blob/main/docs/PLAYGROUND.md`;
 
-/** The one line that adds the demo chain to Claude Code (mcp/README.md): `--network demo` needs an @blockula/mcp after 1.0.4. */
+/** The one line that adds the demo chain to Claude Code (mcp/README.md). */
 const AGENT_INSTALL = "claude mcp add blockula -- npx -y @blockula/mcp --network demo";
-/** The same node for @blockula/mcp 1.0.4, pinned on first use instead of built in. */
-const AGENT_INSTALL_104 = "claude mcp add blockula -e BLOCKULA_RPC=https://demo.blockula.app -- npx -y @blockula/mcp";
 
 /** The guestbook page in the demo node's own wallet (the site serves no wallet routes). */
 const guestbookOf = (node: string) => `${walletOf(node).replace(/\/$/, "")}${to.guestbook()}/`;
@@ -216,9 +214,6 @@ export function ProjectSite() {
         <div className="site-hero-install stack" data-testid="hero-install">
           <span className="dim small">One line adds the demo chain to Claude Code, or any MCP client:</span>
           <Command text={AGENT_INSTALL} />
-          <span className="dim small" data-testid="hero-install-note">
-            <code>--network demo</code> needs <code>@blockula/mcp</code> newer than 1.0.4. With 1.0.4: <code>{AGENT_INSTALL_104}</code> <Copy text={AGENT_INSTALL_104} label="Copy" />
-          </span>
         </div>
         <div className="site-cta">
           {DEMO_NODE && <a className="btn primary big" href={guestbookOf(DEMO_NODE)} data-testid="hero-guestbook">See the guestbook</a>}

@@ -62,6 +62,10 @@ node examples/guestbook.mjs read --network local --limit 10                   # 
 
 The house's rules: a payment of at least the stake is a play (a smaller one, or one from the bot itself, is kept and logged); it draws with the operator's own `crypto.randomInt` (45% trick, 45% treat, 10% jackpot: 0.65 times the stake on average, and the operator's RNG is trusted, which is fine for a toy) and pays the sender's address, never a name or text from the memo. Every sender is capped per UTC day, and below its floor balance the bot stops paying, says so, and keeps what it's sent (the chain's own faucet drip counts as a play if it reaches the bot).
 
+**Watching for payments.** Both bots use `watchPayments` from the SDK, which reports every finalized transfer that paid the account. If you write a watcher of your own on `/api/account/{address}` or `/api/tx/{id}`, match on the tx's `to.address`, the account it paid when it ran. Don't match on `action.to`, which is what the sender signed: a payment sent to `trickortreat.boo` carries the name there, not the address, so a watcher that compares `action.to` with its own address silently misses it.
+
+**On the demo chain**, pass `--network demo` (needs `@blockula/sdk` 1.0.6 or later; with 1.0.5, `--rpc https://demo.blockula.app`). The project runs the demo's own `trickortreat.boo` and `guestbook.boo` with `deploy/host-bots.sh`; run yours under another name.
+
 State is in `trickortreat-<name>.json`: the height to resume from and each payment seen, by tx id. A payout is signed once and stored before it's sent. After a restart, an unsettled payout is rebroadcast by its stored bytes, never signed again, and if the node can't say whether it ran, the bot stops until it's clear (an unused nonce past the tx's `valid_until` means it never ran, and the sender is owed it by hand). A flag `--from HEIGHT` rescans old blocks, and nothing is paid twice.
 
 ## Other networks

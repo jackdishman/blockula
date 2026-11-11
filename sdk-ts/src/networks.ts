@@ -4,14 +4,16 @@
 // talks to your own node of blockula-testnet-2 and pins its chain id, genesis hash, address prefix
 // and genesis clock up front, so the first address it renders is already `tboo1…` and a node on
 // any other chain is refused before anything is signed. The public testnet was retired in November
-// 2026 and has no public node, so no RPC is built in for it: pass your node's URL. For a chain of
-// your own, pin it yourself: `new Client(rpc, { chainId, genesisHash })`.
+// 2026 and has no public node, so no RPC is built in for it: pass your node's URL.
+// `new Client({ network: "demo" })` (or `Client.demo()`) talks to Blockula's demo chain at
+// https://demo.blockula.app, pinned the same way. For a chain of your own, pin it yourself:
+// `new Client(rpc, { chainId, genesisHash })`.
 //
-// The testnet values match mcp/src/network.ts (`KNOWN_GENESIS`, `KNOWN_CLOCKS`) and
+// The testnet and demo values match mcp/src/network.ts (`KNOWN_GENESIS`, `KNOWN_CLOCKS`) and
 // web/lib/config.ts; test/integrators.ts checks the MCP's.
 
 /** A network this SDK knows by name. */
-export type NetworkName = "testnet" | "local";
+export type NetworkName = "demo" | "testnet" | "local";
 
 /** A chain's genesis clock: its genesis.json's `created_at_ms` and `block_time_ms`. */
 export interface NetworkClock {
@@ -47,15 +49,25 @@ const TESTNET: NetworkPreset = {
 export const TESTNET_RETIRED =
   'the public testnet (blockula-testnet-2) was retired in November 2026 and has no public node: run your own chain (`blockula dev`, `blockula summon`) and pass its URL, or pass the URL of a blockula-testnet-2 node you run, new Client(url, { network: "testnet" })';
 
+/** Blockula's demo chain (blockula-demo-2): the public chain since the testnet was retired. A test chain: FANG on it has no value. */
+const DEMO: NetworkPreset = {
+  name: "demo",
+  rpc: "https://demo.blockula.app",
+  chainId: "blockula-demo-2",
+  genesisHash: "e712d9376917f0c9d10c164fa7c1a53fef7c8dc1c24100e7924037d0250f705e",
+  prefix: "boo",
+  genesisClock: { createdAtMs: 1794193062992, blockTimeMs: 2000 },
+};
+
 /** A `blockula dev` chain on this machine. Nothing is pinned: `--reset` makes a new chain each time. */
 const LOCAL: NetworkPreset = { name: "local", rpc: "http://localhost:7070" };
 
 const frozen = (p: NetworkPreset): Readonly<NetworkPreset> => Object.freeze({ ...p, genesisClock: p.genesisClock ? Object.freeze({ ...p.genesisClock }) : undefined });
 
 /** The networks this SDK knows: `new Client({ network })` pins what they list. */
-export const NETWORKS: Readonly<Record<NetworkName, Readonly<NetworkPreset>>> = Object.freeze({ testnet: frozen(TESTNET), local: frozen(LOCAL) });
+export const NETWORKS: Readonly<Record<NetworkName, Readonly<NetworkPreset>>> = Object.freeze({ demo: frozen(DEMO), testnet: frozen(TESTNET), local: frozen(LOCAL) });
 
 /** Whether `s` names a network this SDK knows. */
 export function isNetworkName(s: unknown): s is NetworkName {
-  return s === "testnet" || s === "local";
+  return s === "demo" || s === "testnet" || s === "local";
 }
