@@ -45,14 +45,40 @@ function api(p: string, missing: string[]): unknown {
     tally: { unlocked_supply: big(100_000n), quorum: big(1000n), quorum_reached: false, supermajority: false, council_size: 22, council_ayes: 15, council_nays: 1 }, outcome: "passed by the bootstrap council: 15 of 22 validators approved",
   };
   const proposal1 = { id: 1, title: HOSTILE, url: "javascript:window.__pwned=2", kind: { type: "text" }, summary: "<b>bold</b>", proposer: label(OWNER), deposit: "0", deposit_display: "0 FANG", status: "rejected", created_at: 1, voting_end: 2, execute_at: null, supermajority: false, ayes: { amount: big(0n), weight: big(0n) }, nays: { amount: big(5n), weight: big(5n) }, voters: 1, council: [], tally: null, outcome: "quorum not reached" };
+  const proposal3 = {
+    id: 3, title: "Lower the proposal deposit to 100 FANG", url: "", kind: { type: "param_change", key: "proposal_deposit", value: "100000000000" }, summary: "set proposal_deposit to 100000000000",
+    proposer: label(OWNER, "salem.boo"), deposit: (1000n * FANG).toString(), deposit_display: "1000 FANG", status: "voting", created_at: 980, voting_end: 5000, execute_at: null, supermajority: false,
+    ayes: { amount: big(0n), weight: big(0n) }, nays: { amount: big(0n), weight: big(0n) }, voters: 0, council: [], tally: null, outcome: "",
+  };
   if (p.startsWith("/proposals"))
-    return { count: 2, next_id: 3, council_active: true, spending_open: false, params: { proposal_deposit_display: "1000 FANG", voting_blocks: 604_800, bootstrap_end_height: 31_557_600, supermajority_bps: 6667 }, treasury: { balance_display: "250000000 FANG" }, community: { balance_display: "320000000 FANG" }, proposals: [proposal2, proposal1] };
+    return { count: 3, next_id: 4, council_active: true, spending_open: false, params: { proposal_deposit_display: "1000 FANG", voting_blocks: 604_800, bootstrap_end_height: 31_557_600, supermajority_bps: 6667 }, treasury: { balance_display: "250000000 FANG" }, community: { balance_display: "320000000 FANG" }, proposals: [proposal3, proposal2, proposal1] };
+  if (p === "/proposal/3") return { ...proposal3, votes: [], distribution: null };
   if (p === "/proposal/2") return { ...proposal2, votes: [{ voter: label(OWNER, "vlad.boo"), aye: true, amount: (100n * FANG).toString(), amount_display: "100 FANG", conviction: 3, weight: big(300n), locked_until: 9000, council: null, at: 950 }], distribution: null };
   if (p === "/proposal/1") return { ...proposal1, votes: [], distribution: null };
   if (p === "/params") return { params: { max_validators: "31", unbonding_blocks: "1814400", slash_double_sign_bps: "500", min_self_bond: (10_000n * FANG).toString(), issuance_initial_ppm: "60000", max_block_bytes: "2097152", name_price_3: (100n * FANG).toString() }, genesis: { block_time_ms: 1000, epoch_blocks: 3600 }, issuance: { year: 1 } };
   if (p === "/fees") return { height: 999, lag: 17, rate_scale: 1000, slots: [], suggested: { flat: "10000", rate: "10000" }, floor: { flat: "10000", per_byte: "10" }, account_creation_fee: "100000000", account_creation_fee_display: "0.1 FANG" };
   if (p === "/name/ghoul" || p === "/name/ghoul.boo") return { name: "ghoul.boo", status: "active", available: false, owner: label(OWNER, "ghoul.boo"), registered_at: 10, expires_at: 1000 + 86_400 * 30, grace_until: 1000 + 86_400 * 60, price_display: "1 FANG", renewal_price_display: "0.2 FANG" };
   if (p === "/name/" + encodeURIComponent("old.boo")) return { name: "old.boo", status: "grace", available: false, owner: label(OWNER, "ghoul.boo"), registered_at: 1, expires_at: 900, grace_until: 2000 };
+  const LARGE_ID = "ab".repeat(32);
+  const largeTx = {
+    id: LARGE_ID, kind: "transfer", status: "finalized", height: 990, amount: (250n * FANG).toString(), amount_display: "250 FANG", memo: "",
+    summary: "vlad.boo sent 250 FANG to ghoul.boo", from: label(OWNER, "vlad.boo"), to: label(V1, "ghoul.boo"),
+    fee_display: "0.001 FANG", nonce: 3, signature_scheme: "ML-DSA-65", size_bytes: 5400, action: { type: "transfer", to: "ghoul.boo", amount: (250n * FANG).toString() },
+  };
+  if (p === `/tx/${LARGE_ID}`) return largeTx;
+  if (p.startsWith("/accounts")) return { accounts: [
+    { account: label(OWNER, "vlad.boo"), last_active: 990, system: null },
+    { account: label(V1, "ghoul.boo"), last_active: 990, system: "treasury" },
+  ] };
+  if (p.startsWith("/account/") && p.includes("/txs")) {
+    if (p.includes(V1)) return { txs: [{ id: "22".repeat(32), kind: "transfer", status: "finalized", height: 990, amount: (9000n * FANG).toString(), memo: "", summary: "treasury sent 9000 FANG to vlad.boo" }] };
+    return { txs: [
+      largeTx,
+      { id: "cd".repeat(32), kind: "transfer", status: "finalized", height: 996, amount: (100n * FANG).toString(), amount_display: "100 FANG", memo: "🦇 faucet drip", summary: "validator sent a faucet drip of 100 FANG", from: label(V2), to: label(OWNER, "vlad.boo") },
+      { id: "ef".repeat(32), kind: "transfer", status: "finalized", height: 994, amount: (1n * FANG).toString(), amount_display: "1 FANG", memo: "hello", summary: "vlad.boo sent 1 FANG to ghoul.boo", from: label(OWNER, "vlad.boo"), to: label(V1, "ghoul.boo") },
+      { id: "11".repeat(32), kind: "transfer", status: "finalized", height: 993, amount: (100n * FANG).toString(), amount_display: "100 FANG", memo: "thanks", summary: "vlad.boo sent exactly 100 FANG to ghoul.boo", from: label(OWNER, "vlad.boo"), to: label(V1, "ghoul.boo") },
+    ] };
+  }
   if (p.startsWith("/account/")) return { account: label(OWNER, "ghoul.boo"), balance_display: "5 FANG", nonce: 1, names: ["ghoul.boo", "old.boo"], hunts_won: [], hunts_created: [], familiars: [], recent_txs: [], contribution: null };
   if (p === "/blocks?limit=15") return [];
   // Failures answered from the node's failure memory, without the tx (node/src/api.rs `tx`).
@@ -155,6 +181,33 @@ test("a node without the v1 endpoints says so", async ({ page }) => {
   await expect(page.locator("#app")).toContainText("This node doesn't serve proposals");
   await page.goto(`${ORIGIN}/#/params`);
   await expect(page.locator("#app")).toContainText("This node doesn't serve its parameters yet");
+});
+
+test("the front page leads with an open proposal and a large transfer, not faucet drips", async ({ page }) => {
+  await open(page, "#/");
+  const app = page.locator("#app");
+  const lead = app.locator("a.story.lead");
+  await expect(lead).toHaveAttribute("href", "#/proposal/3");
+  await expect(lead).toContainText("Open for votes");
+  await expect(lead).toContainText("Lower the proposal deposit to 100 FANG");
+  await expect(lead).toContainText("Proposed by salem.boo");
+  await expect(app.locator('a[data-front="tx"]')).toHaveAttribute("href", `#/tx/${"ab".repeat(32)}`);
+  await expect(app).toContainText("vlad.boo sent 250 FANG to ghoul.boo");
+  await expect(app).toContainText("movements of more than 100 FANG");
+  await expect(app).not.toContainText("faucet drip");
+  await expect(app).not.toContainText("sent 1 FANG");
+  await expect(app).not.toContainText("exactly 100 FANG");
+  await expect(app).not.toContainText("9000 FANG");
+  await expect(app.locator("img")).toHaveCount(0);
+  await expect(app).not.toContainText(/contract/i);
+  // The stories link through to the proposal and the transaction.
+  await lead.click();
+  await expect(app).toContainText("Proposal #3");
+  await expect(app).toContainText("Lower the proposal deposit to 100 FANG");
+  await page.goto(`${ORIGIN}/#/`);
+  await app.locator('a[data-front="tx"]').click();
+  await expect(app).toContainText("vlad.boo sent 250 FANG to ghoul.boo");
+  await expect(app.locator("a", { hasText: "vlad.boo" }).first()).toHaveAttribute("href", "#/account/vlad.boo");
 });
 
 test("route ids never become markup, even under Object.prototype names (F64)", async ({ page }) => {

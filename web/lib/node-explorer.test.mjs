@@ -170,6 +170,74 @@ test("a deployed program's page: its record, its methods named by the deployer, 
   await assert.rejects(views.program(HOSTILE[0]), /never by a \.boo name/);
 });
 
+test("the front page leads with an open proposal and large movements, and leaves faucet drips off", async () => {
+  const id = (hex) => hex.repeat(32);
+  const drops = (fang) => (BigInt(fang) * 1000000000n).toString();
+  const who = (name, address) => ({ address, name, short: `${address.slice(0, 10)}…${address.slice(-4)}` });
+  const SALEM = "boo1salemqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+  const DARKOH = "boo1darkohqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+  const QUIET = "boo1quietqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+  const TREASURY = "boo1" + "q".repeat(45);
+  const tx = (over) => ({ status: "finalized", memo: "", from: who("darkoh.boo", DARKOH), to: who("salem.boo", SALEM), ...over });
+  const open = {
+    id: 0, title: "Lower the proposal deposit to 100 FANG", url: "", status: "voting", summary: "set proposal_deposit to 100000000000",
+    proposer: who("salem.boo", SALEM), deposit_display: "1000 JACK", voting_end: 110000, council: [],
+    ayes: { amount: { drops: "0" }, weight: { drops: "0", display: "0 JACK" } }, nays: { amount: { drops: "0" }, weight: { drops: "0", display: "0 JACK" } },
+  };
+  const hostileOpen = { ...open, id: 1, title: '<img src=x onerror=alert(1)>', summary: "<b>bold</b> \u202ehidden", deposit_display: "1 JACK" };
+  const rejected = { ...open, id: 2, title: "REJECTED-SECRET", status: "rejected", summary: "no" };
+  const moves = [
+    tx({ id: id("a1"), height: 70000, kind: "transfer", amount: drops(502), summary: "darkoh.boo sent 502.579232831 JACK to darkohh.boo" }),
+    tx({ id: id("a2"), height: 78000, kind: "transfer", amount: drops(101), summary: "darkoh.boo sent 101 JACK to salem.boo" }),
+    tx({ id: id("a3"), height: 79000, kind: "transfer", amount: drops(100), memo: "thanks", summary: "darkoh.boo sent exactly 100 JACK to salem.boo" }),
+    tx({ id: id("a4"), height: 79100, kind: "transfer", amount: drops(100), memo: "🦇 faucet drip", summary: "salem.boo sent a faucet drip of 100 JACK" }),
+    tx({ id: id("a5"), height: 79200, kind: "transfer", amount: drops(250), memo: "Faucet   drip", summary: "BIG DRIP of 250 JACK" }),
+    tx({ id: id("a6"), height: 1000, kind: "transfer", amount: drops(5000), summary: "darkoh.boo sent 5000 JACK long ago" }),
+    tx({ id: id("a7"), height: 71000, kind: "call_program", amount: null, summary: "darkoh.boo called program boo1prog… with 200 JACK attached", action: { type: "call_program", calls: [{ program: DARKOH, method: "add_liquidity_PWN", value: drops(200) }] } }),
+    tx({ id: id("a8"), height: 79050, kind: "transfer", amount: drops(1), summary: "darkoh.boo sent 1 JACK to salem.boo" }),
+  ];
+  const blockOnly = tx({ id: id("b1"), height: 79500, kind: "transfer", amount: drops(300), from: who("salem.boo", SALEM), summary: "salem.boo sent 300 JACK to darkoh.boo" });
+  const answers = {
+    "/status": { name: "Demo", token: "JACK", chain_id: "blockula-demo-2", height: 80000, block_time_ms: 2000, epoch: 1, active_validators: 1, mempool: 0, supply_display: "1000 JACK", burned_display: "1 JACK", accounts: 4, names: 2, head_age_ms: 100, history_from: 1 },
+    "/health": { ok: true },
+    "/blocks": [
+      { height: 80000, tx_count: 0, timestamp_ms: Date.now(), proposer: who("salem.boo", SALEM) },
+      { height: 79500, tx_count: 1, timestamp_ms: Date.now() - 1000, proposer: who("salem.boo", SALEM) },
+    ],
+    "/block/79500": { txs: [blockOnly] },
+    "/proposals": { proposals: [open, hostileOpen, rejected] },
+    "/accounts": { accounts: [
+      { account: who("darkoh.boo", DARKOH), last_active: 79200, system: null },
+      { account: { address: TREASURY, name: "🏛️ treasury", short: "boo1qqqqq…qqqq" }, last_active: 79200, system: "treasury" },
+      { account: who("quiet.boo", QUIET), last_active: 1000, system: null },
+    ] },
+    [`/account/${encodeURIComponent("darkoh.boo")}/txs`]: { txs: moves },
+    [`/account/${TREASURY}/txs`]: { txs: [tx({ id: id("c1"), height: 79200, kind: "transfer", amount: drops(9000), summary: "treasury sent 9000 JACK" })] },
+    [`/account/${encodeURIComponent("quiet.boo")}/txs`]: { txs: [tx({ id: id("c2"), height: 79000, kind: "transfer", amount: drops(800), summary: "quiet.boo sent 800 JACK" })] },
+  };
+  const views = explorer(answers);
+  const page = await views.home();
+  assert.match(page, /<a class="story lead" data-front="proposal" href="#\/proposal\/0">/);
+  assert.match(page, /Open for votes/);
+  assert.match(page, /Lower the proposal deposit to 100 FANG/);
+  assert.match(page, /Proposed by salem\.boo/);
+  assert.match(page, /in about 17 hours/);
+  assert.ok(page.includes("100 JACK"), "the threshold is named in the chain's unit");
+  assert.ok(!page.includes(SALEM), "the proposer's name is shown, not the raw address");
+  assert.match(page, /href="#\/proposal\/1"/);
+  assert.ok(page.includes("&lt;img src=x onerror=alert(1)&gt;"), "an open proposal's title is text");
+  assert.ok(!page.includes("<img") && !page.includes("\u202e") && !page.includes("<b>bold</b>"), "hostile title is not markup");
+  assert.ok(!page.includes("REJECTED-SECRET"), "a closed proposal is not front-page news");
+  for (const headline of ["sent 502.579232831 JACK", "sent 101 JACK", "sent 300 JACK", "with 200 JACK attached"]) assert.ok(page.includes(headline), headline);
+  for (const href of [id("a1"), id("a2"), id("a7"), id("b1")]) assert.ok(page.includes(`href="#/tx/${href}"`), href);
+  for (const hidden of ["exactly 100 JACK", "faucet drip", "BIG DRIP", "5000 JACK", "sent 1 JACK", "9000 JACK", "800 JACK", "add_liquidity_PWN"]) assert.ok(!page.includes(hidden), hidden);
+  assert.ok(!/contract/i.test(page), "a program is never called a contract");
+  // A second read within the cache window still has the lead and the large transfer.
+  const again = await views.home();
+  assert.match(again, /href="#\/proposal\/0"/);
+  assert.ok(again.includes("sent 502.579232831 JACK"));
+});
+
 test("a stored code's page: its exports as the deployer's names", async () => {
   const c = fixtures.counter.code;
   const page = await explorer({ [`/code/${c.wasm_hash}`]: c }).code(c.wasm_hash);
