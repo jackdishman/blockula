@@ -140,6 +140,7 @@ jobs:
       # payment, client-side navigation and the node's CSP (web/e2e/served.spec.ts).
       - name: Served wallet e2e (the node's /wallet/, Playwright)
         run: |
+          bash scripts/ci-apt-sources.sh
           npx playwright install --with-deps chromium
           E2E_SERVED=only npm run test:e2e -w @blockula/web
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
@@ -212,8 +213,9 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22, cache: npm }
       - run: npm ci
-      # The browser matching @playwright/test in package-lock.json, with its system libraries.
-      - run: npx playwright install --with-deps chromium
+      # The browser matching @playwright/test in package-lock.json, with its system libraries, from
+      # Ubuntu's own servers (scripts/ci-apt-sources.sh).
+      - run: bash scripts/ci-apt-sources.sh && npx playwright install --with-deps chromium
       - run: npm run build -w @blockula/sdk
       # Testnet and mainnet production builds, a PRF virtual authenticator and a mock node
       # (web/playwright.config.ts).
@@ -314,7 +316,7 @@ jobs:
         run: bash scripts/check-fuzz-workflow.sh
       - name: Fuzz crash sealing (a real age round trip)
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends age
+          bash scripts/ci-apt-sources.sh && sudo apt-get install -y -qq --no-install-recommends age
           REQUIRE_AGE=1 bash scripts/test-fuzz-seal.sh
       # The nightly corpus is bounded so replaying it can't take the budget (scripts/fuzz-bound-corpus.sh).
       - name: Fuzz corpus bound (the script, and the workflow's use of it)
