@@ -140,7 +140,7 @@ jobs:
       # payment, client-side navigation and the node's CSP (web/e2e/served.spec.ts).
       - name: Served wallet e2e (the node's /wallet/, Playwright)
         run: |
-          npx playwright install --with-deps chromium
+          npx playwright install chromium
           E2E_SERVED=only npm run test:e2e -w @blockula/web
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
       - name: 4 validators + full node + SDK e2e + CLI
@@ -212,8 +212,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22, cache: npm }
       - run: npm ci
-      # The browser matching @playwright/test in package-lock.json, with its system libraries.
-      - run: npx playwright install --with-deps chromium
+      # The browser matching @playwright/test in package-lock.json. No apt: the ubuntu-24.04 image
+      # ships Chrome, so Chromium's system libraries are already there, and a job that needs
+      # Ubuntu's package servers fails whenever the runners can't reach them (2026-11-11).
+      - run: npx playwright install chromium
       - run: npm run build -w @blockula/sdk
       # Testnet and mainnet production builds, a PRF virtual authenticator and a mock node
       # (web/playwright.config.ts).
@@ -312,9 +314,13 @@ jobs:
       # The fuzz job runs in public: crashes stay out of its log and artifacts (supply-chain-B-1).
       - name: Fuzz crashes stay private (workflow, open findings)
         run: bash scripts/check-fuzz-workflow.sh
+      # age 1.2.1 from its GitHub release (checksum-pinned), not apt: see the wallet e2e's note.
       - name: Fuzz crash sealing (a real age round trip)
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends age
+          curl -fsSL -o /tmp/age.tgz https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-linux-amd64.tar.gz
+          echo "7df45a6cc87d4da11cc03a539a7470c15b1041ab2b396af088fe9990f7c79d50  /tmp/age.tgz" | sha256sum -c -
+          tar -xzf /tmp/age.tgz -C /tmp age/age age/age-keygen
+          sudo install -m 755 /tmp/age/age /tmp/age/age-keygen /usr/local/bin/
           REQUIRE_AGE=1 bash scripts/test-fuzz-seal.sh
       # The nightly corpus is bounded so replaying it can't take the budget (scripts/fuzz-bound-corpus.sh).
       - name: Fuzz corpus bound (the script, and the workflow's use of it)
