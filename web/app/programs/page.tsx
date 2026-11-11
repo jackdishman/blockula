@@ -10,7 +10,7 @@ import { NodeError, useNode } from "@/lib/explorer/node";
 import { createdProgramAddresses, featuredPrograms, listDeployed, type FeaturedProgram } from "@/lib/explorer/featured";
 import { deployedProgram, PROGRAMS, signature } from "@/lib/explorer/programs";
 import { to } from "@/lib/explorer/routes";
-import type { ChainStatus, ContributionsView, DeployedProgramView, HuntsView, ValidatorsDetail } from "@/lib/explorer/types";
+import type { ChainStatus, ContributionsView, DeployedProgramView, HuntsView, ProgramsList, ValidatorsDetail } from "@/lib/explorer/types";
 import { useProgramActivity } from "@/lib/explorer/useProgramActivity";
 
 export default function ProgramsPage() {
@@ -70,29 +70,34 @@ export default function ProgramsPage() {
 
 /**
  * The addresses of the programs recent blocks created, newest first: from the receipts of their `create_program` transactions.
- * That's a window of recent blocks, not every program: no route lists them yet (docs/PROGRAMS-V0.md §8.2). Pins in
- * `FEATURED_PROGRAMS` stay listed for their chain. The page says which is which.
+ * Only for a node that predates `/api/programs` (docs/PROGRAMS-V0.md §8.2): that's a window of recent blocks, not every
+ * program, and the page says so. Pins in `FEATURED_PROGRAMS` stay listed for their chain either way.
  */
 const CREATES = ["create_program"] as const;
+
+/** How many programs one read of `/api/programs` asks for; "Show more" asks for that many more, up to the node's page cap. */
+const LIST_PAGE = 24;
+const LIST_MAX = 100;
+/** What every program route answers on a chain whose programs were never switched on (node/src/programs/api.rs `dormant`). */
+const DORMANT = "no programs exist on this chain";
 
 /** Programs anyone deployed, beside the built-in ones (docs/PROGRAMS-V0.md §8.6): read only, every name in them the deployer's. */
 function Deployed({ chainId, genesisHash }: { chainId?: string; genesisHash?: string }) {
   const router = useRouter();
   const [q, setQ] = useState("");
-  const creates = useProgramActivity(CREATES);
+  const [limit, setLimit] = useState(LIST_PAGE);
+  const all = useNode<ProgramsList>(`/programs?limit=${limit}`, { every: 30_000 });
   const pins = featuredPrograms(chainId, genesisHash);
-  const listed = listDeployed(createdProgramAddresses(creates.txs), pins.map((p) => p.address));
-  const recent = listed.filter((s) => !s.featured);
-  const pinKey = pins.map((p) => p.address).join(" ");
-  const [report, setReport] = useState<{ key: string; n: number } | null>(null);
-  const onShown = useCallback((key: string, n: number) => setReport({ key, n }), []);
-  const featuredShown = report?.key === pinKey ? report.n : null;
+  const dormant = !all.data && all.error instanceof NodeError && all.error.status === 404 && all.error.message.startsWith(DORMANT);
+  // A node that predates the route: anything but a list or the dormant 404.
+  const scan = !all.data && all.error != null && !dormant;
   const open = (e: React.FormEvent) => {
     e.preventDefault();
     const v = q.trim().toLowerCase();
     if (v) router.push(to.deployed(v));
   };
-  const showEmpty = recent.length === 0 && !creates.loading && (pins.length === 0 || featuredShown === 0);
+  const rows = Array.isArray(all.data?.programs) ? all.data.programs : [];
+  const total = typeof all.data?.total === "number" ? all.data.total : rows.length;
   return (
     <section className="stack-lg" aria-labelledby="deployed-heading">
       <div className="page-head">
@@ -101,7 +106,11 @@ function Deployed({ chainId, genesisHash }: { chainId?: string; genesisHash?: st
         </span>
         <h2 id="deployed-heading">Programs anyone deployed</h2>
         <span className="sub">
-          WebAssembly on this chain. Featured programs are pinned by this wallet for this chain, so they stay listed; a featured title, and the line under it, are this wallet&apos;s description. The rest are programs created in a window of recent blocks (the node has no list of every program yet), so an older one that isn&apos;t featured is opened by its address below. What a program holds is on the chain, and every name it uses is its deployer&apos;s claim.
+          {scan ? (
+            <>WebAssembly on this chain. Featured programs are pinned by this wallet for this chain, so they stay listed; a featured title, and the line under it, are this wallet&apos;s description. The rest are programs created in a window of recent blocks (this node can&apos;t list every program), so an older one that isn&apos;t featured is opened by its address below. What a program holds is on the chain, and every name it uses is its deployer&apos;s claim.</>
+          ) : (
+            <>Every program on this chain, newest first. Featured programs are pinned by this wallet for this chain; a featured title, and the line under it, are this wallet&apos;s description. What a program holds is on the chain, and every name it uses is its deployer&apos;s claim.</>
+          )}
         </span>
       </div>
       <form className="row-gap" onSubmit={open} role="search" aria-label="Open a program or code">
@@ -113,10 +122,64 @@ function Deployed({ chainId, genesisHash }: { chainId?: string; genesisHash?: st
           Open
         </button>
       </form>
+      {scan ? (
+        <RecentCreates pins={pins} />
+      ) : (
+        <Listing
+          pins={pins}
+          addresses={rows.map((r) => r.address).filter((a): a is string => typeof a === "string")}
+          recentLimit={Infinity}
+          loading={!all.data && !dormant}
+          loadingText="Reading the programs…"
+          emptyText={dormant ? "This chain has programs off." : "No program has been created on this chain yet."}
+          more={
+            rows.length < total ? (
+              <p className="card-note">
+                {rows.length < LIST_MAX ? (
+                  <button className="btn small" type="button" onClick={() => setLimit((l) => Math.min(l + LIST_PAGE, LIST_MAX))}>
+                    Show more ({(total - rows.length).toLocaleString("en-US")} older)
+                  </button>
+                ) : (
+                  <>The newest {rows.length} of {total.toLocaleString("en-US")} are listed; open an older one by its address above.</>
+                )}
+              </p>
+            ) : null
+          }
+        />
+      )}
+    </section>
+  );
+}
+
+/** On a node without `/api/programs`: the creates in a window of recent blocks. */
+function RecentCreates({ pins }: { pins: readonly FeaturedProgram[] }) {
+  const creates = useProgramActivity(CREATES);
+  return (
+    <Listing
+      pins={pins}
+      addresses={createdProgramAddresses(creates.txs)}
+      loading={creates.loading}
+      loadingText="Reading recent blocks…"
+      emptyText="No program was created in the recent blocks (or this chain has programs off)."
+    />
+  );
+}
+
+/** The featured pins, then the other programs (each once), with what to say while loading and when there are none. */
+function Listing({ pins, addresses, recentLimit, loading, loadingText, emptyText, more }: { pins: readonly FeaturedProgram[]; addresses: readonly string[]; recentLimit?: number; loading: boolean; loadingText: string; emptyText: string; more?: ReactNode }) {
+  const listed = listDeployed(addresses, pins.map((p) => p.address), recentLimit);
+  const recent = listed.filter((s) => !s.featured);
+  const pinKey = pins.map((p) => p.address).join(" ");
+  const [report, setReport] = useState<{ key: string; n: number } | null>(null);
+  const onShown = useCallback((key: string, n: number) => setReport({ key, n }), []);
+  const featuredShown = report?.key === pinKey ? report.n : null;
+  const showEmpty = recent.length === 0 && !loading && (pins.length === 0 || featuredShown === 0);
+  return (
+    <>
       <FeaturedGroup pins={pins} pinKey={pinKey} onShown={onShown} />
       {recent.length > 0 && (
         <>
-          {featuredShown != null && featuredShown > 0 && <span className="eyebrow">Recent</span>}
+          {featuredShown != null && featuredShown > 0 && <span className="eyebrow">All programs</span>}
           <div className="programs" data-testid="deployed-programs">
             {recent.map((s) => (
               <DeployedCard key={s.address} address={s.address} />
@@ -124,13 +187,14 @@ function Deployed({ chainId, genesisHash }: { chainId?: string; genesisHash?: st
           </div>
         </>
       )}
-      {recent.length === 0 && creates.loading && <p className="card-note">Reading recent blocks…</p>}
+      {more}
+      {recent.length === 0 && loading && <p className="card-note">{loadingText}</p>}
       {showEmpty && (
         <p className="card-note" data-testid="no-deployed">
-          No program was created in the recent blocks (or this chain has programs off).
+          {emptyText}
         </p>
       )}
-    </section>
+    </>
   );
 }
 

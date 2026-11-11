@@ -4,7 +4,7 @@
 // submit it, wait for it, keep the receipt. If anything is unclear afterwards, rebroadcast the
 // same signed bytes; never sign the payment again.
 //
-//   node examples/pay-from-a-script.mjs <to> <amount> [--memo TEXT] [--rpc URL] [--network local|testnet]
+//   node examples/pay-from-a-script.mjs <to> <amount> [--memo TEXT] [--rpc URL] [--network local|demo|testnet]
 //        (--key FILE | --faucet) [--outbox FILE] [--dry-run]
 //   node examples/pay-from-a-script.mjs --rebroadcast <tx id> [--rpc URL] [--network …] [--outbox FILE]
 //
@@ -29,7 +29,7 @@ if (flags.rebroadcast) {
 
 const [to, amount] = positional;
 if (!to || !amount || (!flags.key && !flags.faucet)) {
-  console.error("usage: node examples/pay-from-a-script.mjs <to> <amount> [--memo TEXT] [--rpc URL] [--network local|testnet] (--key FILE | --faucet) [--outbox FILE] [--dry-run]");
+  console.error("usage: node examples/pay-from-a-script.mjs <to> <amount> [--memo TEXT] [--rpc URL] [--network local|demo|testnet] (--key FILE | --faucet) [--outbox FILE] [--dry-run]");
   process.exit(2);
 }
 

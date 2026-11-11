@@ -128,6 +128,14 @@ details.raw pre, pre.raw { background: var(--paper-hi); border: 1px solid var(--
 .chart .axis { fill: var(--dim); font: 400 13px var(--mono); }
 .chart .baseline { stroke: var(--ink); stroke-width: 1; shape-rendering: crispEdges; }
 .chart.refetching { opacity: 0.6; transition: opacity 0.2s; }
+/* Balance history: the range and the coin sit on one wrapping row, and the line stays inside the card. */
+.balance-history .row-between { flex-wrap: wrap; align-items: center; }
+.card.balance-history .row-between h2 { margin: 0; }
+.balance-history .filters { margin: 0 0 10px; }
+.balance-history .row-between .filters { margin: 0; }
+.balance-history .chart svg { overflow: hidden; }
+.balance-history .chart-summary { margin: 8px 0 0; color: var(--ink-soft); font-size: 15px; line-height: 1.45; }
+.balance-history .tooltip { max-width: calc(100% - 24px); white-space: normal; }
 .tooltip {
   position: absolute; z-index: 30; pointer-events: none; transform: translate(-50%, calc(-100% - 12px));
   background: var(--paper-hi); border: 1.5px solid var(--ink); box-shadow: 3px 3px 0 var(--ink); padding: 7px 11px; font-size: 15px; line-height: 1.4; white-space: nowrap;

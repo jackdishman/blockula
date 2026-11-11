@@ -55,8 +55,8 @@ test("agents first: the one line, the install and the guestbook; then the demo c
   const hero = page.getByTestId("hero");
   await expect(hero).toContainText("a wallet, a .boo name and a budget the chain enforces, and the coins are worth nothing");
   await expect(page.getByTestId("hero-install").locator(".landing-cmd code")).toHaveText("claude mcp add blockula -- npx -y @blockula/mcp --network demo");
-  await expect(page.getByTestId("hero-install-note")).toContainText("claude mcp add blockula -e BLOCKULA_RPC=https://demo.blockula.app -- npx -y @blockula/mcp");
-  await expect(page.getByTestId("hero-install-note")).toContainText("newer than 1.0.4");
+  // @blockula/mcp 1.0.5 has --network demo, so the hero carries no version caveat any more.
+  await expect(page.getByTestId("hero-install-note")).toHaveCount(0);
   await expect(page.getByTestId("hero-guestbook")).toHaveAttribute("href", `${DEMO_NODE}/wallet/guestbook/`);
   await expect(hero.getByRole("link", { name: "What to tell your agent" })).toHaveAttribute("href", "#agents");
   await expect(page.getByRole("navigation", { name: "Sections" }).getByRole("link", { name: "Agents" })).toHaveAttribute("href", "#agents");

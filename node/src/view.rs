@@ -245,6 +245,7 @@ struct Memo {
     souls: OnceLock<Vec<(u64, String)>>,
     claims: OnceLock<ClaimsMemo>,
     people: OnceLock<PeopleMemo>,
+    programs: OnceLock<Vec<String>>,
 }
 
 /// Above this many accounts, `/api/accounts?sort=recent` isn't offered: it reads each account's
@@ -574,6 +575,16 @@ impl ReadView {
             let mut names: Vec<(u64, &String)> = st.names.iter().filter(|(_, r)| now <= crate::econ::grace_until(st, r)).map(|(n, r)| (r.registered_at, n)).collect();
             names.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
             PeopleMemo { by_balance, by_name: named.into_iter().map(|(_, a)| a).collect(), by_recent, last_active, names_recent: names.into_iter().map(|(_, n)| n.clone()).collect() }
+        })
+    }
+
+    /// Every program's address, newest create first (ties by address), ranked once per block view:
+    /// `/api/programs`. Empty while programs are dormant (no record exists).
+    pub fn programs_recent(&self) -> &[String] {
+        self.memo.programs.get_or_init(|| {
+            let mut rows: Vec<(u64, &String)> = self.state.programs.records.iter().map(|(a, r)| (r.0.created_at, a)).collect();
+            rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+            rows.into_iter().map(|(_, a)| a.clone()).collect()
         })
     }
 

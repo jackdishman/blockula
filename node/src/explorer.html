@@ -70,6 +70,21 @@
   .figure-title { font:500 44px/1.1 var(--serif); letter-spacing:-.01em; }
   .lede { font-size:20px; color:var(--ink-soft); margin:0; }
   .lede::first-letter { float:left; font:400 64px/.8 var(--display); color:var(--blood); padding:6px 8px 0 0; }
+  /* The front page: one lead story and a rail, like the top of a gazette. */
+  .front { border:5px double var(--ink); }
+  .front-note { margin:0 0 4px; font-size:16px; }
+  .front-more { margin:14px 0 0; }
+  .stories { display:grid; grid-template-columns:minmax(0,1.4fr) minmax(0,1fr); gap:6px 32px; align-items:start; }
+  .stories.one { grid-template-columns:minmax(0,1fr); }
+  .story { display:block; text-decoration:none; color:inherit; padding:12px 0 2px; border-top:1px solid var(--ink); }
+  .story.lead { border-top:3px solid var(--ink); padding-top:14px; }
+  .story:hover { color:inherit; }
+  .story:hover .hed { color:var(--blood); }
+  .kicker { font:400 14px var(--caps); letter-spacing:.14em; color:var(--blood); display:block; margin-bottom:4px; }
+  .story .hed { font:500 20px/1.25 var(--display); display:block; overflow-wrap:anywhere; }
+  .story.lead .hed { font-size:34px; line-height:1.15; }
+  .rail .story .hed { font:500 18px/1.3 var(--serif); }
+  .story .deck { display:block; margin-top:6px; color:var(--ink-soft); font-size:17px; overflow-wrap:anywhere; }
   p { margin:0 0 10px; } p:last-child { margin-bottom:0; }
 
   /* Figures: a ruled table of numbers, like the front page of a gazette */
@@ -157,6 +172,8 @@
     .stat .v { font-size:22px; } .stat .v small { display:block; margin:0; line-height:1.2; }
     h1 { font-size:32px; } .summary { font-size:22px; }
     .term:hover::after { width:240px; }
+    .stories { grid-template-columns:minmax(0,1fr); }
+    .story.lead .hed { font-size:28px; }
     .task .body { grid-column:1 / -1; }
     .cmd { flex-direction:column; align-items:stretch; gap:0; }
     .cmd pre { font-size:13px; }
@@ -280,14 +297,24 @@ const expiryText = (r, s) => {
 
 const views = {
   async home() {
-    const [s, blocks, v, health, ctx] = await Promise.all([
-      api("/status"), api("/blocks?limit=15"), api("/validators").catch(() => null),
+    const [s, narrow, wide, v, health, ctx, proposals] = await Promise.all([
+      api("/status"),
+      api("/blocks?limit=15"),
+      api("/blocks?limit=100").catch(() => null),
+      api("/validators").catch(() => null),
       fetch("/api/health").then((r) => r.json()).catch(() => ({ ok: false, reason: "unreachable" })),
       startContext(),
+      api("/proposals?limit=20").catch(() => null),
     ]);
+    // Account histories are the slow read. Skip them while the last scan is still fresh.
+    const people = accountMovesFresh(s) ? null : await api("/accounts?sort=recent&limit=24").catch(() => null);
+    const blocks = Array.isArray(wide) && wide.length ? wide : narrow;
+    const shown = Array.isArray(blocks) ? blocks.slice(0, 15) : [];
+    const news = await frontMarkup(s, blocks, proposals, people).catch(() => "");
     const prog = startProgress(startSteps(s, ctx), s);
     const age = s.head_age_ms != null ? Math.round(s.head_age_ms / 1000) : null;
     return `<div class="stack">
+      ${news}
       <section>
         <div class="figures">
           ${stat(`#${s.height}`, `${term("height", "latest block")}${s.syncing ? ` · syncing ${Math.floor((s.sync_progress || 0) * 100)}% of ~#${s.network_height_claimed}` : ""}`)}
@@ -313,7 +340,7 @@ const views = {
         <p><b><a href="#/start">Start here →</a></b> <span class="dim">${prog.done} of ${prog.total} steps done: get a wallet, send something, invite friends.</span></p>
         <div class="meter"><span style="width:${prog.pct}%"></span></div>`, "learn")}
       ${card(`<h2>Latest blocks</h2><div class="rows">
-        ${blocks.map((b) => `<div class="row blockrow"><a class="height" href="#/block/${b.height}">#${b.height}</a><span class="dim">${b.tx_count ? `<a href="#/block/${b.height}">${plural(b.tx_count, "transaction")}</a>` : "no transactions"}<span class="proposer"> · proposed by ${who(b.proposer)}</span></span><span class="dim">${ago(b.timestamp_ms)}</span></div>`).join("")}
+        ${shown.map((b) => `<div class="row blockrow"><a class="height" href="#/block/${b.height}">#${b.height}</a><span class="dim">${b.tx_count ? `<a href="#/block/${b.height}">${plural(b.tx_count, "transaction")}</a>` : "no transactions"}<span class="proposer"> · proposed by ${who(b.proposer)}</span></span><span class="dim">${ago(b.timestamp_ms)}</span></div>`).join("")}
       </div>`)}
     </div>`;
   },
@@ -617,6 +644,183 @@ const tallyBar = (p) => {
 };
 const councilText = (c) => c && (c.ayes || c.nays) ? `${term("council", "council")}: ${c.ayes} validator${c.ayes === 1 ? "" : "s"} approve${c.nays ? `, ${c.nays} reject` : ""}${c.of ? ` (of ${c.of})` : ""}` : "";
 const thresholdText = (p) => (p.threshold == null ? "a simple majority" : typeof p.threshold === "number" ? `${pct(p.threshold)} of the weight` : "a supermajority");
+
+// ---- The front page (#/). Live from /api/proposals, /api/accounts?sort=recent (each account's
+// /txs) and nonempty blocks among the latest headers. Nothing is pinned to one chain or one id.
+//
+// What leads: proposals whose status is "voting" (open for votes), then "queued" (passed, waiting
+// to run). Closed ones stay on the Governance page.
+//
+// What else runs: a transfer, delegation, vote, hunt, pool or shield movement, or a program call's
+// attached value, that moves MORE than 100 of the chain's unit. 100 is one faucet drip (the node
+// pays `100 * DROPS_PER_FANG` with the memo "faucet drip"), the ordinary size on a demo or dev
+// chain, and well above the 1-unit payments people send each other. A drip — any tx whose memo
+// reads as a faucet drip — is left out even if a chain's drip were larger, so drips can't fill
+// the page. The window is one day of blocks (`block_time_ms`). Names come from the tx's from/to
+// labels and the proposal's proposer; a program is an address, never a name. ----
+
+const LARGE_FANG = 100n;
+const LARGE_DROPS = LARGE_FANG * 1000000000n;
+const FRONT_WINDOW_MS = 86_400_000;
+const FRONT_TXS = 4;
+const NEWS_KINDS = new Set(["transfer", "delegate", "vote", "fund_hunt", "create_hunt", "fund_pool", "shield", "unshield", "claim_distribution", "call_program"]);
+const BLOCK_TXS = new Map();
+let ACCOUNT_MOVES = { at: 0, head: -1, txs: [] };
+let ACCOUNT_JOB = null;
+
+const newsMinHeight = (s) => {
+  const ms = Number(s && s.block_time_ms) || 1000;
+  const spanBlocks = Math.max(1, Math.round(FRONT_WINDOW_MS / ms));
+  return Math.max(0, (Number(s && s.height) || 0) - spanBlocks);
+};
+const memoText = (m) => plain(m || "").replace(/\s+/g, " ").trim();
+/** A faucet drip, whatever the leading emoji: the memo the node writes is "faucet drip". */
+const isFaucetDrip = (t) => /faucet\s*drip/i.test(memoText(t && t.memo));
+const digits = (v) => (/^\d+$/.test(String(v ?? "")) ? BigInt(v) : 0n);
+/** FANG a tx moves: its `amount`, or for a program call the value attached to each call. */
+const movedDrops = (t) => {
+  const direct = digits(t && t.amount);
+  if (!t || t.kind !== "call_program" || !t.action || !Array.isArray(t.action.calls)) return direct;
+  let n = 0n;
+  for (const c of t.action.calls) n += digits(c && c.value);
+  return n > direct ? n : direct;
+};
+const qualifiesNews = (t, minHeight) => {
+  if (!t || !t.summary || t.status === "failed") return false;
+  if (isFaucetDrip(t) || !NEWS_KINDS.has(t.kind)) return false;
+  if (movedDrops(t) <= LARGE_DROPS) return false;
+  if (t.height == null) return true;
+  const h = Number(t.height);
+  return Number.isFinite(h) && h >= minHeight;
+};
+const personText = (l) => {
+  if (!l || typeof l !== "object") return "an account";
+  if (l.name && !String(l.name).includes(" ")) return String(l.name);
+  if (l.name) return plain(String(l.name));
+  return l.short ? String(l.short) : "an account";
+};
+const proposalDeck = (p, s) => {
+  const bits = [`Proposed by ${personText(p.proposer)}`];
+  if (p.deposit) bits.push(`bonding ${p.deposit}`);
+  if (p.summary) bits.push(inert(p.summary, 180));
+  if (p.status === "voting" && p.endsAt != null && s) {
+    const left = Number(p.endsAt) - Number(s.height);
+    bits.push(left > 0 ? `voting ends at block #${p.endsAt} (in about ${span(left, s.block_time_ms)})` : `voting ends at block #${p.endsAt}`);
+  } else if (p.status === "queued" && p.executesAt != null) bits.push(`runs at block #${p.executesAt}`);
+  return bits.join(" · ");
+};
+const proposalItems = (raw, s) => {
+  if (!raw) return [];
+  const ps = list(raw, "proposals").map((p) => proposalOf(p, raw.params || {}));
+  const open = ps.filter((p) => (p.status === "voting" || p.status === "queued") && /^\d+$/.test(String(p.id)));
+  open.sort((a, b) => (a.status === b.status ? 0 : a.status === "voting" ? -1 : 1));
+  return open.slice(0, 3).map((p) => ({
+    href: `#/proposal/${p.id}`, front: "proposal", lead: p.status === "voting",
+    kicker: p.status === "voting" ? "Open for votes" : "Passed, waiting to run",
+    hed: inert(p.title || `Proposal #${p.id}`, 160),
+    deck: proposalDeck(p, s),
+  }));
+};
+const txKicker = (t) => {
+  const where = t.height == null ? "pending" : `block #${t.height}`;
+  const kind = { transfer: "Large transfer", delegate: "Delegation", vote: "Vote", call_program: "Program", fund_hunt: "Hunt", create_hunt: "Hunt", fund_pool: "Pool" }[t.kind] || "Large movement";
+  return `${kind} · ${where}`;
+};
+const txItems = (txs, minHeight) => {
+  const byId = new Map();
+  for (const t of txs) {
+    if (!qualifiesNews(t, minHeight)) continue;
+    const id = String(t.id);
+    if (!/^[0-9a-f]{64}$/.test(id) || byId.has(id)) continue;
+    byId.set(id, t);
+  }
+  const ranked = [...byId.values()].sort((a, b) => {
+    const ah = a.height == null ? Number.MAX_SAFE_INTEGER : Number(a.height);
+    const bh = b.height == null ? Number.MAX_SAFE_INTEGER : Number(b.height);
+    if (bh !== ah) return bh - ah;
+    const ad = movedDrops(a), bd = movedDrops(b);
+    return ad === bd ? 0 : bd > ad ? 1 : -1;
+  });
+  return ranked.slice(0, FRONT_TXS).map((t) => ({
+    href: `#/tx/${t.id}`, front: "tx", lead: false, kicker: txKicker(t),
+    hed: inert(t.summary, 200),
+    deck: t.memo ? `“${inert(t.memo, 80)}”` : "",
+  }));
+};
+const storyHtml = (item, lead) => `<a class="story${lead ? " lead" : ""}" data-front="${esc(item.front)}" href="${esc(item.href)}"><span class="kicker">${esc(item.kicker)}</span><span class="hed">${esc(item.hed)}</span>${item.deck ? `<span class="deck">${esc(item.deck)}</span>` : ""}</a>`;
+const frontSection = (items, unit) => {
+  if (!items.length) return "";
+  const lead = items.find((i) => i.lead) || items[0];
+  const rest = items.filter((i) => i !== lead);
+  const rail = rest.map((i) => storyHtml(i, false)).join("");
+  const grid = rail ? `<div class="stories">${storyHtml(lead, true)}<div class="rail">${rail}</div></div>` : `<div class="stories one">${storyHtml(lead, true)}</div>`;
+  return card(`<span class="eyebrow">The front page</span><h2>In the news</h2>
+    <p class="front-note dim">Open proposals, and movements of more than ${esc(String(LARGE_FANG))} ${esc(unit)} in the last day. Faucet drips aren't listed.</p>
+    ${grid}
+    <p class="front-more"><a href="#/governance">All proposals →</a></p>`, "front");
+};
+const accountIdOf = (row) => {
+  const a = row && row.account;
+  if (!a) return null;
+  if (typeof a.name === "string" && /^[a-z0-9-]{1,64}\.boo$/.test(a.name)) return a.name;
+  if (typeof a.address === "string" && isAddr(a.address)) return a.address;
+  return null;
+};
+const accountMovesFresh = (s) => ACCOUNT_MOVES.at && Date.now() - ACCOUNT_MOVES.at < 45_000 && (Number(s && s.height) || 0) - ACCOUNT_MOVES.head < 40;
+async function accountMoves(s, people) {
+  const min = newsMinHeight(s);
+  const rows = people && Array.isArray(people.accounts) ? people.accounts : [];
+  const ids = [];
+  for (const row of rows) {
+    if (!row || row.system) continue;
+    const last = Number(row.last_active);
+    if (!Number.isFinite(last) || last < min) continue;
+    const id = accountIdOf(row);
+    if (id && !ids.includes(id)) ids.push(id);
+    if (ids.length >= 20) break;
+  }
+  const pages = await Promise.all(ids.map((id) => api("/account/" + encodeURIComponent(id) + "/txs?limit=100").catch(() => null)));
+  const txs = [];
+  for (const page of pages) if (page && Array.isArray(page.txs)) txs.push(...page.txs);
+  return txs;
+}
+async function cachedAccountMoves(s, people) {
+  const head = Number(s && s.height) || 0;
+  if (accountMovesFresh(s)) return ACCOUNT_MOVES.txs;
+  if (ACCOUNT_JOB) return ACCOUNT_JOB;
+  ACCOUNT_JOB = (async () => {
+    try {
+      const txs = await accountMoves(s, people);
+      ACCOUNT_MOVES = { at: Date.now(), head, txs };
+      return txs;
+    } finally { ACCOUNT_JOB = null; }
+  })();
+  return ACCOUNT_JOB;
+}
+async function txsInBlocks(headers) {
+  const list = Array.isArray(headers) ? headers : [];
+  const need = [];
+  for (const b of list) {
+    const h = b && b.height;
+    if (!b || !Number(b.tx_count) || BLOCK_TXS.has(h)) continue;
+    if (!/^\d+$/.test(String(h))) continue;
+    need.push(h);
+    if (need.length >= 12) break;
+  }
+  await Promise.all(need.map(async (h) => {
+    const full = await api("/block/" + h).catch(() => null);
+    if (full && Array.isArray(full.txs)) BLOCK_TXS.set(h, full.txs);
+  }));
+  while (BLOCK_TXS.size > 80) BLOCK_TXS.delete(BLOCK_TXS.keys().next().value);
+  const out = [];
+  for (const b of list) { const txs = BLOCK_TXS.get(b.height); if (txs) out.push(...txs); }
+  return out;
+}
+async function frontMarkup(s, headers, proposals, people) {
+  const [blockTxs, accountTxs] = await Promise.all([txsInBlocks(headers), cachedAccountMoves(s, people)]);
+  const unit = /^[A-Z][A-Z0-9]{1,7}$/.test(String(s && s.token || "")) ? s.token : "FANG";
+  return frontSection([...proposalItems(proposals, s), ...txItems([...blockTxs, ...accountTxs], newsMinHeight(s))], unit);
+}
 
 views.governance = async function () {
   let r;

@@ -2421,6 +2421,12 @@ export class Client {
     return new Client(rpc, { ...rest, network: "testnet" });
   }
 
+  /** Blockula's demo chain, blockula-demo-2 (`NETWORKS.demo`), every pin set: `Client.demo()`, or `Client.demo({ rpc })` for another of its nodes. */
+  static demo(opts: Omit<ClientOptions, "network"> & { rpc?: string } = {}): Client {
+    const { rpc, ...rest } = opts;
+    return new Client(rpc, { ...rest, network: "demo" });
+  }
+
   /** A `blockula dev` chain on this machine (`NETWORKS.local`). */
   static local(opts: Omit<ClientOptions, "network"> & { rpc?: string } = {}): Client {
     const { rpc, ...rest } = opts;
@@ -2440,7 +2446,7 @@ export class Client {
       if (rpc === null || typeof rpc !== "object") throw new Error("new Client(rpc, opts) takes the node's URL, or the options alone");
       opts = { ...rpc, ...options };
     }
-    if (opts.network !== undefined && !isNetworkName(opts.network)) throw new Error(`unknown network ${JSON.stringify(opts.network)} (testnet or local)`);
+    if (opts.network !== undefined && !isNetworkName(opts.network)) throw new Error(`unknown network ${JSON.stringify(opts.network)} (demo, testnet or local)`);
     const preset: NetworkPreset | undefined = opts.network === undefined ? undefined : NETWORKS[opts.network];
     if (preset) {
       url ??= preset.rpc;

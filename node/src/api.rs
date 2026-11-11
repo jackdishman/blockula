@@ -708,6 +708,7 @@ pub fn router(node: Node) -> Router {
         .route("/api/health", get(health))
         .route("/api/upgrade", get(upgrade))
         .route("/api/beacon", get(beacon))
+        .route("/api/programs", get(crate::programs::api::programs))
         .route("/api/program/{address}", get(crate::programs::api::program))
         .route("/api/program/{address}/storage", get(crate::programs::api::storage))
         .route("/api/code/{hash}", get(crate::programs::api::code))

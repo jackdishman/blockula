@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // A guestbook on a chain: anyone signs it by sending a payment with a memo to its name.
 //
-//   node examples/guestbook.mjs serve [--name guestbook] [--rpc URL] [--network local|testnet]
+//   node examples/guestbook.mjs serve [--name guestbook] [--rpc URL] [--network local|demo|testnet]
 //        [--key FILE] [--faucet] [--state FILE] [--from HEIGHT]
-//   node examples/guestbook.mjs read [--name guestbook] [--limit 20] [--rpc URL] [--network local|testnet]
+//   node examples/guestbook.mjs read [--name guestbook] [--limit 20] [--rpc URL] [--network local|demo|testnet]
 //
 // serve: owns the name (registering it if it's free) and logs each new signature once, by tx id,
 //        resuming from the stored height after a restart. It signs nothing and pays nothing.
@@ -19,7 +19,7 @@ import { ApiError, Client, Wallet, formatFang, parseFang, watchPayments } from "
 const { positional, flags } = parseArgs(process.argv.slice(2));
 const mode = positional[0];
 if (mode !== "serve" && mode !== "read") {
-  console.error("usage: node examples/guestbook.mjs serve|read [--name guestbook] [--rpc URL] [--network local|testnet] [--key FILE] [--faucet] [--state FILE] [--limit N]");
+  console.error("usage: node examples/guestbook.mjs serve|read [--name guestbook] [--rpc URL] [--network local|demo|testnet] [--key FILE] [--faucet] [--state FILE] [--limit N]");
   process.exit(2);
 }
 const name = (flags.name ?? "guestbook").replace(/\.boo$/, "");

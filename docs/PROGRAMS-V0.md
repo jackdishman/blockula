@@ -2015,6 +2015,7 @@ reading `n.live.view()` (a `ReadView`, never the chain lock):
 | Route | Returns |
 |---|---|
 | `GET /api/program/{address}` | The record: `creator`, `created_at`, `code` (`wasm_hash`, size, `interface_hash`), `version` and `version_digest`, `authority`, `upgrade_delay_blocks`, `policy`, an `upgradability` sentence ("immutable", or "no upgrades exist yet; once a protocol version adds them, X may upgrade it with N blocks' notice"), `accepts_transfers`, `balance`, storage totals, `record_deposit`, the decoded methods with `untrusted_name`s, the proof path (`/api/proof/66/{hex(address)}`), and `height` |
+| `GET /api/programs?after=&limit=` | Every program, newest create first (ties by address), up to 100 a page (default 50): each row's `address`, `creator`, `created_at`, `wasm_hash`, `interface_hash`, `version`, `accepts_transfers`, `balance` and storage `items`; `next` (the last address, the next page's `after`), `total`, `height`. Ranked once per block; 404 while programs are dormant |
 | `GET /api/program/{address}/storage?after=&limit=` | Entries by key prefix (hex), a page at a time (should, not must) |
 | `GET /api/code/{hash}` | `size`, `exports`, `uploader`, `deposit`, `refs`, `uploaded_at`, `last_used_at`; `?wasm=1` adds the code as hex |
 | `GET /api/interface/{hash}` | The raw bytes as hex and the decoded JSON (§3.4) |
@@ -2176,9 +2177,10 @@ Read-only. The node's built-in explorer (`node/src/explorer.html`) and the web e
 history: tag 64's `addresses()` names each call's program, so the store's history rows index
 it). A transaction page shows the receipt with facts apart from claims (PRG 8.4). "What was signed,
 exactly" abridges only the blobs a program action carries (`wasm`, `interface`, `input`, data);
-every v1 action prints exactly as before, keys and proofs whole. Until the list route exists
-(§8.2) the Programs page lists the creates in a window of recent blocks, and says so, plus any
-program pinned for that chain id and genesis hash in `FEATURED_PROGRAMS` (`web/lib/explorer/featured.ts`).
+every v1 action prints exactly as before, keys and proofs whole. The Programs page lists every
+program from `/api/programs` (§8.2), newest first, and on a node that predates the route falls
+back to the creates in a window of recent blocks, saying so. Programs pinned for that chain id and
+genesis hash in `FEATURED_PROGRAMS` (`web/lib/explorer/featured.ts`) are shown above them.
 `web/lib/explorer/programs.ts` lists deployed programs beside native ones (`Program.kind:
 "deployed"`) with no `ActionSpec` forms yet (calls are CLI- and SDK-only in v0);
 `web/lib/explorer/ledger.ts` learns what tags 62–64 move (fee, value, deposits, the creation
