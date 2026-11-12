@@ -30,6 +30,7 @@ mod programs;
 mod protection;
 mod release_cli;
 mod replay;
+mod setup_cli;
 mod status_cli;
 mod types;
 mod upgrade;

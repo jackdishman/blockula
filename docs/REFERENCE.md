@@ -82,6 +82,8 @@ Every command that signs (`wallet send|name`, `stake`, `gov`, `multisig`, `name`
 
 Validators are permissionless: anyone can register one with a self-bond, anyone can delegate to it, and at each epoch boundary the top `max_validators` by stake make the set (newcomers at most a third of it). Double-signing is slashed and banned for good; missing too many turns gets a validator jailed until it unjails. Everything is on-chain and visible in the explorer's Validators page.
 
+On a machine at home, `blockula validator setup --node <any node> --genesis-hash <hash>` does the steps below in one go (and on an internet chain, `--host <your public host>` and a full node for your HTTP address), runs the node as a launchd or systemd user service, and prints what the chain's owner runs to let you in ([BECOME-A-VALIDATOR.md](BECOME-A-VALIDATOR.md#the-quick-way-blockula-validator-setup)). By hand:
+
 ```bash
 # 1. Create a validator home: fetches genesis, generates the ML-DSA-65 key, records your public addresses
 #    (--public-http-addr: the URL clients reach you through, a sentry or RPC node, or 127.0.0.1:7070

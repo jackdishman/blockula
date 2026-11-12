@@ -162,7 +162,14 @@ The chains listed on [blockula.app](https://blockula.app) with **Wants validator
 - **Two ports are open to the internet:** TCP 30300 (other validators dial it) and 7171 (your full node, which the chain publishes as your validator's HTTP address). Forward them on your router ([Running at home](#running-at-home)).
 - **Only chains on the open internet can take you.** A chain on a tailnet or a home network can't: its validators must reach yours, and yours theirs. Chains listed without **Wants validators** are open for their wallet only.
 
-With `<node>` the chain's listed `https://` node, `<hash>` its genesis hash, `<id>` its chain id and `<your host>` your public IP or DNS name:
+With `<node>` the chain's listed `https://` node, `<hash>` its genesis hash, `<id>` its chain id and `<your host>` your public IP or DNS name, one command sets up both nodes, runs them in the background (launchd on a Mac, systemd on Linux) and registers the validator:
+
+```bash
+curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh
+blockula validator setup --node <node> --genesis-hash <hash> --host <your host>
+```
+
+([BECOME-A-VALIDATOR.md](BECOME-A-VALIDATOR.md#the-quick-way-blockula-validator-setup) says what it does.) The same by hand:
 
 ```bash
 curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh

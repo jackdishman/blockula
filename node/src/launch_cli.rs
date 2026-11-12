@@ -353,7 +353,7 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
     }
 
     /// Asks until `check` takes the answer.
-    fn ask<T>(&mut self, q: &str, default: Option<&str>, check: impl Fn(&str) -> Result<T>) -> Result<T> {
+    pub(crate) fn ask<T>(&mut self, q: &str, default: Option<&str>, check: impl Fn(&str) -> Result<T>) -> Result<T> {
         loop {
             match default {
                 Some(d) if !d.is_empty() => write!(self.out, "  {q} [{d}]: ")?,
@@ -369,7 +369,7 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
         }
     }
 
-    fn confirm(&mut self, q: &str, default: bool) -> Result<bool> {
+    pub(crate) fn confirm(&mut self, q: &str, default: bool) -> Result<bool> {
         loop {
             write!(self.out, "  {q} [{}]: ", if default { "Y/n" } else { "y/N" })?;
             self.out.flush()?;
@@ -382,7 +382,7 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
         }
     }
 
-    fn choose(&mut self, heading: Option<&str>, options: &[String], default: usize) -> Result<usize> {
+    pub(crate) fn choose(&mut self, heading: Option<&str>, options: &[String], default: usize) -> Result<usize> {
         if let Some(h) = heading {
             writeln!(self.out, "  {h}")?;
         }
@@ -561,7 +561,7 @@ pub fn guide(plan: &Plan, g: &Genesis, home: &Path, genesis_hash: &str, https_ur
     }
     if let Some(u) = plan.shared_url() {
         s += &format!(
-            "## Friends run their own node\n\nThey install Blockula, then run:\n\n```sh\ncurl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh\nblockula join --genesis {u} --genesis-hash {genesis_hash} --home ~/.blockula/{id}\n```\n\nTheir node checks every block, and its explorer is at http://localhost:7171. To make them a validator, follow step 3 of https://github.com/jackdishman/blockula/blob/main/docs/CREATE.md and approve them with:\n\n```sh\nblockula validator approve <their validator address> --key {key} --rpc {local}\n```\n\n",
+            "## Friends run their own node\n\nThey install Blockula, then run:\n\n```sh\ncurl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh\nblockula join --genesis {u} --genesis-hash {genesis_hash} --home ~/.blockula/{id}\n```\n\nTheir node checks every block, and its explorer is at http://localhost:7171.\n\n## Friends become validators\n\nOn their machine, one command makes the key, takes the bond, runs the node in the background and registers it:\n\n```sh\nblockula validator setup --node {u} --genesis-hash {genesis_hash}\n```\n\nIt prints their validator address. Check it with them, then let it in:\n\n```sh\nblockula validator approve <their validator address> --key {key} --rpc {local}\n```\n\nWith two or three validators every block needs each one, so add friends who keep their machine on (https://github.com/jackdishman/blockula/blob/main/docs/CREATE.md, step 3).\n\n",
             id = g.chain_id,
             key = display_home(&home.join("validator.key")),
             local = plan.local_url(),

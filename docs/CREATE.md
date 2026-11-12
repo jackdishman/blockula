@@ -50,13 +50,30 @@ Its explorer is at `http://localhost:7171`. The wallet, the SDK and the MCP can 
 
 ## 3. Friends become validators
 
-Validators take turns making blocks. On the friend's machine:
+Validators take turns making blocks. On the friend's machine, one command does it all:
+
+```bash
+blockula validator setup --node http://<your address>:7070 --genesis-hash <hash>
+```
+
+It checks the node is on the chain with that hash, sees how the chain is reached (your tailnet, your home network or the internet) and finds the friend's address on it, makes the validator's key, takes the bond from the faucet, runs the node in the background so it starts again with the computer (launchd on a Mac, systemd on Linux; `--foreground` keeps it in the terminal), registers it, and prints the one command for you. Run without flags, it asks for the node and the hash. Run it again any time: it picks up where it stopped, and never makes a second key or starts a second copy.
+
+On your machine, approve it with the command it printed:
+
+```bash
+blockula validator approve <validator address> --key ~/.blockula/<chain id>/validator.key --rpc http://localhost:7070
+```
+
+It joins at the next epoch boundary, within 10 minutes, and starts taking turns. With two validators every block needs both, so only add friends who keep their machine on.
+
+<details>
+<summary>The same steps by hand</summary>
 
 ```bash
 # A validator home: a new key, and the addresses the others reach it at
 blockula validator init --home ~/.blockula/<chain id>-validator \
   --genesis http://<your address>:7070 --genesis-hash <hash> \
-  --public-p2p-addr <their address>:30300 --public-http-addr http://<their address>:7070
+  --public-p2p-addr <their address>:30300 --public-http-addr <their address>:7070
 
 # Its bond, from the faucet, to the validator address init printed (it waits until the payment is final)
 blockula wallet faucet --to <validator address> --rpc http://<your address>:7070
@@ -66,13 +83,7 @@ blockula run --home ~/.blockula/<chain id>-validator --bind 0.0.0.0
 blockula validator register --home ~/.blockula/<chain id>-validator --rpc http://<your address>:7070
 ```
 
-`register` bonds 50 FANG and prints how the validator gets in. On your machine, approve it:
-
-```bash
-blockula validator approve <validator address> --key ~/.blockula/<chain id>/validator.key --rpc http://localhost:7070
-```
-
-It joins at the next epoch boundary, within 10 minutes, and starts taking turns.
+</details>
 
 ## List your chain
 

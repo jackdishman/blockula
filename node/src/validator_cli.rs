@@ -42,6 +42,11 @@ pub enum ValidatorCmd {
         #[arg(long)]
         allow_private_addr: bool,
     },
+    /// Set up a validator on this machine for a chain someone else runs, in one go: the key, the
+    /// bond (from the faucet), the node as a background service that starts with the computer,
+    /// and `register`. It asks what it needs, and says what the chain's owner runs to let it in.
+    /// Run it again to pick up where it stopped (docs/BECOME-A-VALIDATOR.md)
+    Setup(crate::setup_cli::SetupArgs),
     /// Bond FANG and register this validator (signed by the validator's own account, which
     /// must already hold the bond plus fees — on testnets, use the faucet). Start its node first
     /// (`blockula run`): this checks it answers. Then it prints how this chain lets it in (stake
@@ -344,44 +349,8 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
 pub fn run_in(cmd: ValidatorCmd, dir: &Path) -> Result<()> {
     match cmd {
         ValidatorCmd::Init { home, genesis, genesis_hash, public_p2p_addr, public_http_addr, allow_private_addr } => {
-            if home.join("validator.key").exists() {
-                bail!("{} already has a validator.key", home.display());
-            }
-            let remote = genesis.starts_with("http://") || genesis.starts_with("https://");
-            let g: Genesis = if remote {
-                let g: Genesis = serde_json::from_value(rt()?.block_on(get(&genesis, "/genesis"))?)?;
-                g.check_prefix().context("genesis")?;
-                g
-            } else {
-                Genesis::load(Path::new(&genesis))?
-            };
-            // As `join` does: a known chain's genesis must match this release, a pin must match,
-            // and a genesis fetched from a node must be pinned (a local file is the operator's own).
-            crate::checkpoints::Trust::new(&g, &crate::checkpoints::Pins { genesis_hash, ..Default::default() }, remote)?;
-            // On a public chain the addresses are what other validators dial and what the chain
-            // publishes: never a loopback default (OPERATOR-3).
-            let public = is_public_chain(&g);
-            let (p2p, http) = match (public_p2p_addr, public_http_addr) {
-                (Some(p), Some(h)) => (p, h),
-                (p, h) if public => bail!(
-                    "`{}` is a public chain, so its validators publish addresses others can reach: pass {}. Nothing was created",
-                    g.chain_id,
-                    [(p.is_none(), "--public-p2p-addr <host:port> (the public IP or DNS name and port other validators dial; TCP 30300 by convention)"), (h.is_none(), "--public-http-addr <https://…> (the public URL of a full node you run for this validator: its own HTTP API stays private)")].iter().filter(|(missing, _)| *missing).map(|(_, f)| *f).collect::<Vec<_>>().join(" and ")
-                ),
-                (p, h) => (
-                    match p { Some(a) => a, None => format!("127.0.0.1:{}", crate::chain::free_port()?) },
-                    match h { Some(a) => a, None => format!("127.0.0.1:{}", crate::chain::free_port()?) },
-                ),
-            };
-            crate::chain::check_host_port(&p2p).context("--public-p2p-addr")?;
-            crate::chain::check_http_addr(&http).context("--public-http-addr")?;
-            check_reachable(public && !allow_private_addr, [("--public-p2p-addr", p2p.as_str()), ("--public-http-addr", http.as_str())], "Pass a public IP or DNS name (or --allow-private-addr if the other validators really reach this one over a private network). Nothing was created")?;
-            std::fs::create_dir_all(&home)?;
-            let keys = Keys::generate();
+            let (g, keys, p2p, http) = init_home(&home, &genesis, genesis_hash, public_p2p_addr, public_http_addr, allow_private_addr)?;
             let me = keys.address_with(&g.address_prefix);
-            std::fs::write(home.join("genesis.json"), serde_json::to_string_pretty(&g)?)?;
-            write_secret(&home.join("validator.key"), &keys.seed_hex())?;
-            std::fs::write(home.join("node.json"), serde_json::to_string_pretty(&NodeAddrs { p2p_addr: p2p.clone(), http_addr: http.clone() })?)?;
             println!("🧛 Validator home ready at {}", home.display());
             println!("   address (account + validator id): {me}");
             println!("   consensus key: ML-DSA-65, {}…", &hex::encode(keys.public_key())[..32]);
@@ -436,6 +405,7 @@ pub fn run_in(cmd: ValidatorCmd, dir: &Path) -> Result<()> {
             println!("  Others can back it: blockula stake delegate {me} <FANG> --key <key file> --rpc {rpc}");
             Ok(())
         }
+        ValidatorCmd::Setup(a) => crate::setup_cli::setup(&a, dir),
         ValidatorCmd::Unjail(a) => admin(a, dir, |v| Action::Unjail { validator: v }),
         ValidatorCmd::Commission { bps, key, rpc, from, pin } => {
             let keys = load_seed(&key)?;
@@ -552,6 +522,50 @@ pub fn run_in(cmd: ValidatorCmd, dir: &Path) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `validator init`'s work: checks the genesis (a pin must match; one fetched from a node must be
+/// pinned) and the addresses, then writes the home (genesis.json, validator.key, node.json).
+/// Returns the genesis, the new key and the p2p and HTTP addresses it records.
+pub(crate) fn init_home(home: &Path, genesis: &str, genesis_hash: Option<String>, public_p2p_addr: Option<String>, public_http_addr: Option<String>, allow_private_addr: bool) -> Result<(Genesis, Keys, String, String)> {
+    if home.join("validator.key").exists() {
+        bail!("{} already has a validator.key", home.display());
+    }
+    let remote = genesis.starts_with("http://") || genesis.starts_with("https://");
+    let g: Genesis = if remote {
+        let g: Genesis = serde_json::from_value(rt()?.block_on(get(genesis, "/genesis"))?)?;
+        g.check_prefix().context("genesis")?;
+        g
+    } else {
+        Genesis::load(Path::new(genesis))?
+    };
+    // As `join` does: a known chain's genesis must match this release, a pin must match,
+    // and a genesis fetched from a node must be pinned (a local file is the operator's own).
+    crate::checkpoints::Trust::new(&g, &crate::checkpoints::Pins { genesis_hash, ..Default::default() }, remote)?;
+    // On a public chain the addresses are what other validators dial and what the chain
+    // publishes: never a loopback default (OPERATOR-3).
+    let public = is_public_chain(&g);
+    let (p2p, http) = match (public_p2p_addr, public_http_addr) {
+        (Some(p), Some(h)) => (p, h),
+        (p, h) if public => bail!(
+            "`{}` is a public chain, so its validators publish addresses others can reach: pass {}. Nothing was created",
+            g.chain_id,
+            [(p.is_none(), "--public-p2p-addr <host:port> (the public IP or DNS name and port other validators dial; TCP 30300 by convention)"), (h.is_none(), "--public-http-addr <https://…> (the public URL of a full node you run for this validator: its own HTTP API stays private)")].iter().filter(|(missing, _)| *missing).map(|(_, f)| *f).collect::<Vec<_>>().join(" and ")
+        ),
+        (p, h) => (
+            match p { Some(a) => a, None => format!("127.0.0.1:{}", crate::chain::free_port()?) },
+            match h { Some(a) => a, None => format!("127.0.0.1:{}", crate::chain::free_port()?) },
+        ),
+    };
+    crate::chain::check_host_port(&p2p).context("--public-p2p-addr")?;
+    crate::chain::check_http_addr(&http).context("--public-http-addr")?;
+    check_reachable(public && !allow_private_addr, [("--public-p2p-addr", p2p.as_str()), ("--public-http-addr", http.as_str())], "Pass a public IP or DNS name (or --allow-private-addr if the other validators really reach this one over a private network). Nothing was created")?;
+    std::fs::create_dir_all(home)?;
+    let keys = Keys::generate();
+    std::fs::write(home.join("genesis.json"), serde_json::to_string_pretty(&g)?)?;
+    write_secret(&home.join("validator.key"), &keys.seed_hex())?;
+    std::fs::write(home.join("node.json"), serde_json::to_string_pretty(&NodeAddrs { p2p_addr: p2p.clone(), http_addr: http.clone() })?)?;
+    Ok((g, keys, p2p, http))
 }
 
 /// The candidate `validator admit` signs: an address, on every chain (audit review-r3-staking-1,
@@ -741,7 +755,7 @@ fn all_validators(set: &Value) -> Vec<Value> {
 }
 
 /// Validator `address`'s record in `/api/validators`.
-fn find_validator(set: &Value, address: &str) -> Option<Value> {
+pub(crate) fn find_validator(set: &Value, address: &str) -> Option<Value> {
     all_validators(set).into_iter().find(|v| v["validator"]["address"].as_str() == Some(address))
 }
 
@@ -953,7 +967,7 @@ pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
     }
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A tx the node dropped unrun isn't reported as a failure that was charged (review-fix-clients-2).
@@ -1134,7 +1148,7 @@ mod tests {
     }
 
     /// A node with an API on a summoned chain of one validator, making blocks in the background.
-    fn local_node(tag: &str) -> (PathBuf, Vec<PathBuf>, std::sync::Arc<parking_lot::Mutex<crate::chain::Chain>>, tokio::runtime::Runtime, String) {
+    pub(crate) fn local_node(tag: &str) -> (PathBuf, Vec<PathBuf>, std::sync::Arc<parking_lot::Mutex<crate::chain::Chain>>, tokio::runtime::Runtime, String) {
         let root = std::env::temp_dir().join(format!("blockula-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()));
         let homes = crate::chain::Chain::summon(&root, &crate::chain::SummonOpts::new(tag, 1)).unwrap();
         let chain = std::sync::Arc::new(parking_lot::Mutex::new(crate::chain::Chain::open(&homes[0]).unwrap()));

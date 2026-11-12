@@ -6,7 +6,7 @@ A step-by-step guide for someone who has never run one. It takes about an hour t
 - **[Path B: a home server with port forwarding](#path-b-a-home-server-with-port-forwarding)**: free if you have the machine, but your home IP becomes public.
 - **[Path C: a home server behind a cheap relay](#path-c-a-home-server-behind-a-relay)**: the machine is at home, and a $4–5 server shows the world its IP instead of yours.
 
-Or skip to **[Let your coding agent do it](#let-your-coding-agent-do-it)** and paste one prompt.
+On a machine at home (B or C), **[`blockula validator setup`](#the-quick-way-blockula-validator-setup)** does most of the work in one command. Or skip to **[Let your coding agent do it](#let-your-coding-agent-do-it)** and paste one prompt.
 
 [RUN-A-NODE.md](RUN-A-NODE.md) is the shorter reference; [OPERATIONS.md](OPERATIONS.md) is for professional operators.
 
@@ -48,6 +48,26 @@ blockula --version
 ```
 
 It installs into `~/.blockula/bin`. To check the download came from this project's release pipeline first (recommended), install [GitHub's CLI](https://cli.github.com), run `gh auth login`, and follow [OPERATIONS.md, A first install](OPERATIONS.md#a-first-install). Path A does this check for you.
+
+## The quick way: `blockula validator setup`
+
+On the machine that will be the validator (a Mac or Linux computer at home, or a server you're logged in to):
+
+```bash
+blockula validator setup
+```
+
+It asks for the chain's node and genesis hash, then:
+
+1. checks the node reports exactly that genesis hash, and stops if it doesn't;
+2. works out how the chain's validators reach each other from the addresses they publish, and this machine's address on it: its Tailscale IP on a tailnet chain, its home network IP on a home-network chain, or on an internet chain the DNS name or public IP (or relay) you give it;
+3. makes the validator's key in `~/.blockula/<chain id>-validator/validator.key` (mode 600), once;
+4. on an internet chain, sets up your full node too (`~/.blockula/<chain id>`, port 7171), which the chain publishes as your validator's HTTP address, while the validator's own API stays on this machine;
+5. takes the bond from the chain's faucet; on a chain without one, it prints the command for the owner to send it, and waits;
+6. runs the node in the background: a launchd agent on a Mac (it starts when you log in, restarts after a crash, and keeps the Mac from idle sleep while it runs) or a systemd user service on Linux. It never restarts a node that stopped on purpose (a halt, an upgrade it needs, slashing protection);
+7. waits for the node to sync, signs `blockula validator register`, and prints the exact `approve` or `admit` command to send the chain's owner, and how to see its logs, stop it and start it. All of that is also in `~/.blockula/<chain id>-validator/README.md`.
+
+Run it again at any time: it picks up where it stopped, and it never makes a second key or starts a second copy of a running node. As flags (for scripts and agents): `--node <node> --genesis-hash <hash>`, `--host <your host>` (needed on an internet chain), `--relay` (Path C), `--foreground` (no service: the node runs in the terminal), `--dry-run` (print the review, do nothing) and `--yes` (no questions). On Linux, `sudo loginctl enable-linger $USER` keeps a user service running while you're logged out.
 
 ## Path A: in the cloud
 
@@ -160,7 +180,13 @@ Steps, with `<your host>` your dynamic DNS name (or public IP):
 
 1. **Give the machine a fixed address on your network** (in your router: "DHCP reservation"), say `192.168.1.50`.
 2. **Forward two ports** in your router to that address: TCP **30300** (p2p: other validators dial it) and TCP **7171** (your full node). Never forward 7070, the validator's own HTTP.
-3. **Install and set up** as on the VPS above, with `<your host>` in place of `<server IP>` (on a Mac, run the same commands as your own user, with homes under `~/.blockula/`, and keep them running in two terminals or with `launchd`):
+3. **Install and set up** with one command ([the quick way](#the-quick-way-blockula-validator-setup)): it makes the key, sets up the full node, takes the bond, starts both in the background and registers:
+
+   ```bash
+   blockula validator setup --node <node> --genesis-hash <hash> --host <your host>
+   ```
+
+   Or by hand, as on the VPS above with `<your host>` in place of `<server IP>` (on a Mac, as your own user, with homes under `~/.blockula/`, kept running in two terminals or with `launchd`):
 
    ```bash
    blockula join --genesis <node> --genesis-hash <hash> --home ~/.blockula/<id> --bind 0.0.0.0
@@ -172,7 +198,7 @@ Steps, with `<your host>` your dynamic DNS name (or public IP):
    ```
 
 4. **Check the ports from outside**: from a phone off Wi-Fi, or a site like portchecker.co, port 30300 on `<your host>` should be open once the validator runs.
-5. **Turn off sleep** (and on a laptop, sleep with the lid closed), and plan for power cuts: a cheap UPS keeps a router and a mini PC up through short ones.
+5. **Turn off sleep** (on a Mac, `setup`'s service already keeps it from idle sleep while the node runs, but not from sleeping when a laptop's lid closes), and plan for power cuts: a cheap UPS keeps a router and a mini PC up through short ones.
 
 ## Path C: a home server behind a relay
 
@@ -243,7 +269,13 @@ Your validator still dials other validators directly from home, so they see your
 
    A Fly machine can be the relay too, but it needs Tailscale inside the container; a plain VPS is simpler.
 
-3. **The home server publishes the relay's address** and runs the `public-nat` preset. With `<relay host>` the relay's public IP (or a DNS name pointing at it):
+3. **The home server publishes the relay's address** and runs the `public-nat` preset. With `<relay host>` the relay's public IP (or a DNS name pointing at it), [the quick way](#the-quick-way-blockula-validator-setup) does both:
+
+   ```bash
+   blockula validator setup --node <node> --genesis-hash <hash> --host <relay host> --relay
+   ```
+
+   Or by hand:
 
    ```bash
    blockula join --genesis <node> --genesis-hash <hash> --home ~/.blockula/<id> --bind 0.0.0.0
@@ -324,6 +356,9 @@ Rules:
   offline.
 - Ask me before anything that costs money (a Fly app, a VPS) or changes my network (router port
   forwards, firewall rules, Tailscale), and wait for my yes.
+- For Path B or C, use `blockula validator setup` (with --node, --genesis-hash, --host, and --relay
+  for C): it does the key, the full node, the bond, the background service and register. Run it
+  with --dry-run first and show me its review; run it with --yes once I say yes.
 - Take the bond from the chain's faucet if it has one; if it doesn't, tell me how much to ask the
   chain's operator for and wait.
 - Run `blockula validator register`, then STOP: give me my validator address (boo1…) and the exact
