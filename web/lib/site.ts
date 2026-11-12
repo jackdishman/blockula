@@ -92,6 +92,9 @@ Rules:
   offline.
 - Ask me before anything that costs money (a Fly app, a VPS) or changes my network (router port
   forwards, firewall rules, Tailscale), and wait for my yes.
+- For Path B or C, use \`blockula validator setup\` (with --node, --genesis-hash, --host, and --relay
+  for C): it does the key, the full node, the bond, the background service and register. Run it
+  with --dry-run first and show me its review; run it with --yes once I say yes.
 - Take the bond from the chain's faucet if it has one; if it doesn't, tell me how much to ask the
   chain's operator for and wait.
 - Run \`blockula validator register\`, then STOP: give me my validator address (boo1…) and the exact
