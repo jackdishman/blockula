@@ -19,7 +19,7 @@
 // instruction and never markup. Nothing in this file puts one into an error message unquoted.
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import { bech32m } from "@scure/base";
-import { interfaceHash, methodSelector, versionDigest, wasmHash } from "./tx.js";
+import { interfaceHash, methodSelector, parseFang, versionDigest, wasmHash } from "./tx.js";
 
 // ---- limits the chain holds program transactions to (node/vm/src/config.rs), checked before signing ----
 
@@ -981,4 +981,363 @@ export function programCost(r: ProgramReceipt, signer: string): ProgramCost {
   const fee = chargedFee(r);
   const vm = -vmChange(r, signer);
   return { fee, outside_vm: r.facts.outside_vm, vm, total: fee + r.facts.outside_vm.total + vm };
+}
+
+// ---- the ABI: a call's input and a method's return data, typed by the interface ----
+//
+// The chain never reads a call's input against the interface (docs/PROGRAMS-V0.md §3.1, PRG 11.1): a
+// program decodes its own. By convention every value is Borsh (§3.2, PRG 11.3; node/vm/src/interface.rs
+// `Type`), and that's what these write and read, as the `borsh` crate the node pins does
+// (sdk-ts/test/program-abi-vectors.json, written by node/src/programs/abi_vectors.rs):
+//
+//   u8 u16 u32 u64 u128      little-endian, 1 2 4 8 16 bytes
+//   i64 i128                 little-endian two's complement, 8 16 bytes
+//   fang                     an amount of drops, as a u64
+//   bool                     one byte: 0 or 1
+//   address, hash32          the 32 bytes (an address's bech32m payload)
+//   name                     a `.boo` label (3 to 32 of a–z, 0–9 and -), as a Borsh string
+//   text(max)                u32 LE length ‖ that many bytes of UTF-8, at most `max` bytes (bytes, not characters)
+//   bytes(max)               u32 LE length ‖ that many bytes, at most `max`
+//   option<T>                0 for none, or 1 ‖ T
+//   vec<T, max>              u32 LE count, at most `max` ‖ each T
+//
+// A call's input is its arguments' encodings back to back (a Borsh tuple); a method's return data is its
+// return type's encoding, and nothing for a method that returns nothing. Decoding takes the whole of the
+// bytes or refuses them: a value that ends early, has bytes left over, isn't UTF-8 where text goes, or runs
+// past its type's bound is an error, never a best guess. A decoded value is the program's claim: the chain
+// checks none of it, and its text is a stranger's.
+
+/**
+ * A value of an interface type, as this SDK takes and returns it:
+ * - `u8` … `u128`, `i64`, `i128`: a `bigint` (a safe-integer `number` or a decimal string is accepted too);
+ * - `fang`: drops, a `bigint` (or, as everywhere in this SDK, an amount of FANG as a decimal string, `"1.5"`);
+ * - `bool`: a `boolean`;
+ * - `address`: its `boo1…` (or `tboo1…`) string, **never a `.boo` name**: a program reads 32 bytes, and a
+ *   name moves with its owner;
+ * - `name`: a `.boo` label (`"alice"`; `"alice.boo"` is accepted and written as its label);
+ * - `hash32`: 64 lowercase hex; `bytes`: lowercase hex of whole bytes (or a `Uint8Array` for either);
+ * - `text`: a string;
+ * - `option<T>`: `null` for none, `{ some: v }` for some (a bare `v` is read as some when `T` isn't itself an option);
+ * - `vec<T, n>`: an array.
+ *
+ * Decoding always returns the first form of each: bigints, lowercase hex, `{ some }`.
+ */
+export type ProgramValue = bigint | boolean | string | null | { some: ProgramValue } | ProgramValue[];
+
+/** Options of the ABI codec. */
+export interface ProgramValueOptions {
+  /**
+   * The chain's address prefix (`boo`, `tboo`). Encoding refuses an address under another prefix (another
+   * network's: refused, never converted); decoding writes addresses with it. Default: any known prefix
+   * when encoding, `boo` when decoding.
+   */
+  prefix?: string;
+}
+
+/**
+ * A value that isn't one of its type (encoding), or bytes that aren't a value of it (decoding). `where`
+ * names the place by position (`argument 2`, `argument 2, item 3`, `the value, inside some`), never by a
+ * name the program's deployer chose; `problem` is this SDK's words, quoting a value only through `shown()`.
+ */
+export class ProgramValueError extends Error {
+  constructor(readonly where: string, readonly problem: string) {
+    super(`${where}: ${problem}`);
+    this.name = "ProgramValueError";
+  }
+}
+
+const INTEGERS: Record<string, { bytes: number; signed: boolean }> = {
+  u8: { bytes: 1, signed: false },
+  u16: { bytes: 2, signed: false },
+  u32: { bytes: 4, signed: false },
+  u64: { bytes: 8, signed: false },
+  u128: { bytes: 16, signed: false },
+  i64: { bytes: 8, signed: true },
+  i128: { bytes: 16, signed: true },
+  fang: { bytes: 8, signed: false },
+};
+
+/** The bounds node/vm/src/interface.rs holds a type's `max` to: bytes and text 1 to 32,768, a vec 1 to 1,024. */
+const MAX_BOUND = { bytes: 32_768, text: 32_768, vec: 1_024 } as const;
+/** A `.boo` label as node/src/types.rs `normalize_name` leaves one: 3 to 32 of a–z, 0–9 and -, not starting or ending with -. */
+const LABEL = /^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$/;
+/** A lone surrogate: text that isn't Unicode, so it has no UTF-8 (TextEncoder would write U+FFFD in its place, silently). */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+const UTF8_IN = new TextEncoder();
+// `fatal`: bytes that aren't UTF-8 are refused, not replaced; `ignoreBOM`: a leading U+FEFF is the program's, kept as written.
+const UTF8_OUT = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+/** A type as a caller gives one: the closed vocabulary of `ProgramType`, bounded as an interface's are, at most four `option`/`vec` layers. */
+function typeArg(t: unknown, where: string, depth = 0): ProgramType {
+  const bad = (why: string): never => {
+    throw new ProgramValueError(where, `the type ${why}`);
+  };
+  if (depth > 4) bad("nests deeper than an interface type can (four option or vec layers)");
+  if (typeof t === "string") return SCALARS.has(t) ? t : bad(`${shown(t)} isn't one an interface can hold`);
+  if (t === null || typeof t !== "object" || Array.isArray(t) || Object.keys(t).length !== 1) return bad(`${shown(t)} isn't one an interface can hold`);
+  const [key, v] = Object.entries(t)[0];
+  const bound = (n: unknown, most: number) => (typeof n === "number" && Number.isInteger(n) && n >= 1 && n <= most ? n : bad(`${key}'s bound ${shown(n)} isn't 1 to ${most}`));
+  if (key === "bytes") return { bytes: bound(v, MAX_BOUND.bytes) };
+  if (key === "text") return { text: bound(v, MAX_BOUND.text) };
+  if (key === "option") return { option: typeArg(v, where, depth + 1) };
+  if (key === "vec" && Array.isArray(v) && v.length === 2) return { vec: [typeArg(v[0], where, depth + 1), bound(v[1], MAX_BOUND.vec)] };
+  return bad(`${shown(t)} isn't one an interface can hold`);
+}
+
+const isSome = (v: unknown): v is { some: unknown } => v !== null && typeof v === "object" && !Array.isArray(v) && !(v instanceof Uint8Array) && Object.keys(v).length === 1 && Object.hasOwn(v, "some");
+
+/** A whole number of an integer type (or `fang`'s drops), range-checked. */
+function integerArg(type: string, v: unknown, where: string): bigint {
+  const { bytes, signed } = INTEGERS[type];
+  let n: bigint;
+  if (typeof v === "bigint") n = v;
+  else if (typeof v === "number") {
+    // A number is FANG to `parseFang` and drops to a u64: neither is guessed.
+    if (type === "fang") throw new ProgramValueError(where, `an amount is a bigint of drops or a decimal string of FANG ("1.5"), not the number ${shown(v)}`);
+    if (!Number.isSafeInteger(v)) throw new ProgramValueError(where, `${shown(v)} isn't a whole number JavaScript holds exactly: pass a bigint or a decimal string`);
+    n = BigInt(v);
+  } else if (typeof v === "string" && type === "fang") {
+    // An amount of FANG, as everywhere in this SDK ("1.5"); drops are a bigint.
+    if (!/^\d{1,20}(\.\d{1,9})?$/.test(v)) throw new ProgramValueError(where, `an amount of FANG is a decimal string with at most 9 decimals ("1.5"), or a bigint of drops, not ${shown(v)}`);
+    n = parseFang(v);
+  } else if (typeof v === "string" && /^-?(0|[1-9]\d{0,39})$/.test(v) && v !== "-0") n = BigInt(v);
+  else throw new ProgramValueError(where, `${type} is a whole number (a bigint, or a decimal string), not ${shown(v)}`);
+  const bits = BigInt(bytes * 8);
+  const min = signed ? -(1n << (bits - 1n)) : 0n;
+  const max = signed ? (1n << (bits - 1n)) - 1n : (1n << bits) - 1n;
+  if (n < min || n > max) throw new ProgramValueError(where, `${n} is outside ${type === "fang" ? "an amount of drops (a u64)" : type}'s range, ${min} to ${max}`);
+  return n;
+}
+
+/** Bytes given as a `Uint8Array` or lowercase hex of whole bytes. */
+function bytesArg(v: unknown, where: string, what: string): Uint8Array {
+  if (v instanceof Uint8Array) return v;
+  if (typeof v === "string" && v.length % 2 === 0 && /^[0-9a-f]*$/.test(v)) return hexToBytes(v);
+  throw new ProgramValueError(where, `${what} is lowercase hex of whole bytes (or a Uint8Array), not ${shown(v)}`);
+}
+
+/** A u32, little-endian. */
+const u32le = (n: number) => Uint8Array.of(n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff);
+
+function writeValue(out: Uint8Array[], type: ProgramType, v: unknown, where: string, opts: ProgramValueOptions): void {
+  if (typeof type === "string") {
+    if (Object.hasOwn(INTEGERS, type)) {
+      const { bytes, signed } = INTEGERS[type];
+      let n = integerArg(type, v, where);
+      if (signed && n < 0n) n += 1n << BigInt(bytes * 8);
+      const b = new Uint8Array(bytes);
+      for (let i = 0; i < bytes; i++, n >>= 8n) b[i] = Number(n & 0xffn);
+      out.push(b);
+      return;
+    }
+    switch (type) {
+      case "bool":
+        if (typeof v !== "boolean") throw new ProgramValueError(where, `a bool is true or false, not ${shown(v)}`);
+        out.push(Uint8Array.of(v ? 1 : 0));
+        return;
+      case "address": {
+        if (typeof v === "string" && (/\.boo$/i.test(v.trim()) || !v.includes("1"))) throw new ProgramValueError(where, `a program takes an address (boo1… or tboo1…), never a .boo name, which moves with its owner: ${shown(v)} isn't one`);
+        if (!isAddr(v)) throw new ProgramValueError(where, `${shown(v)} isn't an address (boo1… or tboo1…, lowercase, with its checksum)`);
+        const { prefix, words } = bech32m.decode(v as `${string}1${string}`);
+        if (opts.prefix !== undefined && prefix !== opts.prefix) throw new ProgramValueError(where, `that's an address on another network (${prefix}1…): addresses here start with ${opts.prefix}1`);
+        out.push(Uint8Array.from(bech32m.fromWords(words)));
+        return;
+      }
+      case "hash32": {
+        const b = bytesArg(v, where, "a hash32");
+        if (b.length !== 32) throw new ProgramValueError(where, `a hash32 is 32 bytes (64 hex characters), not ${b.length}`);
+        out.push(b);
+        return;
+      }
+      case "name": {
+        if (typeof v !== "string") throw new ProgramValueError(where, `a name is a .boo label, not ${shown(v)}`);
+        const label = v.toLowerCase().replace(/\.boo$/, "");
+        if (!LABEL.test(label)) throw new ProgramValueError(where, `a name is 3 to 32 of a–z, 0–9 and dashes, not starting or ending with one: ${shown(v)} isn't`);
+        out.push(u32le(label.length), UTF8_IN.encode(label));
+        return;
+      }
+    }
+    throw new ProgramValueError(where, `the type ${shown(type)} isn't one an interface can hold`);
+  }
+  if ("text" in type) {
+    if (typeof v !== "string") throw new ProgramValueError(where, `text is a string, not ${shown(v)}`);
+    if (LONE_SURROGATE.test(v)) throw new ProgramValueError(where, "the text holds a lone surrogate, which isn't Unicode and has no UTF-8");
+    const b = UTF8_IN.encode(v);
+    if (b.length > type.text) throw new ProgramValueError(where, `text of at most ${type.text} bytes of UTF-8, and this is ${b.length}`);
+    out.push(u32le(b.length), b);
+    return;
+  }
+  if ("bytes" in type) {
+    const b = bytesArg(v, where, "bytes");
+    if (b.length > type.bytes) throw new ProgramValueError(where, `at most ${type.bytes} bytes, and this is ${b.length}`);
+    out.push(u32le(b.length), b);
+    return;
+  }
+  if ("option" in type) {
+    if (v === null || v === undefined) {
+      out.push(Uint8Array.of(0));
+      return;
+    }
+    const nested = typeof type.option === "object" && "option" in type.option;
+    if (!isSome(v) && nested) throw new ProgramValueError(where, "an option of an option is null (none) or { some: … }");
+    out.push(Uint8Array.of(1));
+    writeValue(out, type.option, isSome(v) ? v.some : v, `${where}, inside some`, opts);
+    return;
+  }
+  const [of, max] = type.vec;
+  if (!Array.isArray(v)) throw new ProgramValueError(where, `a vec is an array, not ${shown(v)}`);
+  if (v.length > max) throw new ProgramValueError(where, `a vec of at most ${max} items, and this has ${v.length}`);
+  out.push(u32le(v.length));
+  v.forEach((x, i) => writeValue(out, of, x, `${where}, item ${i + 1}`, opts));
+}
+
+const joined = (parts: Uint8Array[]) => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+};
+
+/** One value of `type`, Borsh-encoded (`ProgramValueError` when it isn't one of the type). */
+export function encodeProgramValue(type: ProgramType, value: unknown, opts: ProgramValueOptions = {}): Uint8Array {
+  const parts: Uint8Array[] = [];
+  writeValue(parts, typeArg(type, "the value"), value, "the value", opts);
+  return joined(parts);
+}
+
+/**
+ * A call's input (lowercase hex): its arguments' values, in the interface's order, each Borsh-encoded and
+ * back to back. `args` are a method's (`ProgramMethod.args`: only their types are read, never their names),
+ * `values` one for each. Refused (`ProgramValueError`) when a value isn't of its type, a count differs, or
+ * the input passes the 32 KiB a call may carry.
+ */
+export function encodeProgramInput(args: readonly { type: ProgramType }[], values: readonly unknown[], opts: ProgramValueOptions = {}): string {
+  if (!Array.isArray(args) || !Array.isArray(values)) throw new ProgramValueError("the input", "takes a list of arguments and a list of values");
+  if (values.length !== args.length) throw new ProgramValueError("the input", `the method takes ${args.length} argument${args.length === 1 ? "" : "s"}, and ${values.length} ${values.length === 1 ? "was" : "were"} given`);
+  const parts: Uint8Array[] = [];
+  args.forEach((a, i) => writeValue(parts, typeArg(a?.type, `argument ${i + 1}`), values[i], `argument ${i + 1}`, opts));
+  const input = joined(parts);
+  if (input.length > MAX_PROGRAM_INPUT_BYTES) throw new ProgramValueError("the input", `is ${input.length} bytes, past the ${MAX_PROGRAM_INPUT_BYTES} a call may carry`);
+  return bytesToHex(input);
+}
+
+/** Reads Borsh values from bytes, refusing (`ProgramValueError`) whatever isn't one. */
+class ValueReader {
+  at = 0;
+  constructor(readonly bytes: Uint8Array, readonly prefix: string) {}
+
+  take(n: number, where: string): Uint8Array {
+    if (this.at + n > this.bytes.length) throw new ProgramValueError(where, `the bytes end ${this.at + n - this.bytes.length} short of the value (${n} needed at byte ${this.at})`);
+    const b = this.bytes.subarray(this.at, this.at + n);
+    this.at += n;
+    return b;
+  }
+
+  u32(where: string): number {
+    const b = this.take(4, where);
+    return (b[0] | (b[1] << 8) | (b[2] << 16)) + b[3] * 0x1000000;
+  }
+
+  value(type: ProgramType, where: string): ProgramValue {
+    if (typeof type === "string") {
+      if (Object.hasOwn(INTEGERS, type)) {
+        const { bytes, signed } = INTEGERS[type];
+        const b = this.take(bytes, where);
+        let n = 0n;
+        for (let i = bytes - 1; i >= 0; i--) n = (n << 8n) | BigInt(b[i]);
+        if (signed && b[bytes - 1] & 0x80) n -= 1n << BigInt(bytes * 8);
+        return n;
+      }
+      switch (type) {
+        case "bool": {
+          const b = this.take(1, where)[0];
+          if (b > 1) throw new ProgramValueError(where, `a bool is the byte 0 or 1, not ${b}`);
+          return b === 1;
+        }
+        case "address":
+          return bech32m.encode(this.prefix, bech32m.toWords(this.take(32, where)));
+        case "hash32":
+          return bytesToHex(this.take(32, where));
+        case "name": {
+          const label = this.text(32, where, "a name");
+          if (!LABEL.test(label)) throw new ProgramValueError(where, `${shown(label)} isn't a .boo label`);
+          return label;
+        }
+      }
+      throw new ProgramValueError(where, `the type ${shown(type)} isn't one an interface can hold`);
+    }
+    if ("text" in type) return this.text(type.text, where, "text");
+    if ("bytes" in type) {
+      const n = this.u32(where);
+      if (n > type.bytes) throw new ProgramValueError(where, `says ${n} bytes, past its type's ${type.bytes}`);
+      return bytesToHex(this.take(n, where));
+    }
+    if ("option" in type) {
+      const tag = this.take(1, where)[0];
+      if (tag === 0) return null;
+      if (tag !== 1) throw new ProgramValueError(where, `an option starts with the byte 0 (none) or 1 (some), not ${tag}`);
+      return { some: this.value(type.option, `${where}, inside some`) };
+    }
+    const [of, max] = type.vec;
+    const n = this.u32(where);
+    if (n > max) throw new ProgramValueError(where, `says ${n} items, past its type's ${max}`);
+    const items: ProgramValue[] = [];
+    for (let i = 0; i < n; i++) items.push(this.value(of, `${where}, item ${i + 1}`));
+    return items;
+  }
+
+  text(max: number, where: string, what: string): string {
+    const n = this.u32(where);
+    if (n > max) throw new ProgramValueError(where, `says ${n} bytes of ${what}, past its type's ${max}`);
+    const b = this.take(n, where);
+    try {
+      return UTF8_OUT.decode(b);
+    } catch {
+      throw new ProgramValueError(where, `the ${what} isn't UTF-8`);
+    }
+  }
+
+  end(where: string) {
+    const left = this.bytes.length - this.at;
+    if (left !== 0) throw new ProgramValueError(where, `${left} byte${left === 1 ? "" : "s"} left over after the value`);
+  }
+}
+
+function readerOf(data: unknown, opts: ProgramValueOptions, where: string): ValueReader {
+  const prefix = opts.prefix ?? "boo";
+  if (prefix !== "boo" && prefix !== "tboo") throw new ProgramValueError(where, `${shown(prefix)} isn't an address prefix this SDK knows`);
+  return new ValueReader(bytesArg(data, where, "the data"), prefix);
+}
+
+/**
+ * A value of `type` from its Borsh bytes (a `Uint8Array` or lowercase hex): all of them, or
+ * `ProgramValueError`. `type` `null` (a method that returns nothing) reads no bytes. What a view or a call
+ * returned is the program's claim, and its text a stranger's: show it as data.
+ */
+export function decodeProgramValue(type: ProgramType | null, data: Uint8Array | string, opts: ProgramValueOptions = {}): ProgramValue {
+  const r = readerOf(data, opts, "the value");
+  const v = type === null ? null : r.value(typeArg(type, "the value"), "the value");
+  r.end("the value");
+  return v;
+}
+
+/** A call's input read back through its method's arguments (`encodeProgramInput`'s inverse): all of the bytes, or `ProgramValueError`. */
+export function decodeProgramInput(args: readonly { type: ProgramType }[], data: Uint8Array | string, opts: ProgramValueOptions = {}): ProgramValue[] {
+  const r = readerOf(data, opts, "the input");
+  const out = args.map((a, i) => r.value(typeArg(a?.type, `argument ${i + 1}`), `argument ${i + 1}`));
+  r.end("the input");
+  return out;
+}
+
+/**
+ * Whether two values are the same value (bigints by value, hex and strings exactly, `null` and `{ some }`
+ * apart): what a wallet holds the input it built to, decoded back, before it signs (PRG 11.2).
+ */
+export function sameProgramValue(a: ProgramValue, b: ProgramValue): boolean {
+  if (Array.isArray(a) || Array.isArray(b)) return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => sameProgramValue(x, b[i]));
+  if (isSome(a) || isSome(b)) return isSome(a) && isSome(b) && sameProgramValue(a.some as ProgramValue, b.some as ProgramValue);
+  return a === b;
 }

@@ -6,8 +6,8 @@
 // multisig; names active, expired, offered and reserved; a stranger's phishing memos on a creator's
 // page, one on a dust payment. Strangers' text (memos, titles, labels, reasons, links) carries
 // markup and `javascript:` links, which must only ever show as text.
-import { interfaceHash, parseFang, proposal, versionDigest, wasmHash } from "@blockula/sdk";
-import { addressOf, OTHER_VALIDATOR, VALIDATOR, type MockNode } from "./mock-node";
+import { decodeProgramInput, encodeProgramValue, interfaceHash, methodSelector, parseFang, proposal, versionDigest, wasmHash } from "@blockula/sdk";
+import { addressOf, OTHER_VALIDATOR, PROGRAMS_ON, VALIDATOR, type MockNode } from "./mock-node";
 
 const F = 10n ** 9n;
 const fang = (s: string) => parseFang(s);
@@ -36,6 +36,61 @@ export const GUESTBOOK_SNEAKY = "hello\u202edlrow\u0007 there";
 export const TRICKORTREAT = addressOf("ca".repeat(32));
 /** A deployed program (protocol v2). */
 export const PROGRAM = addressOf("e1".repeat(32));
+/** A deployed program a wallet can call (`addCallable`): a record the SDK's checks pass, with views and calls. */
+export const CALLABLE = addressOf("e2".repeat(32));
+/** What its `greeting` view returns: a stranger's text, with markup, a bidi override and a control character. */
+export const HOSTILE_GREETING = `Welcome! <img src=x onerror="window.__pwned=7"> ‮eman.boo‬ verify at https://blockula-help.example\u0007`;
+
+/**
+ * A program a wallet can call, on a chain with programs on: a registry of labels. Its views are `count() → u64`,
+ * `greeting() → text(200)` (a stranger's text: `HOSTILE_GREETING`) and `lookup(label: text(32)) → option<address>`; its
+ * calls are `register(label: text(32), handle: option<text(32)>, friends: vec<address, 3>) → u64`, which writes (it bonds
+ * 0.0032 FANG, so it traps at a storage limit below that) and returns the new count, and `tip(note: text(64))`, payable.
+ * Its record is what node/src/programs/api.rs serves, so `client.program` checks it (selectors, digest).
+ */
+export function addCallable(node: MockNode, creator: string) {
+  const wasm = Uint8Array.from({ length: 1200 }, (_, i) => (i < 8 ? [0, 97, 115, 109, 1, 0, 0, 0][i] : (i * 7) % 251));
+  const iface = Uint8Array.from([1, 5, 9, 9, 9]);
+  const [wasm_hash, interface_hash] = [wasmHash(wasm), interfaceHash(iface)];
+  const method = (name: string, kind: "call" | "view", args: [string, unknown][], returns: unknown, payable = false) => ({ untrusted_name: name, selector: methodSelector(name), kind, payable, args: args.map(([n, type]) => ({ untrusted_name: n, type })), returns });
+  const label = (a: string) => node.label(a);
+  node.fuel = PROGRAMS_ON;
+  node.credit(CALLABLE, "0");
+  node.programs.set(CALLABLE, {
+    address: CALLABLE, creator: label(creator), created_at: 3, code: { wasm_hash, size: wasm.length, interface_hash }, version: 1, version_digest: versionDigest(CALLABLE, wasm_hash, interface_hash, 1),
+    authority: null, upgrade_delay_blocks: 0, policy: "open", upgradability: "immutable", accepts_transfers: false, balance: "0", balance_display: "0 FANG",
+    storage: { items: 2, bytes: 64, deposit: "6400000", sponsored: "0" }, record_deposit: "25600000", record_payer: label(creator),
+    methods: [
+      method("count", "view", [], "u64"),
+      method("greeting", "view", [], { text: 200 }),
+      method("lookup", "view", [["label", { text: 32 }]], { option: "address" }),
+      method("register", "call", [["label", { text: 32 }], ["handle", { option: { text: 32 } }], ["friends", { vec: ["address", 3] }]], "u64"),
+      method("tip", "call", [["note", { text: 64 }]], null, true),
+    ],
+    proof_path: `/api/proof/66/${Buffer.from(CALLABLE).toString("hex")}`,
+  });
+  node.accountExtra.set(CALLABLE, { program: { creator: label(creator), created_at: 3, version_digest: versionDigest(CALLABLE, wasm_hash, interface_hash, 1), upgradability: "immutable", accepts_transfers: false, link: `/api/program/${CALLABLE}` } });
+  const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
+  const labels = new Map<string, string>([["darkoh", creator]]);
+  node.views.set(CALLABLE, (m, input) => {
+    if (m === "count") return { ok: true, data: hex(encodeProgramValue("u64", BigInt(labels.size))) };
+    if (m === "greeting") return { ok: true, data: hex(encodeProgramValue({ text: 200 }, HOSTILE_GREETING)) };
+    if (m === "lookup") {
+      const [l] = decodeProgramInput([{ type: { text: 32 } }], input);
+      const owner = labels.get(String(l).toLowerCase());
+      return { ok: true, data: hex(encodeProgramValue({ option: "address" }, owner ? { some: owner } : null)) };
+    }
+    return { ok: false, outcome: { ok: false, number: 1, code: "trapped", program: CALLABLE, trap: { number: 3, name: "unreachable" } } };
+  });
+  node.programRuns.set(CALLABLE, (call, from) => {
+    if (call.method === "tip") return { ok: true };
+    const [l] = decodeProgramInput([{ type: { text: 32 } }, { type: { option: { text: 32 } } }, { type: { vec: ["address", 3] } }], call.input);
+    const key = String(l).toLowerCase();
+    if (labels.has(key)) return { ok: false, outcome: { ok: false, number: 2, code: "aborted", program: CALLABLE, abort_code: 1, untrusted_message: `taken ${HOSTILE_GREETING}` } };
+    return { ok: true, bonded: 3_200_000n, data: hex(encodeProgramValue("u64", BigInt(labels.size + 1))), apply: () => void labels.set(key, from) };
+  });
+  return { wasm_hash, interface_hash, digest: versionDigest(CALLABLE, wasm_hash, interface_hash, 1) };
+}
 
 export const ADDR = {
   mina: addressOf("c2".repeat(32)),

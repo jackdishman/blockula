@@ -73,6 +73,19 @@ export function keyIdOfAddress(address: string) {
 interface MultisigPending { id: number; action: Json; summary: string; proposed_by: string; approvals: string[]; valid_approvals: number; created_at: number; expires_at: number; expired: boolean; superseded: string | null }
 interface MultisigRec extends Json { threshold: number; owners: { key_id: string; label: string | null }[]; pending: MultisigPending[] }
 
+/**
+ * A program's run, as the mock plays it: it returned `data` (hex; omitted: nothing) and its writes bonded `bonded`
+ * drops, or it failed with `outcome` (docs/PROGRAMS-V0.md §8.1's shape: `{ ok: false, number, code, … }`).
+ */
+export type ProgramRun = { ok: true; data?: string; bonded?: bigint; apply?: () => void } | { ok: false; outcome: Json };
+
+/** A chain with programs on, at their genesis prices (node/src/programs/params.rs): fuel schedule 0, the floor rate of 250 milli-drops per fuel. */
+export const PROGRAMS_ON: Json = {
+  status: "on", schedule: 0, load_base: 10_000, load_per_byte: 40, upload_base: 50_000, upload_per_byte: 71,
+  rate: 250, floor_rate: 250, suggested_rate: 250, max_tx_fuel: 10_000_000, max_block_fuel: 60_000_000, max_tx_code_bytes: 4_194_304,
+  state_bytes: 4096, state_soft_bytes: 1_073_741_824, storage_price: "100000", paused_until: null,
+};
+
 class HttpError extends Error {
   constructor(readonly status: number, message: string) {
     super(message);
@@ -147,6 +160,12 @@ export class MockNode {
   listsPrograms = true;
   codes = new Map<string, Json>();
   interfaces = new Map<string, Json>();
+  /** `/api/fees`' `fuel` section (node/src/programs/api.rs `fuel_json`): absent, as on a chain that never switched programs on, until a test sets it (`PROGRAMS_ON`). */
+  fuel: Json | null = null;
+  /** What a program's view methods return, by its address (`POST /api/program/{address}/view`); a node with none answers 403, as one that serves no views. */
+  views = new Map<string, (method: string, input: string) => ProgramRun>();
+  /** How a program's calls run, by its address: what they return, bond and pay out, or how they fail. A program without one applies every call and returns nothing. */
+  programRuns = new Map<string, (call: { method: string; input: string; value: bigint }, from: string) => ProgramRun>();
   /** Merged into `/api/validators` (v1's leaving, tombstoned, admission…). */
   validatorsExtra: Json = {};
   /**
@@ -456,6 +475,7 @@ export class MockNode {
     const shared = this.multisigs.get(tx.from) as MultisigRec | undefined;
     if (shared && key.role.type === "owner" && act.type !== "multisig_propose" && act.type !== "multisig_approve")
       throw new HttpError(400, `${this.label(tx.from).short} is a ${shared.threshold}-of-${this.ownerKeys(tx.from).length} multisig: propose this with multisig_propose`);
+    if (act.type === "call_program") return this.callProgram(tx, act, key, signer);
     const amount = act.type === "transfer" ? BigInt(act.amount) : 0n;
     if (a.balance < amount + fee) throw new HttpError(400, `insufficient balance: has ${formatFang(a.balance)}, needs ${formatFang(amount + fee)}`);
     let to: string | null = null;
@@ -642,6 +662,63 @@ export class MockNode {
     const signedTo = act.type === "transfer" || act.type === "award_hunt" || act.type === "transfer_name" ? act.to : act.type === "vouch" ? act.account : null;
     const toName = signedTo && !/^t?boo1/.test(signedTo) ? `${signedTo.replace(/\.boo$/, "")}.boo` : null;
     return this.record({ tx, kind: act.type, from: tx.from, to, toName, amount: act.type === "transfer" ? amount : null, fee, maxFee: fee, tip: BigInt(tx.tip ?? 0), signer, nonce: tx.nonce, memo: tx.memo, summary });
+  }
+
+  /**
+   * A `call_program`, as node/src/programs admits and runs one: only an owner key signs it, it binds the
+   * program's version digest (a call to a program that changed is refused, uncharged), it sends FANG only to a
+   * payable method, and its fee covers the fuel it reserves at 250 milli-drops per fuel. In the block, the run
+   * is `programRuns`' (its writes past the storage limit trap): applied, it moves its value and bonds its
+   * writes; failed, it costs only its fee. Its receipt is node/src/programs/tx_json.rs's shape. One call, no bindings.
+   */
+  private callProgram(tx: Tx, act: Extract<Action, { type: "call_program" }>, key: KeyRec, signer: string) {
+    if (!this.fuel) throw new HttpError(400, "programs aren't on: this chain never switched the programs feature on");
+    if (this.fuel.status === "paused") throw new HttpError(400, `programs are paused until block ${this.fuel.paused_until}`);
+    if (key.role.type !== "owner") throw new HttpError(400, "session keys can only send transfers");
+    if (act.calls.length !== 1 || act.bindings.length) throw new HttpError(400, "the mock node runs one call and no bindings");
+    const call = act.calls[0];
+    const p = this.programs.get(call.program) as (Json & { version: number; version_digest: string; code: { size: number }; balance: string; methods: { untrusted_name: string; kind: string; payable: boolean }[] | null }) | undefined;
+    if (!p) throw new HttpError(400, `no program has the address ${call.program}`);
+    if (call.version_digest !== p.version_digest) throw new HttpError(400, `call 1 binds version digest ${call.version_digest.slice(0, 16)}…, but the program's is ${p.version_digest.slice(0, 16)}… (version ${p.version})`);
+    const m = (p.methods ?? []).find((x) => x.untrusted_name === call.method);
+    if (!m || m.kind !== "call") throw new HttpError(400, `the program's interface has no call method ${call.method}`);
+    const value = BigInt(call.value);
+    if (value > 0n && !m.payable) throw new HttpError(400, `${call.method} isn't payable`);
+    if (value > 0n && this.fuel.status === "exit_only") throw new HttpError(400, "programs are exit-only: a call may not send FANG");
+    const fee = BigInt(tx.fee);
+    const tip = BigInt(tx.tip ?? 0);
+    const load = 10_000 + 40 * Number(p.code.size);
+    const fuelFee = (250n * BigInt(act.fuel_limit + load)) / 1000n;
+    if (fee < fuelFee + tip) throw new HttpError(400, `fee too low: the fuel it reserves alone costs ${formatFang(fuelFee)}`);
+    const a = this.acct(tx.from);
+    let run = this.programRuns.get(call.program)?.({ method: call.method, input: call.input, value }, tx.from) ?? ({ ok: true } as ProgramRun);
+    if (run.ok && (run.bonded ?? 0n) > BigInt(act.storage_limit)) run = { ok: false, outcome: { ok: false, number: 1, code: "trapped", program: call.program, trap: { number: 25, name: "storage_limit" } } };
+    const bonded = run.ok ? (run.bonded ?? 0n) : 0n;
+    const debit = fee + (run.ok ? value + bonded : 0n);
+    if (a.balance < debit) throw new HttpError(400, `insufficient balance: has ${formatFang(a.balance)}, needs ${formatFang(debit)}`);
+    if (run.ok) run.apply?.();
+    a.balance -= debit;
+    a.nonce += 1;
+    if (run.ok && value > 0n) {
+      this.acct(call.program).balance += value;
+      p.balance = (BigInt(p.balance) + value).toString();
+      p.balance_display = formatFang(BigInt(p.balance));
+    }
+    this.submitted.push(tx);
+    const changes = run.ok ? [{ account: tx.from, change: (-(value + bonded)).toString() }, { account: call.program, change: value.toString() }].filter((c) => c.change !== "0") : [];
+    const section = {
+      version: 1, kind: "call", outcome: run.ok ? { ok: true } : run.outcome,
+      facts: {
+        balance_changes: changes, storage: { bytes_delta: Number(bonded / 100_000n), bonded: bonded.toString(), refunded: "0" },
+        outside_vm: { record_deposit: "0", upload_deposit: "0", account_creation_fee: "0", total: "0" }, burned_by_programs: "0",
+        fuel: { limit: act.fuel_limit, load, used: Math.min(act.fuel_limit, 41_000), reserved: act.fuel_limit + load, rate: 250 },
+        fee: { bytes: (fee - fuelFee - tip).toString(), fuel: fuelFee.toString(), tip: tip.toString() }, created: null, upload: null,
+      },
+      claims: { return_data: run.ok && run.data !== undefined ? [{ program: call.program, untrusted_method: call.method, value: value.toString(), data: run.data }] : [], events: [], omitted: null },
+    };
+    const summary = `${this.label(tx.from).short} called program ${this.label(call.program).short}${value > 0n ? ` with ${formatFang(value)}` : ""}`;
+    const failed = run.ok ? {} : { status: "failed" as const, error: `program ${this.label(call.program).short} ${String(run.outcome.code)}` };
+    return this.record({ tx, kind: "call_program", from: tx.from, to: null, amount: null, fee, maxFee: fee, tip, signer, nonce: tx.nonce, memo: tx.memo, summary, names: [call.program], program: section, ...failed });
   }
 
   /** The account's owner key ids, as node/src/governance.rs `owner_keys`. */
@@ -835,6 +912,15 @@ export class MockNode {
         const p = this.programs.get(m[1]);
         return p ? reply(200, { ...p, height: this.height }) : reply(404, { error: "no program has this address" });
       }
+      if (req.method() === "POST" && (m = path.match(/^\/program\/(t?boo1[0-9a-z]+)\/view$/))) {
+        // node/src/programs/api.rs `view`: run as of the newest block; 403 from a node that serves no views.
+        if (!this.programs.has(m[1])) return reply(404, { error: "no program has this address" });
+        const views = this.views.get(m[1]);
+        if (!views) return reply(403, { error: "this node doesn't run views" });
+        const { method, input } = JSON.parse(body ?? "{}") as { method: string; input?: string };
+        const run = views(method, input ?? "");
+        return reply(200, run.ok ? { ok: true, outcome: { ok: true }, return_data: run.data ?? "", fuel_used: 41_000, height: this.height } : { ok: false, outcome: run.outcome, return_data: null, fuel_used: 1, height: this.height });
+      }
       if (req.method() === "GET" && (m = path.match(/^\/code\/([0-9a-f]{64})$/))) {
         const c = this.codes.get(m[1]);
         return c ? reply(200, { ...c, height: this.height }) : reply(404, { error: "no code has this hash" });
@@ -883,7 +969,7 @@ export class MockNode {
       if (req.method() === "GET" && this.governance && path.startsWith("/proposals")) return reply(200, { count: this.proposals.length, next_id: this.proposals.length, council_active: true, spending_open: false, params: { supermajority_bps: 6667, voting_blocks: 604_800, timelock_blocks: 172_800, lock_period_blocks: 604_800 }, proposals: this.proposals.map((p) => this.proposalView(p)) });
       if (req.method() === "GET" && path === "/params") return reply(200, { params: { unbonding_blocks: "1814400", lock_period_blocks: "604800", proposal_deposit: (1000n * 10n ** 9n).toString(), max_validators: "31", multisig_expiry_blocks: "604800" }, genesis: { block_time_ms: 1000, epoch_blocks: 3600, address_prefix: "tboo", epochs_per_year: 8766 }, issuance: { year: 1, rate_ppm: 60000 } });
       // The base fee at its genesis floor (node/src/api.rs `fees`): what Wallet.build prices at.
-      if (req.method() === "GET" && path === "/fees") return reply(200, { height: this.height, lag: 17, rate_scale: 1000, slots: [], suggested: { flat: "10000", rate: "10000" }, floor: { flat: "10000", per_byte: "10" }, target_fullness_bps: 5000, max_change_bps: 1250, account_creation_fee: "100000000", account_creation_fee_display: "0.1 FANG" });
+      if (req.method() === "GET" && path === "/fees") return reply(200, { height: this.height, lag: 17, rate_scale: 1000, slots: [], suggested: { flat: "10000", rate: "10000" }, floor: { flat: "10000", per_byte: "10" }, target_fullness_bps: 5000, max_change_bps: 1250, account_creation_fee: "100000000", account_creation_fee_display: "0.1 FANG", ...(this.fuel ? { fuel: this.fuel } : {}) });
       return reply(404, { error: `mock node: no route for ${req.method()} ${path}` });
     } catch (e) {
       return reply(e instanceof HttpError ? e.status : 500, { error: e instanceof Error ? e.message : String(e) });

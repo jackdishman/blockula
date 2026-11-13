@@ -1,0 +1,441 @@
+{
+  "description": "The ABI's Borsh encoding (node/src/programs/abi_vectors.rs), for sdk-ts's codec (sdk-ts/src/programs.ts encodeProgramInput, decodeProgramValue; docs/PROGRAMS-V0.md §3.2). Every hex is the borsh crate's. Values: integers and drops as decimal strings, addresses as boo1…, hash32 and bytes as hex, an option as null or { some }. Regenerate: cargo test --manifest-path node/Cargo.toml programs::abi_vectors::write_abi_vectors -- --ignored",
+  "inputs": [
+    {
+      "args": [],
+      "hex": "",
+      "label": "no arguments",
+      "values": []
+    },
+    {
+      "args": [
+        "u64",
+        "address"
+      ],
+      "hex": "0100000000000000ab69b25473cf117573037e7702f8ab644107dd24a65ef646616c8c53e835368e",
+      "label": "escrow's open(id: u64, seller: address), as the recorded call carried it",
+      "values": [
+        "1",
+        "boo14d5my4rneugh2ucr0ems979tv3qs0hfy5e00v3npdjx986p4x68qsfwvtm"
+      ]
+    },
+    {
+      "args": [
+        "address",
+        "u64"
+      ],
+      "hex": "24f6e6fd930a9d10680705972cf647232e1a63d8ce9ad28298b800205185a6b6fa00000000000000",
+      "label": "token's transfer(to: address, amount: u64)",
+      "values": [
+        "boo1ynmwdlvnp2w3q6q8qktjeaj8yvhp5c7ce6dd9q5chqqzq5v956mqla75w9",
+        "250"
+      ]
+    },
+    {
+      "args": [
+        {
+          "text": 32
+        },
+        {
+          "option": {
+            "text": 32
+          }
+        },
+        {
+          "option": {
+            "text": 200
+          }
+        }
+      ],
+      "hex": "060000004461726b6f6801080000006461726b6f685f7800",
+      "label": "register(label: text(32), handle: option<text(32)>, tweet: option<text(200)>)",
+      "values": [
+        "Darkoh",
+        {
+          "some": "darkoh_x"
+        },
+        null
+      ]
+    },
+    {
+      "args": [
+        "bool",
+        "fang",
+        "name",
+        "hash32",
+        {
+          "bytes": 4
+        },
+        "i128"
+      ],
+      "hex": "0105000000000000000300000062617407070707070707070707070707070707070707070707070707070707070707070100000009fdffffffffffffffffffffffffffffff",
+      "label": "every kind once",
+      "values": [
+        true,
+        "5",
+        "bat",
+        "0707070707070707070707070707070707070707070707070707070707070707",
+        "09",
+        "-3"
+      ]
+    }
+  ],
+  "refused": [
+    {
+      "hex": "02",
+      "label": "a bool of 2",
+      "type": "bool"
+    },
+    {
+      "hex": "0201",
+      "label": "an option tagged 2",
+      "type": {
+        "option": "u8"
+      }
+    },
+    {
+      "hex": "02000000c328",
+      "label": "text that isn't UTF-8",
+      "type": {
+        "text": 32
+      }
+    },
+    {
+      "hex": "05000000616263",
+      "label": "text cut short",
+      "type": {
+        "text": 32
+      }
+    },
+    {
+      "hex": "01000000000000",
+      "label": "a u64 of 7 bytes",
+      "type": "u64"
+    },
+    {
+      "hex": "0100",
+      "label": "a byte left over",
+      "type": "u8"
+    },
+    {
+      "hex": "050000000102",
+      "label": "a vec that says 5 items and holds 2",
+      "type": {
+        "vec": [
+          "u8",
+          8
+        ]
+      }
+    },
+    {
+      "hex": "ababababababababababababababababababababababababababababababab",
+      "label": "an address of 31 bytes",
+      "type": "address"
+    }
+  ],
+  "values": [
+    {
+      "hex": "00",
+      "label": "u8 0",
+      "type": "u8",
+      "value": "0"
+    },
+    {
+      "hex": "ff",
+      "label": "u8 255",
+      "type": "u8",
+      "value": "255"
+    },
+    {
+      "hex": "0102",
+      "label": "u16 513",
+      "type": "u16",
+      "value": "513"
+    },
+    {
+      "hex": "ffffffff",
+      "label": "u32 max",
+      "type": "u32",
+      "value": "4294967295"
+    },
+    {
+      "hex": "0100000000000000",
+      "label": "u64 1",
+      "type": "u64",
+      "value": "1"
+    },
+    {
+      "hex": "ffffffffffffffff",
+      "label": "u64 max",
+      "type": "u64",
+      "value": "18446744073709551615"
+    },
+    {
+      "hex": "00000000000000000100000000000000",
+      "label": "u128 2^64",
+      "type": "u128",
+      "value": "18446744073709551616"
+    },
+    {
+      "hex": "ffffffffffffffffffffffffffffffff",
+      "label": "u128 max",
+      "type": "u128",
+      "value": "340282366920938463463374607431768211455"
+    },
+    {
+      "hex": "ffffffffffffffff",
+      "label": "i64 -1",
+      "type": "i64",
+      "value": "-1"
+    },
+    {
+      "hex": "0000000000000080",
+      "label": "i64 min",
+      "type": "i64",
+      "value": "-9223372036854775808"
+    },
+    {
+      "hex": "ffffffffffffff7f",
+      "label": "i64 max",
+      "type": "i64",
+      "value": "9223372036854775807"
+    },
+    {
+      "hex": "feffffffffffffffffffffffffffffff",
+      "label": "i128 -2",
+      "type": "i128",
+      "value": "-2"
+    },
+    {
+      "hex": "00000000000000000000000000000080",
+      "label": "i128 min",
+      "type": "i128",
+      "value": "-170141183460469231731687303715884105728"
+    },
+    {
+      "hex": "01",
+      "label": "bool true",
+      "type": "bool",
+      "value": true
+    },
+    {
+      "hex": "00",
+      "label": "bool false",
+      "type": "bool",
+      "value": false
+    },
+    {
+      "hex": "002f685900000000",
+      "label": "fang 1.5 FANG in drops",
+      "type": "fang",
+      "value": "1500000000"
+    },
+    {
+      "hex": "177c577d91cf59f1008512a5960e280ffc1889d74e10966fa6d6b9d12fbecc3c",
+      "label": "an address",
+      "type": "address",
+      "value": "boo1za79wlv3eavlzqy9z2jevr3gpl7p3zwhfcgfvmax66uazta7es7qsnegkt"
+    },
+    {
+      "hex": "05000000616c696365",
+      "label": "a name's label",
+      "type": "name",
+      "value": "alice"
+    },
+    {
+      "hex": "abababababababababababababababababababababababababababababababab",
+      "label": "a hash32",
+      "type": "hash32",
+      "value": "abababababababababababababababababababababababababababababababab"
+    },
+    {
+      "hex": "04000000000102ff",
+      "label": "bytes",
+      "type": {
+        "bytes": 8
+      },
+      "value": "000102ff"
+    },
+    {
+      "hex": "00000000",
+      "label": "no bytes",
+      "type": {
+        "bytes": 8
+      },
+      "value": ""
+    },
+    {
+      "hex": "0500000068656c6c6f",
+      "label": "text",
+      "type": {
+        "text": 32
+      },
+      "value": "hello"
+    },
+    {
+      "hex": "00000000",
+      "label": "empty text",
+      "type": {
+        "text": 32
+      },
+      "value": ""
+    },
+    {
+      "hex": "0b00000068c3a96c6c6f20f09f91bb",
+      "label": "text of 7 characters and 11 bytes, at its bound",
+      "type": {
+        "text": 11
+      },
+      "value": "héllo 👻"
+    },
+    {
+      "hex": "05000000efbbbf6869",
+      "label": "text with a byte-order mark first",
+      "type": {
+        "text": 8
+      },
+      "value": "﻿hi"
+    },
+    {
+      "hex": "00",
+      "label": "option none",
+      "type": {
+        "option": "u64"
+      },
+      "value": null
+    },
+    {
+      "hex": "010700000000000000",
+      "label": "option some",
+      "type": {
+        "option": "u64"
+      },
+      "value": {
+        "some": "7"
+      }
+    },
+    {
+      "hex": "010100000078",
+      "label": "option of text",
+      "type": {
+        "option": {
+          "text": 32
+        }
+      },
+      "value": {
+        "some": "x"
+      }
+    },
+    {
+      "hex": "00",
+      "label": "option of an option: none",
+      "type": {
+        "option": {
+          "option": "bool"
+        }
+      },
+      "value": null
+    },
+    {
+      "hex": "0100",
+      "label": "option of an option: some none",
+      "type": {
+        "option": {
+          "option": "bool"
+        }
+      },
+      "value": {
+        "some": null
+      }
+    },
+    {
+      "hex": "010101",
+      "label": "option of an option: some some",
+      "type": {
+        "option": {
+          "option": "bool"
+        }
+      },
+      "value": {
+        "some": {
+          "some": true
+        }
+      }
+    },
+    {
+      "hex": "02000000177c577d91cf59f1008512a5960e280ffc1889d74e10966fa6d6b9d12fbecc3c24f6e6fd930a9d10680705972cf647232e1a63d8ce9ad28298b800205185a6b6",
+      "label": "vec of addresses",
+      "type": {
+        "vec": [
+          "address",
+          8
+        ]
+      },
+      "value": [
+        "boo1za79wlv3eavlzqy9z2jevr3gpl7p3zwhfcgfvmax66uazta7es7qsnegkt",
+        "boo1ynmwdlvnp2w3q6q8qktjeaj8yvhp5c7ce6dd9q5chqqzq5v956mqla75w9"
+      ]
+    },
+    {
+      "hex": "00000000",
+      "label": "empty vec",
+      "type": {
+        "vec": [
+          "u64",
+          4
+        ]
+      },
+      "value": []
+    },
+    {
+      "hex": "0200000001010000006100",
+      "label": "vec of options of text",
+      "type": {
+        "vec": [
+          {
+            "option": {
+              "text": 8
+            }
+          },
+          3
+        ]
+      },
+      "value": [
+        {
+          "some": "a"
+        },
+        null
+      ]
+    },
+    {
+      "hex": "01020000000102000000010200",
+      "label": "four layers",
+      "type": {
+        "option": {
+          "vec": [
+            {
+              "option": {
+                "vec": [
+                  "u8",
+                  2
+                ]
+              }
+            },
+            2
+          ]
+        }
+      },
+      "value": {
+        "some": [
+          {
+            "some": [
+              "1",
+              "2"
+            ]
+          },
+          null
+        ]
+      }
+    }
+  ]
+}
