@@ -65,6 +65,8 @@ test("every route fits a 390 px phone", async ({ page, node }) => {
     "/account/lucy.boo",
     `/account/${ADDR.stranger}`,
     `/block/${node.height - 2}`,
+    "/boo/vlad",
+    "/boo/lucy",
     "/trace/vlad.boo",
     "/name/castle",
     "/name/tomb",

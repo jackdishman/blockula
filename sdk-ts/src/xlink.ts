@@ -131,12 +131,32 @@ export function xLinkCode(chain: XLinkChain, account: string, handle: string): s
 }
 
 /**
- * The text to post: a line a person can read, then the code. `label` is how the account is shown
- * (its `.boo` name or address); only the code is checked. No `@`, `#`, `$` or link in it, so X
- * leaves the code as plain text.
+ * An account's page by its `.boo` name, on the chain's own node: `https://<node>/boo/<label>`
+ * (every node sends it on to the account's page in its wallet). Names are per chain, so the link
+ * is to that chain's node, never to blockula.app. `null` when there's nothing a stranger could
+ * open: no name, or a node that isn't on https (this machine, a private network).
  */
-export function xProofPost(code: string, label?: string): string {
-  return `Verifying my Blockula account${label ? ` ${label}` : ""}.\n\n${code}`;
+export function booProfileUrl(node: string, name: string | undefined | null): string | null {
+  const label = typeof name === "string" ? name.toLowerCase().replace(/\.boo$/, "") : "";
+  if (!/^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$/.test(label)) return null;
+  try {
+    const u = new URL(node);
+    if (u.protocol !== "https:" || u.username || u.password) return null;
+    return `${u.origin}${u.pathname.replace(/\/+$/, "")}/boo/${label}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The text to post: a line a person can read, then the code; only the code is checked. The one
+ * link in it is `profile` (`booProfileUrl`: the account's page on its chain), or blockula.app
+ * without one. It never writes the name as `vlad.boo`: `.boo` is also a web domain, so X would
+ * turn that into a link to a website that isn't Blockula's (and may be anyone's). No `@`, `#` or
+ * `$` either, so X leaves the code as plain text.
+ */
+export function xProofPost(code: string, profile?: string | null): string {
+  return `Verifying my Blockula account${profile ? `: ${profile}` : " on blockula.app."}\n\n${code}`;
 }
 
 /** X's own "write a post" page with `text` filled in (the user still presses Post). */

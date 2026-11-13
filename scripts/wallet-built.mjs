@@ -11,7 +11,7 @@ if (!existsSync(join(out, "index.html"))) {
   console.error("web/out/index.html is missing: the served build (BLOCKULA_SERVED=1) didn't export the wallet.");
   process.exit(1);
 }
-for (const route of ["tx", "account", "block", "name", "program", "programs", "hunt", "claim", "seance", "trace"]) {
+for (const route of ["tx", "account", "block", "name", "boo", "program", "programs", "hunt", "claim", "seance", "trace"]) {
   if (!existsSync(join(out, route, "_", "index.html"))) {
     console.error(`web/out/${route}/_/index.html is missing: every dynamic route needs its placeholder page (web/lib/route-params.ts).`);
     process.exit(1);

@@ -124,6 +124,11 @@ export default function AccountPage() {
             </Link>
           )}
           {!yours && <WatchButton who={a.account} />}
+          {name && (
+            <Link className="btn small ghost" href={to.boo(name)} data-testid="to-profile">
+              Profile
+            </Link>
+          )}
           <Link className="btn small ghost" href={to.trace(name ?? addr)}>
             Follow the money
           </Link>

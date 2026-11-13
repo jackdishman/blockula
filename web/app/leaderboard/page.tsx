@@ -93,7 +93,7 @@ function Row({ who, rank, children }: { who: Label; rank: number; children: Reac
         {named ? text[0].toUpperCase() : "·"}
       </Link>
       <div className="person-who">
-        <Link className="person-name" href={to.account(ref)} data-testid="board-who">
+        <Link className="person-name" href={named ? to.boo(ref) : to.account(ref)} data-testid="board-who">
           {named ? text : <span className="mono">{text}</span>}
         </Link>
       </div>

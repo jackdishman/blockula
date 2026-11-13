@@ -47,7 +47,7 @@ const receipt = (p: Page) => p.locator(".receipt .headline");
 test("no explorer page server-renders a style attribute (the CSP would block it)", async ({ request, node }) => {
   test.skip(!!process.env.E2E_DEV, "next dev relaxes the CSP");
   const w = seedWorld(node);
-  const paths = ["/explore", `/tx/${w.ids.sent}`, `/tx/${w.ids.dropped}`, "/account/vlad.boo", "/block/101", "/trace/vlad.boo", "/name/castle", "/name/tomb", "/programs", "/programs/hunts", "/programs/validators", "/programs/pool", "/programs/names", "/programs/accounts", "/boos", "/guestbook", "/leaderboard", "/hunt/0", "/claim/1", "/seance/2", "/governance", `/program/${PROGRAM}`, `/program/${w.wasm_hash}`, `/tx/${w.ids.programCall}`, `/tx/${w.ids.programFailed}`];
+  const paths = ["/explore", `/tx/${w.ids.sent}`, `/tx/${w.ids.dropped}`, "/account/vlad.boo", "/boo/vlad", "/boo/lucy", "/block/101", "/trace/vlad.boo", "/name/castle", "/name/tomb", "/programs", "/programs/hunts", "/programs/validators", "/programs/pool", "/programs/names", "/programs/accounts", "/boos", "/guestbook", "/leaderboard", "/hunt/0", "/claim/1", "/seance/2", "/governance", `/program/${PROGRAM}`, `/program/${w.wasm_hash}`, `/tx/${w.ids.programCall}`, `/tx/${w.ids.programFailed}`];
   for (const path of paths) {
     const res = await request.get(path);
     expect(res.status(), path).toBe(200);
@@ -88,6 +88,15 @@ test.describe("every explorer page", () => {
     await visit(page, "/account/nosuch.boo", (p) => p.getByRole("heading", { name: "nosuch.boo isn't anyone's" }), errors);
 
     await visit(page, "/trace/vlad.boo", (p) => p.getByRole("heading", { name: "Around vlad.boo" }), errors);
+
+    // A boo's profile: the name, its handles, what it won. The ledger stays on the account's page.
+    await visit(page, "/boo/lucy", (p) => p.getByRole("heading", { name: "lucy.boo" }), errors);
+    await expect(page.getByTestId("profile-hunts")).toContainText("jackdishman/blockula#12 for PR #7");
+    await expect(page.getByTestId("profile-account")).toHaveAttribute("href", /\/account\/lucy\.boo$/);
+    await visit(page, "/boo/Vlad.boo", (p) => p.getByRole("heading", { name: "vlad.boo" }), errors);
+    await expect(page.getByTestId("profile-ids").getByTestId("github")).toBeVisible();
+    await visit(page, "/boo/nosuch", (p) => p.getByRole("heading", { name: "nosuch.boo isn't anyone's" }), errors);
+    await visit(page, "/boo/no", (p) => p.getByRole("heading", { name: "That isn't a .boo name" }), errors);
   });
 
   test("a linked X handle shows on the account and its names, beside its proof post (docs/X-LINKING.md)", async ({ page, node }) => {
@@ -402,7 +411,7 @@ test.describe("every explorer page", () => {
     expect(balances).toEqual([...balances].sort((a, b) => b - a));
     // A named account's row says its name, never its address, as the link.
     const vladRow = list.getByTestId("person").filter({ has: page.locator(".person-name", { hasText: "vlad.boo" }) });
-    await expect(vladRow.locator(".person-name")).toHaveAttribute("href", /\/account\/vlad\.boo\/?$/);
+    await expect(vladRow.locator(".person-name")).toHaveAttribute("href", /\/boo\/vlad\/?$/);
     await expect(vladRow.getByTestId("person-send")).toHaveAttribute("href", /\/send\/?\?to=vlad\.boo$/);
 
     await page.getByTestId("sort-names").click();
@@ -467,7 +476,7 @@ test.describe("the explorer from an account holder's side", () => {
     await expect(rows.getByTestId("signature-from")).toHaveText(["renfield.boo", "lucy.boo", "mina.boo", `${w.stranger.slice(0, 10)}…${w.stranger.slice(-6)}`, "vlad.boo"]);
     await expect(page.getByTestId("guestbook-list")).not.toContainText("not a signature");
     // A name links by name, an unnamed sender by address; each row has its receipt.
-    await expect(rows.nth(4).getByTestId("signature-from")).toHaveAttribute("href", /\/account\/vlad\.boo\/?$/);
+    await expect(rows.nth(4).getByTestId("signature-from")).toHaveAttribute("href", /\/boo\/vlad\/?$/);
     await expect(rows.nth(3).getByTestId("signature-from")).toHaveAttribute("href", new RegExp(`/account/${w.stranger}/?$`));
     await expect(rows.nth(4).getByTestId("signature-tx")).toHaveAttribute("href", new RegExp(`/tx/${signed.vlad}/?$`));
     // Strangers' memos: markup as text, hiding characters gone, long ones cut short, none without a note.
@@ -516,7 +525,7 @@ test.describe("the explorer from an account holder's side", () => {
     await expect(page.getByTestId("players-net")).toHaveText(["+2", "+1", "-1", "-2"]);
     await expect(page.getByTestId("players-detail")).toHaveText(["1 play, won 3", "0 plays, won 1", "1 play, won 1", "2 plays, won 0"]);
     // Names link by name, unnamed accounts by address; memos are never shown.
-    await expect(page.getByTestId("signers-list").getByTestId("board-who").first()).toHaveAttribute("href", /\/account\/vlad\.boo\/?$/);
+    await expect(page.getByTestId("signers-list").getByTestId("board-who").first()).toHaveAttribute("href", /\/boo\/vlad\/?$/);
     await expect(page.getByTestId("signers-list").getByTestId("board-who").nth(4)).toHaveAttribute("href", new RegExp(`/account/${w.stranger}/?$`));
     await expect(page.locator("main")).not.toContainText("onerror");
     await expect(page.locator("main")).not.toContainText("treat!");
@@ -774,8 +783,8 @@ test.describe("the explorer from an account holder's side", () => {
     await page.getByLabel("Your X handle").fill("not a handle");
     await expect(page.getByTestId("x-step-code")).toContainText("An X handle is 1 to 15 letters, digits or underscores.");
     await page.getByLabel("Your X handle").fill("@BlockulaChain");
-    await expect(page.getByTestId("x-post-text")).toHaveText(`Verifying my Blockula account vlad.boo.\n\n${code}`);
-    await expect(page.getByRole("link", { name: "Post it on X ↗" })).toHaveAttribute("href", `https://x.com/intent/post?text=${encodeURIComponent(`Verifying my Blockula account vlad.boo.\n\n${code}`)}`);
+    await expect(page.getByTestId("x-post-text")).toHaveText(`Verifying my Blockula account on blockula.app.\n\n${code}`);
+    await expect(page.getByRole("link", { name: "Post it on X ↗" })).toHaveAttribute("href", `https://x.com/intent/post?text=${encodeURIComponent(`Verifying my Blockula account on blockula.app.\n\n${code}`)}`);
 
     // Step 2: a post under another handle is refused before anything is signed; the right one is recorded.
     const step = page.getByTestId("x-step-record");

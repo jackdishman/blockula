@@ -42,7 +42,7 @@ The newest record wins. `x-unlink:v1` ends the link.
 
 Open **Link X** on your account's page (or `/x` in the wallet, or "Link your X account" in the command palette).
 
-1. Type your handle. The page shows the post, with your code in it, and a button that opens X with it filled in.
+1. Type your handle. The page shows the post, with your code in it, and a button that opens X with it filled in. If your account has a `.boo` name, the post links its page on this chain (`https://<node>/boo/<name>`); it never writes the name as `you.boo`, which X would turn into a link to an unrelated website.
 2. Post it from that handle, as it is.
 3. Paste the post's link and press **Preview**, then **Sign & send**. It costs the fee and moves nothing.
 

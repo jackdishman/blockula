@@ -6,7 +6,7 @@ import { DEFAULT_TIP_CAP_MULTIPLE, KEY_POP_CONTEXT, PUBLIC_KEY_LEN, SIGNATURE_LE
 import { NAMESPACES, checkProofResponse, decodeAccount, decodeName, decodeProgram, type ProofResponse, type ProvenRecord } from "./proof.js";
 import { ANY_PROGRAM_VERSION, MAX_PROGRAM_BINDINGS, MAX_PROGRAM_CALLS, MAX_PROGRAM_CODE_BYTES, MAX_PROGRAM_INTERFACE_BYTES, ProgramAnswerError, ProgramsOffError, defaultFuelLimit, depositWithMargin, plainText, positiveFuel, programAddressArg, programBytesArg, programHashArg, programInputArg, programMethodArg, checkCode, checkFuel, checkInterface, checkParams, checkProgram, checkProgramsStatus, checkReceipt, checkView, outcomeWords, priceFuel, programCost, programRecordDeposit, programUploadDeposit, reserveFuel, uploadFuel, type FuelReservation, type ProgramCodeInfo, type ProgramCost, type ProgramFuel, type ProgramInfo, type ProgramInterfaceInfo, type ProgramParams, type ProgramReceipt, type ProgramViewResult } from "./programs.js";
 import { describeKind, reviewAction } from "./describe.js";
-import { xHandle, xIntentUrl, xLinkCode, xLinkFrom, xLinkMemo, xPostRef, xProofPost, xRecordIn, sameXHandle, X_UNLINK_MEMO, type XLink } from "./xlink.js";
+import { booProfileUrl, xHandle, xIntentUrl, xLinkCode, xLinkFrom, xLinkMemo, xPostRef, xProofPost, xRecordIn, sameXHandle, X_UNLINK_MEMO, type XLink } from "./xlink.js";
 import { NETWORKS, TESTNET_RETIRED, isNetworkName, type NetworkClock, type NetworkName, type NetworkPreset } from "./networks.js";
 
 export * from "./tx.js";
@@ -1012,7 +1012,7 @@ export class Wallet {
     const status = await this.client.status();
     const code = xLinkCode({ chainId: String(status.chain_id), genesisHash: String(status.genesis_hash) }, this.account, h);
     const names = arr((await this.client.account(this.account).catch(() => null))?.names);
-    const text = xProofPost(code, typeof names[0] === "string" ? names[0] : undefined);
+    const text = xProofPost(code, booProfileUrl(this.client.rpc, typeof names[0] === "string" ? names[0] : null));
     return { handle: h, code, text, intent_url: xIntentUrl(text) };
   }
 

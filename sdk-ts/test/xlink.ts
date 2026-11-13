@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import {
-  Client, Wallet, X_CODE_PREFIX, X_OEMBED, X_UNLINK_MEMO, checkXProof, fetchXPost, isXHandle, parseXMemo, parseXOEmbed, sameXHandle, signingBytes, verifyXLink, xHandle, xIntentUrl, xLinkCode, xLinkFrom, xLinkMemo,
+  Client, Wallet, X_CODE_PREFIX, X_OEMBED, X_UNLINK_MEMO, checkXProof, fetchXPost, isXHandle, parseXMemo, parseXOEmbed, sameXHandle, signingBytes, verifyXLink, xHandle, xIntentUrl, booProfileUrl, xLinkCode, xLinkFrom, xLinkMemo,
   xPostRef, xPostUrl, xProofPost, xRecordIn, xRecordOf, type Tx, type XRecordTx,
 } from "../src/index.js";
 
@@ -58,10 +58,19 @@ const ME = me.address;
   assert.throws(() => xLinkCode({ chainId: "", genesisHash: GENESIS }, ME, "jack"), /chain id/);
   assert.throws(() => xLinkCode(CHAIN, ME, "@jack"), /X handle/);
 
-  const text = xProofPost(code, "vlad.boo");
-  assert.equal(text, `Verifying my Blockula account vlad.boo.\n\n${code}`);
-  assert.ok(text.length <= 280 && xProofPost(code, ME).length <= 280, "fits a post, even with a full address");
-  assert.ok(!/[@#$]|https?:/.test(xProofPost(code)), "nothing X would turn into a mention, a tag or a link");
+  const text = xProofPost(code);
+  assert.equal(text, `Verifying my Blockula account on blockula.app.\n\n${code}`);
+  assert.ok(text.length <= 280, "fits a post");
+  assert.ok(!/[@#$]/.test(text), "nothing X would turn into a mention or a tag");
+  assert.deepEqual(text.match(/[a-z0-9-]+(\.[a-z0-9-]+)+/gi), ["blockula.app"], "the only thing X can turn into a link is blockula.app: never a .boo name, which is a web domain too");
+  // With a name and a public node, the link is the account's page on that chain.
+  assert.equal(booProfileUrl("https://demo.blockula.app", "vlad.boo"), "https://demo.blockula.app/boo/vlad");
+  assert.equal(booProfileUrl("https://chain.example/base/", "Vlad"), "https://chain.example/base/boo/vlad");
+  for (const [node, name] of [["http://localhost:7070", "vlad.boo"], ["http://fake.node", "vlad.boo"], ["https://u:p@chain.example", "vlad.boo"], ["not a url", "vlad.boo"], ["https://chain.example", undefined], ["https://chain.example", "v"], ["https://chain.example", "-vlad"], ["https://chain.example", "vl/ad"], ["https://chain.example", "vlad.boo.boo"]] as const)
+    assert.equal(booProfileUrl(node, name), null, `${node} ${name}`);
+  const named = xProofPost(code, booProfileUrl("https://demo.blockula.app", "vlad.boo"));
+  assert.equal(named, `Verifying my Blockula account: https://demo.blockula.app/boo/vlad\n\n${code}`);
+  assert.ok(!/\.boo\b/.test(named) && !/[@#$]/.test(named) && xProofPost(code, booProfileUrl("https://a-long-host-name.chains.example.org", "a".repeat(32))).length <= 280);
   assert.equal(new URL(xIntentUrl(text)).searchParams.get("text"), text);
   assert.equal(new URL(xIntentUrl(text)).origin + new URL(xIntentUrl(text)).pathname, "https://x.com/intent/post");
   console.log("✓ the proof code binds the chain, the account and the handle");
@@ -124,7 +133,7 @@ const row = (memo: string, o: Partial<XRecordTx> = {}): XRecordTx => ({ id: `tx$
 // ---- X's oEmbed answer ----
 const CODE = xLinkCode(CHAIN, ME, "BlockulaChain");
 const embed = (o: { handle?: string; id?: string; text?: string; name?: string } = {}) => {
-  const { handle = "BlockulaChain", id = "20", text = `Verifying my Blockula account vlad.boo.<br><br>${CODE}`, name = "Blockula" } = o;
+  const { handle = "BlockulaChain", id = "20", text = `Verifying my Blockula account on <a href="https://t.co/abc123">blockula.app</a>.<br><br>${CODE}`, name = "Blockula" } = o;
   return {
     url: `https://x.com/${handle}/status/${id}`,
     author_name: name,
@@ -137,7 +146,7 @@ const embed = (o: { handle?: string; id?: string; text?: string; name?: string }
 };
 {
   const post = parseXOEmbed(embed());
-  assert.deepEqual(post, { id: "20", handle: "BlockulaChain", untrusted_text: `Verifying my Blockula account vlad.boo.\n\n${CODE}` });
+  assert.deepEqual(post, { id: "20", handle: "BlockulaChain", untrusted_text: `Verifying my Blockula account on blockula.app.\n\n${CODE}` });
   // The real thing, as publish.x.com answered for the first post ever (2026-11).
   const first = parseXOEmbed({ url: "https://x.com/jack/status/20", author_name: "jack", author_url: "https://x.com/jack", html: '<blockquote class="twitter-tweet"><p lang="en" dir="ltr">just setting up my twttr</p>&mdash; jack (@jack) <a href="https://x.com/jack/status/20?ref_src=twsrc%5Etfw">March 21, 2006</a></blockquote>\n\n' });
   assert.deepEqual(first, { id: "20", handle: "jack", untrusted_text: "just setting up my twttr" });
@@ -257,7 +266,7 @@ globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
   assert.equal(await client.xLink(ME), null, "nothing linked yet");
 
   const proof = await me.xProof("@BlockulaChain");
-  assert.deepEqual(proof, { handle: "BlockulaChain", code: CODE, text: `Verifying my Blockula account vlad.boo.\n\n${CODE}`, intent_url: xIntentUrl(`Verifying my Blockula account vlad.boo.\n\n${CODE}`) });
+  assert.deepEqual(proof, { handle: "BlockulaChain", code: CODE, text: `Verifying my Blockula account on blockula.app.\n\n${CODE}`, intent_url: xIntentUrl(`Verifying my Blockula account on blockula.app.\n\n${CODE}`) });
   assert.equal(posted.length, 0, "the proof signs nothing");
 
   // Refused before anything is signed.
