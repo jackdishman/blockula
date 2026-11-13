@@ -92,6 +92,37 @@ export function addCallable(node: MockNode, creator: string) {
   return { wasm_hash, interface_hash, digest: versionDigest(CALLABLE, wasm_hash, interface_hash, 1) };
 }
 
+/** A claimed repo no GitHub repo could be named: shown as text, never turned into a link. */
+export const HOSTILE_REPO = 'evil/x"><img src=x onerror=window.__pwned=8>';
+
+/**
+ * Séance #3, sealing, with `juror` seated (the wallet's own account, say) beside mina: three claims by two
+ * other people (one in a repo named with markup), and three pairs for `juror` to judge. `reveal()` moves it
+ * on to revealing, as the chain does at its `commit_until`.
+ */
+export function seatJuror(node: MockNode, juror: string) {
+  const label = (a: string) => node.label(a);
+  const claim = (id: number, claimant: string, repo: string, pr: number) => ({
+    id, claimant: label(claimant), handle: null, repo, pr, pr_url: HOSTILE_LINK, familiar: null, bond: F.toString(), bond_display: "1 FANG", status: "in_seance", submitted_at: 100,
+    attestations: [], merge_sha: "f00d".repeat(10), verified_at: 101, eligible_at: 102, expires_at: 700, seance: 3, score_ppm: null, score_display: null, payout: "0", payout_display: "0 FANG", soul_awarded_display: "0", closed_at: null, reason: null,
+    revert_window_until: null, revert_attestations: null,
+  });
+  const claims = [claim(10, ADDR.lucy, "jackdishman/blockula", 151), claim(11, ADDR.renfield, "jackdishman/blockula", 152), claim(12, ADDR.lucy, HOSTILE_REPO, 9)];
+  const seat = (a: string, pairs: [number, number][]) => ({ juror: label(a), pairs: pairs.length, committed: false, revealed: false, agreement_ppm: null, agreement_display: null, reward_display: "0 FANG", soul_delta_display: "0", assigned_pairs: pairs, commitment: null, votes: null, spam: [] });
+  const seance = {
+    id: 3, phase: "sealing", opened_at: node.height - 5, commit_until: node.height + 60, reveal_until: node.height + 90, seed: "5eed".repeat(16), budget: (30n * F).toString(), budget_display: "30 FANG",
+    claims, jurors: [seat(juror, [[10, 11], [11, 12], [12, 10]]), seat(ADDR.mina, [[10, 11]])], results: null, results_display: null,
+  };
+  node.claims = [...node.claims.filter((c) => !claims.some((x) => x.id === c.id)), ...claims];
+  node.seances = [...node.seances.filter((x) => x.id !== 3), seance];
+  return {
+    seance,
+    /** The juror's seat as the node now holds it (committed, revealed, the commitment and the votes). */
+    seat: () => seance.jurors[0] as ReturnType<typeof seat> & { commitment: string | null; votes: string | null; spam: number[] },
+    reveal: () => Object.assign(seance, { phase: "revealing" }),
+  };
+}
+
 export const ADDR = {
   mina: addressOf("c2".repeat(32)),
   lucy: addressOf("c3".repeat(32)),
