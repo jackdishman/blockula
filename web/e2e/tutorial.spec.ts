@@ -63,6 +63,12 @@ test("stages open in order, the next task opens by itself, and the chain ticks w
   await expect(task(page, "fang").locator(".check")).toHaveAttribute("aria-label", "Done");
   await expect(task(page, "name").getByRole("link", { name: "Pick a name" })).toBeVisible();
   await expect(checklist.locator(".check-body")).toHaveCount(1);
+  // A later stage opens for a look, and folds up again.
+  await stage(page, "grow").getByRole("button", { name: /Grow the chain/ }).click();
+  await expect(stage(page, "grow").locator("[data-task]")).toHaveCount(4);
+  await expect(stage(page, "basics")).toHaveAttribute("aria-current", "step");
+  await stage(page, "grow").getByRole("button", { name: /Grow the chain/ }).click();
+  await expect(stage(page, "grow").locator("[data-task]")).toHaveCount(0);
 
   // The chain proves the rest of the basics: a name, a payment this account sent, and one it got from someone else.
   node.names.set("vlad", account);

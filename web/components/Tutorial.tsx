@@ -80,7 +80,8 @@ function useProgramsOn(): boolean | null {
 
 /**
  * The checklist: a path of stages that open in order. The current stage is open, with its next
- * task expanded; finished stages fold up and later ones are only named. `state` is null until this
+ * task expanded; finished stages fold up, and later ones are named and open for a look (their tasks
+ * can be done early: the path still moves on in order). `state` is null until this
  * chain's and account's progress has been read.
  */
 export function Tutorial({ state, update }: { state: TutorialState | null; update: (p: Partial<TutorialState>) => void }) {
@@ -210,11 +211,12 @@ export function Tutorial({ state, update }: { state: TutorialState | null; updat
             );
           return (
             <li key={s.id} className="stage upcoming" data-stage={s.id}>
-              <div className="stage-head">
+              <button className="stage-head" onClick={() => setPeek(peek === s.id ? null : s.id)} aria-expanded={peek === s.id}>
                 <span className="stage-num">{ROMAN[k]}</span>
                 <span className="grow">{copy.title} <span className="small">{k === current + 1 ? "· up next" : ""}</span></span>
                 <span className="small">{s.tasks.length} tasks</span>
-              </div>
+              </button>
+              {peek === s.id && taskList(s, false)}
             </li>
           );
         })}
