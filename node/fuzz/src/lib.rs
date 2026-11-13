@@ -21,6 +21,7 @@ mod node_src {
     pub mod consensus;
     pub mod contrib_cli;
     pub mod crypto;
+    pub mod dev_browser;
     pub mod econ;
     pub mod epochs;
     pub mod genesis_builder;

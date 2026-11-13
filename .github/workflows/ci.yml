@@ -13,6 +13,7 @@
 #   required: Clippy
 #   required: Dependencies (cargo-deny, npm audit)
 #   required: Supply-chain pins, workflows, monitoring config
+#   required: Name sites (sites/*.json)
 #   required: ml-dsa (node)
 #   required: @noble/post-quantum (SDK)
 #   required: Fuzz harness
@@ -269,6 +270,28 @@ jobs:
       - name: npm audit (all, non-blocking)
         continue-on-error: true
         run: npm audit
+
+  sites:
+    # sites/README.md. Every listing's shape on every run, with no network; on a pull request, the
+    # listings it adds or changes against the demo chain and their targets too.
+    name: Name sites (sites/*.json)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false, fetch-depth: 0 }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 22 }
+      - name: Check
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          changed=()
+          if [ "$EVENT" = pull_request ]; then
+            mapfile -t changed < <(git diff --name-only --diff-filter=AMR "$BASE"...HEAD -- 'sites/*.json')
+          fi
+          echo "listings this PR adds or changes: ${changed[*]:-none}"
+          if [ "${#changed[@]}" -eq 0 ]; then node scripts/check-sites.mjs; else node scripts/check-sites.mjs --live "${changed[@]}"; fi
 
   ops:
     name: Supply-chain pins, workflows, monitoring config

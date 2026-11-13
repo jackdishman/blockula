@@ -1,0 +1,37 @@
+# Name sites (sites/README.md): `<name>.blockula.app` for the owner of `<name>.boo` on the demo chain.
+#
+# On main after sites/ changes, once a day and by hand, blockula.app's DNS is made to serve the
+# listings whose names are still active and owned by their listing's owner
+# (scripts/sync-sites-dns.mjs). It needs the secret VERCEL_TOKEN (a token scoped to the team that
+# holds blockula.app's DNS) and, for a team, the variable VERCEL_TEAM_ID; without the token it
+# warns and stops. Listings are checked on pull requests by ci.yml's `sites` job.
+name: Name sites DNS
+on:
+  push:
+    branches: [main]
+    paths: ["sites/**", "web/lib/sites.ts", "scripts/check-sites.mjs", "scripts/sync-sites-dns.mjs"]
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  sync:
+    name: Sync blockula.app DNS
+    if: github.repository == 'jackdishman/blockula' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    concurrency: { group: sites-dns, cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 22 }
+      - name: Sync
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_TEAM_ID: ${{ vars.VERCEL_TEAM_ID }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ]; then echo "::warning::VERCEL_TOKEN isn't set: blockula.app's DNS wasn't synced"; exit 0; fi
+          node scripts/sync-sites-dns.mjs --apply

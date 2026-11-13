@@ -46,6 +46,8 @@ blockula gov vote 0 aye 10 --digest <digest> --rpc <node>
 
 A vote locks the amount you vote with until voting ends (longer with `--conviction`). The deposit comes back if enough of the chain votes or the council does, so the creator, whose validator account holds the starting supply, is the one to propose.
 
+To see the open proposals as a voter should (what each does, read from its content rather than the node's words, the tallies, turnout and the digest to vote with), run [`examples/club-vote.mjs`](../examples/club-vote.mjs) `--rpc <node>`.
+
 ## 4. A team's bounty board
 
 **Who:** a team with a GitHub repo, or friends hacking on a side project.
