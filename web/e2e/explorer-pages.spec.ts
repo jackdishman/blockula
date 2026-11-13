@@ -275,9 +275,11 @@ test.describe("every explorer page", () => {
     await expect(page.locator("main script, main img")).toHaveCount(0);
     await expect(page.getByTestId("methods")).toContainText("view: a read, nothing signed");
     await expect(page.getByTestId("methods")).toContainText("payable");
-    // Its transactions are the calls that named it; a call is read, never made, from here.
+    // Its transactions are the calls that named it. Its record names a method no program can have (and a selector
+    // that isn't its name's), so the SDK refuses the record and the page offers no form to run or sign anything.
     await expect(page.locator(".ledger-summary", { hasText: "called program" }).first()).toBeVisible();
-    await expect(page.getByRole("button", { name: /^(Sign|Send)/ })).toHaveCount(0);
+    await expect(page.getByTestId("program-calls-refused")).toContainText("doesn't check out, so this page offers no forms for it");
+    await expect(page.getByRole("button", { name: /^(Sign|Send|Run|Review)/ })).toHaveCount(0);
     // The code it's made of.
     await visit(page, `/program/${w.wasm_hash}`, (p) => p.getByTestId("code-record"), errors);
     await expect(page.getByTestId("exports").locator("code.named", { hasText: HOSTILE_METHOD })).toBeVisible();

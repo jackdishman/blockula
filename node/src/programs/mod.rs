@@ -278,6 +278,9 @@ pub mod interface_json;
 pub mod view_api;
 // A program transaction's receipt as `/api/tx` serves it (WBS S6b).
 pub mod tx_json;
+// The ABI's Borsh encoding, as vectors for the SDK's codec (tooling: the chain never reads an input against its interface).
+#[cfg(test)]
+mod abi_vectors;
 #[cfg(test)]
 mod summon_tests;
 

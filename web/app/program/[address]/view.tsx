@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouteParam } from "@/lib/route-param";
 import { Amount, Hash, Loading, Named, NotFound, Section, Stat, Term, useMe, Who } from "@/components/explorer/kit";
 import { Ledger } from "@/components/explorer/Ledger";
+import { ProgramCalls } from "@/components/explorer/ProgramCalls";
 import { Copy } from "@/components/ui";
 import { nodeExplorer, RPC } from "@/lib/config";
 import { typeText, shortAddress, inertText } from "@/lib/explorer/inert";
@@ -19,7 +20,7 @@ const isAddress = (s: string) => /^t?boo1[02-9ac-hj-np-z]{40,}$/.test(s);
 const isHash = (s: string) => /^[0-9a-f]{64}$/.test(s);
 const hex = (s: string) => Array.from(new TextEncoder().encode(s), (b) => b.toString(16).padStart(2, "0")).join("");
 
-/** A program anyone deployed (or the code one is made of, by its hash): read only. Everything it names is its deployer's claim. */
+/** A program anyone deployed (or the code one is made of, by its hash): its record, its views and calls (ProgramCalls), and what has called it. Everything it names is its deployer's claim. */
 export default function ProgramPage() {
   const address = useRouteParam("address");
   const id = decodeURIComponent(address);
@@ -142,6 +143,8 @@ function DeployedPage({ address }: { address: string }) {
               Check it against another source: <a href={nodeExplorer.program(address)} target="_blank" rel="noreferrer">the node&apos;s own explorer ↗</a>
             </p>
           </Section>
+        </div>
+        <div className="stack-lg">
           <Section title="Methods" aside={<span className="dim small">named by the deployer</span>}>
             {methods === null ? (
               <p className="card-note">This node couldn&apos;t read the program&apos;s interface.</p>
@@ -157,20 +160,22 @@ function DeployedPage({ address }: { address: string }) {
             <p className="card-note">These names and types are the deployer&apos;s claim, shown as text. The chain enforces each method&apos;s kind (a transaction, a read, or the initializer) and whether it takes FANG, nothing else about it.</p>
           </Section>
         </div>
-        <div className="stack-lg">
-          <Section title="Call it" aside={<span className="dim small">read only here</span>}>
-            <p className="card-note">This page signs nothing. Calls to a deployed program are signed with the CLI or the SDK, which show the digest and the fee, and refuse a reservation no block could carry.</p>
-            <pre className="raw">
-              <code>
-                {`blockula program view ${address} <method>\nblockula program call ${address} <method> --storage-limit 1`}
-              </code>
-            </pre>
-            <div className="row-gap">
-              <Copy text={`blockula program view ${address} <method>`} label="Copy the view command" />
-            </div>
-          </Section>
-        </div>
       </div>
+      <Section title="Call it" aside={<span className="dim small">views run free; calls are reviewed, then signed</span>}>
+        <p className="card-note m0">
+          A view runs on your node and signs nothing. A call is a transaction from your account: you see the exact call first (its input, the version digest it binds, the most it can cost), and only an owner key signs it, after your passkey. What a program returns is its claim.
+        </p>
+        <ProgramCalls address={address} shownDigest={String(p.version_digest)} />
+        <details className="raw">
+          <summary>Or from a terminal</summary>
+          <pre>
+            <code>{`blockula program view ${address} <method> [--input HEX]\nblockula program call ${address} <method> [--input HEX] [--value FANG] [--storage-limit FANG]`}</code>
+          </pre>
+          <div className="row-gap">
+            <Copy text={`blockula program view ${address} <method>`} label="Copy the view command" />
+          </div>
+        </details>
+      </Section>
       <Section title="Recent transactions" aside={<span className="dim small">calls naming this program, and what it did</span>}>
         {account.error && !account.data ? (
           <p className="error" role="alert">Couldn&apos;t load its transactions: {account.error.message}</p>
