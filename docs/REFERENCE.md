@@ -2,6 +2,14 @@
 
 Everything beyond [making a chain](CREATE.md): making one by hand, public servers, how the HTTP API is hardened, the CLI wallet, validators, and Hunts and the contribution pool. These sections used to be the README.
 
+## Local development
+
+`blockula dev` starts a local single-validator chain with a faucet on port 7070.
+`blockula dev --open` opens its wallet in the default browser after `/api/health`
+is healthy, or the explorer if the binary has no wallet built in. Use `--port 7171`
+for another HTTP port. Without `--open`, no browser is opened. On a headless
+machine or if opening fails, the node keeps running and prints a link to open manually.
+
 ## Run your own chain by hand
 
 `summon` creates a genesis plus validator keys; `run` starts a validator. Consensus is

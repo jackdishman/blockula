@@ -1071,6 +1071,11 @@ fn p2p_config(preset: &str, key: PrivateKey, namespace: &[u8], listen: SocketAdd
 }
 
 pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
+    run_validator_with_browser(home, net, false)
+}
+
+/// `dev --open` opts into opening the local wallet after the HTTP API is healthy.
+pub fn run_validator_with_browser(home: PathBuf, net: NetOpts, open_browser: bool) -> Result<()> {
     let mut chain = Chain::open(&home).map_err(exit_on_halt)?;
     // Validators take their genesis from the signed release; a known chain's must match it. The
     // weak-subjectivity period is the one the parameters in force set, if governance shortened it.
@@ -1217,6 +1222,9 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         let metrics = context.child("metrics");
         node.p2p_peers = Some(Arc::new(move || api::connected_peer_labels(&commonware_runtime::Metrics::encode(&metrics))));
         tokio::spawn(serve_http(node, http_bind));
+        if open_browser {
+            tokio::spawn(crate::dev_browser::open_when_ready(http_bind));
+        }
         handle.await
     });
     // A halt stops consensus too (the halting block is never acknowledged): its exit code wins.

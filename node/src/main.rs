@@ -9,6 +9,7 @@ mod cli_net;
 mod consensus;
 mod contrib_cli;
 mod crypto;
+mod dev_browser;
 mod econ;
 mod epochs;
 mod genesis_builder;
@@ -162,6 +163,9 @@ enum Cmd {
         /// Wipe the dev chain and start fresh
         #[arg(long)]
         reset: bool,
+        /// Open the wallet (or explorer if no wallet is built in) once the node is ready
+        #[arg(long)]
+        open: bool,
         /// Start a new dev chain with programs on from block 1 (protocol v2 and the `programs`
         /// feature in its genesis), to upload, create, call and view WebAssembly programs with
         /// `blockula program`. A chain already made without it keeps its genesis: add --reset.
@@ -428,7 +432,7 @@ fn main() -> Result<()> {
             net.bind = created.plan.bind().into();
             node::run_validator(created.home, net_opts(net, None, None, false))
         }
-        Cmd::Dev { port, reset, programs, net } => {
+        Cmd::Dev { port, reset, programs, open, net } => {
             let home = blockula_dir().join("dev");
             let stale = home.join("genesis.json").exists() && (chain::Genesis::load(&home.join("genesis.json")).is_err() || node::dev_is_stale(&home));
             if reset || stale {
@@ -456,7 +460,7 @@ fn main() -> Result<()> {
             // (`/api/program/{address}/view`) as a full node would, with no --program-views.
             let mut opts = net_opts(net, Some(port), Some("local".into()), true);
             opts.http.program_views = true;
-            node::run_validator(home, opts)
+            node::run_validator_with_browser(home, opts, open)
         }
         Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, host, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks, address_prefix, dev_durations, programs, name, description, token } => {
             let home = home.unwrap_or_else(|| blockula_dir().join(&chain_id));
@@ -669,6 +673,17 @@ mod cli_tests {
         };
         assert!(fast(&["--fast"]));
         assert!(!fast(&[]));
+    }
+
+    #[test]
+    fn dev_open_parses_and_is_opt_in() {
+        use clap::Parser;
+        for (args, expected) in [(vec!["blockula", "dev"], false), (vec!["blockula", "dev", "--open", "--port", "7171"], true)] {
+            match super::Cli::try_parse_from(args).unwrap().cmd {
+                super::Cmd::Dev { open, .. } => assert_eq!(open, expected),
+                _ => unreachable!(),
+            }
+        }
     }
 
     /// `--program-views` and `--view-max-fuel` reach the HTTP options (the view fuel is at most what a
