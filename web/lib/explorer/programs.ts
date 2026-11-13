@@ -3,7 +3,8 @@
  * docs/PROGRAMS.md): what state they expose, which transactions call them, and the actions anyone
  * can take, with typed parameters. One generic form (components/explorer/ActionForm.tsx) renders
  * any action, previews the exact transaction, and signs it. A deployed program's interface maps
- * onto `ActionSpec` too: typed params in, an `Action` out (docs/PROGRAMS.md section 11.3). See
+ * onto `ActionSpec` too: typed params in, an `Action` out (docs/PROGRAMS.md section 11.3), which
+ * `program-calls.ts` builds from the program's checked record and `ProgramCalls.tsx` signs. See
  * docs/EXPLORER.md.
  */
 import { X_UNLINK_MEMO, type Action } from "@blockula/sdk";
@@ -22,8 +23,16 @@ import { xRecordMemo } from "./xlink";
  * - `validator`: a field that needs an address (staking). A name is resolved, and on mainnet an
  *   unproven one isn't signed (`UnprovenNameError`).
  * - `x_handle`, `x_post`: an X handle and a link to a post on X (docs/X-LINKING.md).
+ *
+ * A deployed program's arguments (program-calls.ts `paramTypeOf`, docs/PROGRAMS.md 11.3) add the
+ * rest of its interface's types: `bool`; `u64`, `i64`, `u128`, `i128` (decimal strings, read as
+ * bigints, never JS numbers); `address` (an address only: a program keeps 32 bytes, and a `.boo`
+ * name moves with its owner); `hex` (`hash32`, `bytes`); `list` (a vec, `of` its items' type, up to
+ * `max`); and `json`, for a type nested deeper than a list or an optional field.
  */
-export type ParamType = "fang" | "account" | "validator" | "name" | "int" | "years" | "bps" | "text" | "repo" | "days" | "key_id" | "x_handle" | "x_post";
+export type ParamType =
+  | "fang" | "account" | "validator" | "name" | "int" | "years" | "bps" | "text" | "repo" | "days" | "key_id" | "x_handle" | "x_post"
+  | "bool" | "u64" | "i64" | "u128" | "i128" | "address" | "hex" | "list" | "json";
 
 export interface Param {
   key: string;
@@ -34,8 +43,10 @@ export interface Param {
   initial?: string;
   optional?: boolean;
   help?: string;
-  /** For text: max bytes. */
+  /** For text and hex: max bytes. For a list: max items. */
   max?: number;
+  /** For a list: the type of its items. */
+  of?: ParamType;
 }
 
 /** Checked inputs: fang → drops (string), account → as signed, validator → address, int/days/years/bps → number, others trimmed. */
@@ -98,8 +109,9 @@ export interface NativeProgram extends ProgramBase {
 
 /**
  * A program anyone deployed (protocol v2): WebAssembly the chain runs, named by its address. It's
- * described the way a built-in one is, but with no `ActionSpec` forms yet: in v0 calls are made with
- * the CLI and the SDK, and this explorer only reads (docs/PROGRAMS-V0.md §8.6, docs/PROGRAMS.md 11.3).
+ * described the way a built-in one is. Its forms aren't here: they're made on its page from the record
+ * the SDK checked (`client.program`), a spec per method (program-calls.ts `specsFromProgram`,
+ * docs/PROGRAMS.md 11.3), since a node's unchecked answer, which this reads, doesn't make one.
  * Everything it names (its methods, their arguments) is its deployer's claim: `calls` holds text a
  * stranger wrote, to be shown as text and marked as theirs, never as markup or as the explorer's own words.
  */
@@ -519,8 +531,8 @@ export function upgradeSentence(p: Pick<DeployedProgramView, "authority" | "poli
 
 /**
  * A deployed program as a `Program` (the same shape the built-in ones have): what it exposes, and its
- * methods under `calls`. No forms: calls are the CLI's and the SDK's in v0. Read tolerantly; the
- * address is checked by the page that asks, and nothing here is markup.
+ * methods under `calls`. Its forms are on its page (`specsFromProgram`). Read tolerantly; the address is
+ * checked by the page that asks, and nothing here is markup.
  */
 export function deployedProgram(v: DeployedProgramView): DeployedProgram {
   const methods = Array.isArray(v.methods) ? v.methods : [];
@@ -538,6 +550,6 @@ export function deployedProgram(v: DeployedProgramView): DeployedProgram {
     ],
     calls: methods.filter((m) => m.kind === "call").map((m) => inertText(m.untrusted_name)),
     actions: [],
-    elsewhere: "Calling a deployed program is signed with `blockula program call` or the SDK's `wallet.call` in this release: this page reads it, and signs nothing.",
+    elsewhere: "Its page runs its views, and signs a call to it with an owner key (a passkey check first), after showing the version digest the call binds and the most it can cost. `blockula program call` and the SDK's `wallet.call` sign the same call from a terminal.",
   };
 }

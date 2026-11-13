@@ -1961,6 +1961,29 @@ programs reuse it with these changes:
   Bounds (`min_out`, `deadline`) are the defense there, which is why the wallet requires them on
   methods that declare them.
 
+**What runs today** (v0: interface format 1, no `/simulate`, no grants). The wallet's program page
+(`web/components/explorer/ProgramCalls.tsx`) takes the shapes above as far as v0 allows, and
+`web/lib/explorer/program-calls.ts` (`specsFromProgram`) builds the specs from the record the SDK
+checked, not the node's raw answer:
+- each `Call` method is a `ProgramCallSpec`: an `ActionSpec` with `kind: "call_program"`,
+  `ownerOnly` always (session keys sign transfers only, and there are no grants), a fixed `who`,
+  no `blurb` (format 1 has no docs), bound to the version digest of the record the page shows;
+  each `View` method a read form run with `client.view`; `Init` methods aren't offered;
+- `ParamType` gains `bool`, `u64`, `i64`, `u128`, `i128`, `address`, `hex`, `list` and `json`, with
+  one change to the table: an `Address` is an `address` field that takes a `boo1…` address only,
+  never a name (a name moves with its owner, and a program input is signed as bytes), with a "use
+  my address" button. `Option` of a plain type is an optional field, `Vec` of one a list up to its
+  bound, and anything deeper (format 1 has no structs or enums) one `json` field;
+- arguments are encoded by the SDK's ABI codec (`encodeProgramInput`, Borsh, held to the node's
+  pinned `borsh` crate by `sdk-ts/test/program-abi-vectors.json`); the generic `ActionForm` isn't
+  reused, because `Wallet.build` refuses tags 62–64 (their fee needs fuel priced);
+- `prepare` is `Wallet.call`'s pricing: the most fuel a transaction may reserve (`max_tx_fuel`,
+  or what a block's fuel leaves beside loading the code it declares, if less), priced at the suggested
+  fuel rate into the max fee. Nothing is simulated, so
+  the review shows only what the signature bounds (program, method, decoded-back input and its
+  hex, value, storage limit, the full version digest, fuel reserved, max fee, the most it can
+  cost) and none of the simulated facts above. The storage limit is the user's, 0 by default.
+
 ### 11.4 Token convention (above the chain)
 
 **BTS-1** is a fungible-token interface: `transfer`, `approve` (with an expiry height and
