@@ -404,7 +404,7 @@ export const PROGRAMS: NativeProgram[] = [
         describe: () => "Withdraw your vested contribution rewards",
       },
     ],
-    elsewhere: `Sealing and revealing Séance votes keeps a secret salt between the two steps, and a sealed judgment binds the pairs it was made on, so jurors use the CLI: \`blockula contrib vote\`, then \`blockula contrib reveal\`. ${CONTRIBUTION_NOTES_BOTH}`,
+    elsewhere: `Jurors seal and reveal their votes on the Séance's page, with an owner device: sealing keeps a secret salt in that browser until the reveal, and binds the pairs it was made on. The CLI does the same (\`blockula contrib vote\`, then \`blockula contrib reveal\`). ${CONTRIBUTION_NOTES_BOTH}`,
   },
   {
     kind: "native",

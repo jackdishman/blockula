@@ -4,7 +4,7 @@
 // shapes (node/src/api.rs). Submitted txs are checked like the real node does it: ML-DSA
 // signature over the SDK's signing bytes, the signing key authorized on `from` (owner keys for
 // key changes), nonce and balance. e2e/explorer-world.ts fills it with a little of everything.
-import { actionDigest, formatFang, keyId as keyIdOf, parseFang, proposalDigest, signingBytes, txSize, verifyKeyGrant, type Action, type ProposalKind, type Tx } from "@blockula/sdk";
+import { actionDigest, formatFang, keyId as keyIdOf, parseFang, proposalDigest, seanceCommitment, seancePairsDigest, signingBytes, txSize, verifyKeyGrant, type Action, type ProposalKind, type Tx } from "@blockula/sdk";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { createHash } from "node:crypto";
@@ -635,6 +635,31 @@ export class MockNode {
           held(parseFang("1") * BigInt(act.years));
           summary = `${who} renewed ${act.name}.boo for ${act.years} year${act.years === 1 ? "" : "s"}`;
           break;
+        case "commit_votes":
+        case "reveal_votes": {
+          // As node/src/poc.rs: owner keys only; a seal binds the juror's pairs (their ids, repos and PRs) and
+          // comes while the Séance seals; a reveal comes while it reveals and must open the seal.
+          if (key.role.type !== "owner") throw new HttpError(400, "session keys can only send transfers");
+          const x = this.seances.find((y) => y.id === act.seance_id) as (Json & { id: number; phase: string; claims: { id: number; repo: string; pr: number }[]; jurors: (Json & { juror: { address: string }; assigned_pairs: [number, number][]; committed: boolean; revealed: boolean; commitment: string | null })[] }) | undefined;
+          const seat = x?.jurors.find((j) => j.juror.address === tx.from);
+          if (!x || !seat) throw new HttpError(400, `not on the jury of Séance #${act.seance_id}`);
+          if (act.type === "commit_votes") {
+            if (x.phase !== "sealing") throw new HttpError(400, `Séance #${x.id} isn't sealing votes`);
+            if (seat.committed) throw new HttpError(400, "already sealed");
+            const ref = (id: number) => x.claims.find((c) => c.id === id) as { id: number; repo: string; pr: number };
+            if (act.pairs_digest !== seancePairsDigest(x.id, tx.from, seat.assigned_pairs.map(([a, b]) => [ref(a), ref(b)]))) throw new HttpError(400, "the sealed judgment was made on other pairs than this juror's");
+            Object.assign(seat, { committed: true, commitment: act.commitment });
+            summary = `${who} sealed their votes in Séance #${x.id}`;
+          } else {
+            if (x.phase !== "revealing") throw new HttpError(400, `Séance #${x.id} isn't revealing votes`);
+            if (!seat.committed || seat.revealed) throw new HttpError(400, seat.revealed ? "already revealed" : "nothing sealed to reveal");
+            if (act.votes.length !== seat.assigned_pairs.length) throw new HttpError(400, `one vote per assigned pair: ${seat.assigned_pairs.length}`);
+            if (seanceCommitment(x.id, tx.from, act.votes, act.spam, act.salt) !== seat.commitment) throw new HttpError(400, "the reveal doesn't match the sealed commitment");
+            Object.assign(seat, { revealed: true, votes: act.votes, spam: act.spam });
+            summary = `${who} revealed their votes in Séance #${x.id}`;
+          }
+          break;
+        }
         case "cancel_hunt":
         case "release_name":
         case "register_familiar":

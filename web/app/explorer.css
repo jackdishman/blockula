@@ -444,3 +444,12 @@ button.tbody { cursor: pointer; }
   .print-only { display: block; }
   a { text-decoration: none; }
 }
+
+/* A juror's ballot on a Séance page (components/explorer/JurorBallot.tsx). */
+.ballot { list-style: decimal; margin: 0; padding: 0 0 0 22px; display: flex; flex-direction: column; gap: 14px; }
+.ballot-pair { display: flex; flex-direction: column; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid var(--hair); }
+.ballot-claims { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ballot-claim { overflow-wrap: anywhere; }
+.ballot-choices { display: flex; flex-wrap: wrap; gap: 6px 18px; }
+.ballot-choice { display: inline-flex; align-items: baseline; gap: 8px; cursor: pointer; }
+.ballot-spam { border: 0; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
