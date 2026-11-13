@@ -10,7 +10,7 @@
 
 use crate::engine::{Address, BlockEngine, CodeHash, Digest, EngineKind, NodeFault, new_block_engine};
 use crate::exec::{ANY_VERSION, Binding, Call, Diff};
-use crate::host::{MethodInfo, MethodKind, View};
+use crate::host::{Beacon, MethodInfo, MethodKind, View};
 use crate::meter::{SCHEDULE_V0, Schedule};
 use crate::overlay::Entry;
 use crate::storage;
@@ -74,6 +74,14 @@ pub struct MemHost {
     pub storage_price: u64,
     pub state_soft_bytes: u64,
     pub creation_fee: u64,
+    /// The protocol version uploads run under: which host functions code may import
+    /// (`abi::LATEST_VERSION` by default: all of them).
+    pub protocol_version: u32,
+    /// Blocks per epoch: `epoch_v1` is `height / epoch_blocks`, as the node's `epoch_of`.
+    pub epoch_blocks: u64,
+    /// The beacon values the state keeps, by epoch. A test files and prunes them itself, as the
+    /// node's `beacon::end_epoch` would.
+    pub beacons: BTreeMap<u64, Beacon>,
 }
 
 impl Default for MemHost {
@@ -92,6 +100,9 @@ impl Default for MemHost {
             storage_price: 100,
             state_soft_bytes: 512 << 20,
             creation_fee: 100_000_000,
+            protocol_version: crate::abi::LATEST_VERSION,
+            epoch_blocks: 10,
+            beacons: BTreeMap::new(),
         }
     }
 }
@@ -113,7 +124,7 @@ impl MemHost {
     /// stored), the outer one a node fault (a panic in either step), never a refusal. Uploading the
     /// same code again is a no-op that returns its hash.
     pub fn upload(&mut self, wasm: &[u8]) -> Result<Result<CodeHash, Refusal>, NodeFault> {
-        let info = match upload::check(wasm, &SCHEDULE_V0)? {
+        let info = match upload::check(wasm, &SCHEDULE_V0, self.protocol_version)? {
             Ok(info) => info,
             Err(refusal) => return Ok(Err(refusal)),
         };
@@ -284,5 +295,11 @@ impl View for MemHost {
     }
     fn account_creation_fee(&self) -> u64 {
         self.creation_fee
+    }
+    fn epoch(&self) -> u64 {
+        self.height / self.epoch_blocks.max(1)
+    }
+    fn beacon(&self, epoch: u64) -> Option<Beacon> {
+        self.beacons.get(&epoch).copied()
     }
 }

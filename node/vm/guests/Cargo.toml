@@ -4,7 +4,7 @@
 # Its own workspace, like node/vm and node/ghost: profiles are per workspace, and a program's
 # (opt-level "z", panic = "abort") must never reach the node's.
 [workspace]
-members = ["abi", "counter", "token", "escrow", "router"]
+members = ["abi", "counter", "token", "escrow", "router", "dice"]
 resolver = "3"
 
 [workspace.package]

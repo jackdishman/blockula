@@ -1803,6 +1803,10 @@ picks the context and message, could get a wallet to produce a valid transaction
     too few reveals.
   - The SDK docs say it plainly: fine for raffles worth less than a withholding validator stands
     to lose, not for high-value draws. Never use `tx_hash` as randomness.
+  - **As built** (protocol v3, the preview version): `beacon_v1`, `epoch_v1` and `blake3_v1` in
+    the host ABI, and the guests' `abi::random` (`request`, `settle`) in place of the SDK's
+    `Randomness`. [RANDOMNESS.md](RANDOMNESS.md) is the guide for program authors, and proposes a
+    faster per-block value.
 
 ### 10.4 Native actions from programs
 

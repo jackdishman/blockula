@@ -20,7 +20,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use blockula_vm::config::{MAX_INTERFACE_BYTES, MAX_METHODS, MAX_PAGES, MAX_TABLE_ENTRIES};
 use blockula_vm::engine::EngineKind;
 use blockula_vm::exec::{ANY_VERSION, Call, TxLimits, execute};
-use blockula_vm::host::{MethodInfo, MethodKind};
+use blockula_vm::host::{Beacon, MethodInfo, MethodKind};
 use blockula_vm::interface::{self, Arg, Interface, Method, Type};
 use blockula_vm::meter::SCHEDULE_V0;
 use blockula_vm::testing::{MemHost, addr};
@@ -290,12 +290,14 @@ fn arbitrary_interface(u: &mut Unstructured) -> arbitrary::Result<Interface> {
     Ok(Interface { methods })
 }
 
-/// The four hand-written guests (S2), deployed for every run so the executor has real code to run.
+/// The hand-written guests (S2, and `dice`, which calls protocol v3's `blake3_v1`, `epoch_v1` and
+/// `beacon_v1`), deployed for every run so the executor has real code to run.
 const GUESTS: &[(&str, &[u8])] = &[
     ("counter", include_bytes!("../../tests/programs/counter.wasm")),
     ("token", include_bytes!("../../tests/programs/token.wasm")),
     ("escrow", include_bytes!("../../tests/programs/escrow.wasm")),
     ("router", include_bytes!("../../tests/programs/router.wasm")),
+    ("dice", include_bytes!("../../tests/programs/dice.wasm")),
 ];
 
 /// The guests' interfaces, as `UploadCode` carries them beside their code.
@@ -305,17 +307,23 @@ const GUEST_INTERFACES: &[(&str, &[u8])] = &[
     ("token", include_bytes!("../../tests/programs/token.iface")),
     ("escrow", include_bytes!("../../tests/programs/escrow.iface")),
     ("router", include_bytes!("../../tests/programs/router.iface")),
+    ("dice", include_bytes!("../../tests/programs/dice.iface")),
 ];
 
 /// Method names the guests export (`bk_<method>`), plus one they don't, so the "no such export"
 /// path is fuzzed too.
 const METHODS: &[&str] = &[
     "get", "increment", "transfer", "balance_of", "total_supply", "init", "open", "release",
-    "refund", "send", "try_send", "mint", "nope",
+    "refund", "send", "try_send", "mint", "nope", "fund", "roll", "settle",
 ];
 
 #[derive(Arbitrary, Debug)]
 pub struct Scenario {
+    /// The block's height (epochs are `MemHost`'s 10 blocks), and the reveals of every beacon
+    /// value the state keeps at it: the dice's rolls settle, wait, expire or are refunded by them.
+    /// First, so the rest of an input reads as it did before these were added.
+    height: u16,
+    reveals: u8,
     engine: u8,
     /// Interface entries to change before the batch runs: (guest, method, kind, payable).
     methods: Vec<(u8, u8, u8, bool)>,
@@ -347,6 +355,13 @@ pub fn program_exec(scenario: Scenario) {
     let mut host = MemHost::new();
     let signer = addr("signer");
     host.fund(signer, 1_000_000_000_000_000);
+    // The state at `height`: the last 64 epochs' beacon values (`beacon::VALUES_KEPT`), up to the
+    // executing epoch's.
+    host.height = u64::from(scenario.height).max(1);
+    let epoch = host.height / host.epoch_blocks;
+    for e in epoch.saturating_sub(63)..=epoch {
+        host.beacons.insert(e, Beacon { value: addr(&format!("beacon {e}")), reveals: u32::from(scenario.reveals % 8) });
+    }
     let declared: Vec<_> = GUESTS.iter().map(|(name, _)| addr(name)).collect();
     for (name, wasm) in GUESTS {
         // The committed guests always upload; deploy would only panic if that regressed.
@@ -493,7 +508,7 @@ mod tests {
     #[test]
     fn interface_codec_accepts_its_seeds() {
         let seeds = seeds("interface_codec");
-        assert_eq!(seeds.len(), 5);
+        assert_eq!(seeds.len(), 6);
         for seed in &seeds {
             interface::decode(seed).expect("every seed is an interface");
             interface_codec(seed);

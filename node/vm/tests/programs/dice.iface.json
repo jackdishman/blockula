@@ -1,0 +1,48 @@
+{
+  "format": 1,
+  "methods": [
+    {
+      "name": "fund",
+      "kind": "call",
+      "payable": true,
+      "args": [],
+      "returns": null
+    },
+    {
+      "name": "init",
+      "kind": "init",
+      "payable": false,
+      "args": [
+        {
+          "name": "min_reveals",
+          "type": "u32"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "roll",
+      "kind": "call",
+      "payable": true,
+      "args": [
+        {
+          "name": "pick",
+          "type": "u8"
+        }
+      ],
+      "returns": "u64"
+    },
+    {
+      "name": "settle",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "id",
+          "type": "u64"
+        }
+      ],
+      "returns": "u8"
+    }
+  ]
+}

@@ -1,5 +1,6 @@
-//! The recorded v1 history `blockula replay` checks every PR against (`node/testdata/replay/`,
-//! docs/REPLAY.md), and the recorder that writes it.
+//! The recorded history `blockula replay` checks every PR against (`node/testdata/replay/`,
+//! docs/REPLAY.md): v1's, and a short one of protocol v2 with programs on. And the recorder that
+//! writes it.
 //!
 //! The recorder plays the network: it builds each block as a leader would (the leader of its view,
 //! the state root it last executed, views that restart every epoch and skip where a leader was
@@ -31,8 +32,10 @@ use std::path::{Path, PathBuf};
 const BATCH: u64 = 50;
 /// How long a recorded tx stays valid.
 const VALIDITY: u64 = 50;
-/// The upgrade signal in every recorded block: a v1 binary's (`SUPPORTED_PROTOCOL_VERSION` until
-/// the release that ships v2), whatever binary records, so recording again gives the same bytes.
+/// The upgrade signal in every block of the v1 recordings: a v1 binary's
+/// (`SUPPORTED_PROTOCOL_VERSION` until the release that ships v2), whatever binary records, so
+/// recording again gives the same bytes. A recording of another version sets its own
+/// ([`Recorder::signal`]).
 const SIGNAL: u32 = 1;
 
 /// How a tx must end in its block.
@@ -63,6 +66,11 @@ pub(super) struct Recorder {
     lines: Vec<String>,
     /// Nonces the block being built has used per account (on top of the state's).
     used: HashMap<String, u64>,
+    /// The upgrade signal in every recorded block ([`SIGNAL`] unless the recording sets another).
+    pub signal: u32,
+    /// Drops every tx the recorder prices adds to its fee, for the fuel a program tx reserves
+    /// (0 in the v1 recordings).
+    pub fuel_margin: u64,
 }
 
 impl Recorder {
@@ -75,7 +83,7 @@ impl Recorder {
         let mut c = Chain::open(&home).unwrap();
         c.set_scratch();
         let seeds = validators.iter().map(|s| (hex::encode(Keys::from_seed(*s).public_key()), *s)).collect();
-        Recorder { parent: consensus::genesis_block(g), timestamp: g.created_at_ms, c, home, keys, seeds, view: 0, gap: 0, batch: vec![], lines: vec![], used: HashMap::new() }
+        Recorder { parent: consensus::genesis_block(g), timestamp: g.created_at_ms, c, home, keys, seeds, view: 0, gap: 0, batch: vec![], lines: vec![], used: HashMap::new(), signal: SIGNAL, fuel_margin: 0 }
     }
 
     pub fn prefix(&self) -> String {
@@ -125,7 +133,7 @@ impl Recorder {
             *self.used.entry(from.to_string()).or_default() += 1;
         }
         if tx.fee == 0 {
-            tx.fee = crate::econ::max_fee(&self.c.state, tx.size()) + tx.tip;
+            tx.fee = crate::econ::max_fee(&self.c.state, tx.size()) + tx.tip + self.fuel_margin;
         }
         tx.sign(&keys)
     }
@@ -158,7 +166,7 @@ impl Recorder {
         let exec_root = consensus::hex_32(&self.c.root_at(exec_height).expect("the cited root"));
         let version = crate::upgrade::version_at(&self.c.state, h);
         let raw = txs.iter().map(|(t, _)| t.to_bytes()).collect();
-        let b = CBlock::new(self.parent.digest(), h, self.view, parent_view, self.timestamp, proposer, exec_height, exec_root, raw).with_versions(version, SIGNAL);
+        let b = CBlock::new(self.parent.digest(), h, self.view, parent_view, self.timestamp, proposer, exec_height, exec_root, raw).with_versions(version, self.signal);
         let cert = (p.is_boundary(h) || h.is_multiple_of(BATCH)).then(|| self.certify(&b, epoch));
         self.c.execute(consensus::finalized_from(&b, cert.clone())).unwrap_or_else(|e| panic!("executing block {h}: {e:#}"));
         self.used.clear();
@@ -1198,5 +1206,201 @@ pub(super) fn record_season0() -> Recorder {
     let txs = vec![(r.tx("s0", Action::Clawback { account: c2, reason: "again".into() }), Failed(""))];
     r.block(txs);
     r.until(200);
+    r
+}
+
+// ---------------------------------------------------------------------------------- programs
+
+pub(super) const PROGRAMS: &str = "replay-v2-programs";
+const PROGRAMS_KEYS: &[&str] = &["p0", "p1", "q0", "q1", "alice", "bob", "carol"];
+/// The blocks of the programs recording.
+pub(super) const PROGRAMS_BLOCKS: u64 = 40;
+
+/// A module that imports `beacon_v1`, a host function protocol v2 doesn't have (it joins the ABI
+/// with a later version: docs/RANDOMNESS.md). Fixed bytes, so the recording never changes with a
+/// guest. Assembled by hand from:
+///
+/// ```wat
+/// (module
+///   (import "blockula" "beacon_v1" (func (param i64 i32) (result i32)))
+///   (memory (export "memory") 1 1)
+///   (func (export "bk_x") (drop (call 0 (i64.const 0) (i32.const 0)))))
+/// ```
+pub(super) const BEACON_IMPORT_WASM: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0a, 0x02, 0x60, 0x02, 0x7e, 0x7f, 0x01, //
+    0x7f, 0x60, 0x00, 0x00, 0x02, 0x16, 0x01, 0x08, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x75, 0x6c, 0x61, //
+    0x09, 0x62, 0x65, 0x61, 0x63, 0x6f, 0x6e, 0x5f, 0x76, 0x31, 0x00, 0x00, 0x03, 0x02, 0x01, 0x01, //
+    0x05, 0x04, 0x01, 0x01, 0x01, 0x01, 0x07, 0x11, 0x02, 0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, //
+    0x02, 0x00, 0x04, 0x62, 0x6b, 0x5f, 0x78, 0x00, 0x01, 0x0a, 0x0b, 0x01, 0x09, 0x00, 0x42, 0x00, //
+    0x41, 0x00, 0x10, 0x00, 0x1a, 0x0b,
+];
+
+/// A method that uses a float, `(func (export "bk_x") (drop (f32.const 1)))` beside an exported
+/// one-page memory: refused by upload validation's float rule under every version.
+const FLOAT_WASM: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, //
+    0x01, 0x00, 0x05, 0x04, 0x01, 0x01, 0x01, 0x01, 0x07, 0x11, 0x02, 0x06, 0x6d, 0x65, 0x6d, 0x6f, //
+    0x72, 0x79, 0x02, 0x00, 0x04, 0x62, 0x6b, 0x5f, 0x78, 0x00, 0x00, 0x0a, 0x0a, 0x01, 0x08, 0x00, //
+    0x43, 0x00, 0x00, 0x80, 0x3f, 0x1a, 0x0b,
+];
+
+/// A guest of `node/vm/tests/programs` that protocol v2 runs: its code and its interface. Their
+/// bytes are in the recording's txs: these four don't change (`guests/SHA256SUMS`).
+fn guest(name: &str) -> (Vec<u8>, Vec<u8>) {
+    let (wasm, iface): (&[u8], &[u8]) = match name {
+        "counter" => (include_bytes!("../../vm/tests/programs/counter.wasm"), include_bytes!("../../vm/tests/programs/counter.iface")),
+        "token" => (include_bytes!("../../vm/tests/programs/token.wasm"), include_bytes!("../../vm/tests/programs/token.iface")),
+        "escrow" => (include_bytes!("../../vm/tests/programs/escrow.wasm"), include_bytes!("../../vm/tests/programs/escrow.iface")),
+        "router" => (include_bytes!("../../vm/tests/programs/router.wasm"), include_bytes!("../../vm/tests/programs/router.iface")),
+        _ => panic!("no guest {name}"),
+    };
+    (wasm.to_vec(), iface.to_vec())
+}
+
+/// A two-validator chain born at protocol v2 with programs on, as `blockula summon --programs`
+/// makes one.
+pub(super) fn programs_genesis() -> Genesis {
+    let k = keys_of(PROGRAMS_KEYS);
+    let p = "tboo";
+    let a = |n: &str| k[n].address_with(p);
+    let (p0, op0) = validator(PROGRAMS, "p0", &a("q0"), 2_000);
+    let (p1, op1) = validator(PROGRAMS, "p1", &a("q1"), 2_000);
+    let mut allocations = vec![alloc(crate::chain::treasury(p), 1_000_000, None, "treasury")];
+    for n in ["q0", "q1", "alice", "bob", "carol"] {
+        allocations.push(alloc(a(n), 5_000, None, n));
+    }
+    serde_json::from_value(serde_json::json!({
+        "chain_id": PROGRAMS, "token": "FANG", "decimals": 9, "block_time_ms": 1000, "faucet": false, "created_at_ms": 1_795_000_000_000u64,
+        "validators": [p0, p1], "operators": [op0, op1], "allocations": allocations, "epoch_blocks": 10, "address_prefix": p,
+        "params": { "min_self_bond": (1_000 * FANG).to_string() },
+        "upgrades": [{ "version": 2, "activation_height": 1 }], "features": ["programs"],
+    }))
+    .unwrap()
+}
+
+/// The programs chain's history, every block of it under protocol v2: the four guests uploaded,
+/// created and called (alone, in a batch, through a binding, with value, across epochs), uploads
+/// that fail (code that imports `beacon_v1`, in two epochs; a float), calls that fail (an unbound
+/// program, too little fuel), a call left out of its block (a digest that isn't in force), plain
+/// transfers between them, and a validator's pause, after which a call is left out too.
+pub(super) fn record_programs() -> Recorder {
+    use crate::programs::digest;
+    use crate::types::{Binding, HexBytes, InitCall, ProgramCall, ProgramPolicy};
+    use Want::*;
+    const FUEL: u64 = 2_000_000;
+    let g = programs_genesis();
+    let mut r = Recorder::new("programs", &g, keys_of(PROGRAMS_KEYS), &[seed("p0"), seed("p1")]);
+    // What a v2 release signals, and room in each fee for the fuel a program tx reserves.
+    (r.signal, r.fuel_margin) = (2, 20_000_000);
+    let (alice, bob, carol) = (r.addr("alice"), r.addr("bob"), r.addr("carol"));
+    let bytes = |a: &str| crate::crypto::address_bytes(a).unwrap().to_vec();
+    let le = |n: u64| n.to_le_bytes().to_vec();
+    let upload = |wasm: Vec<u8>, iface: Vec<u8>| Action::UploadCode { wasm: HexBytes(wasm), interface: HexBytes(iface), storage_limit: 10 * FANG };
+    let upload_guest = |name: &str| {
+        let (wasm, iface) = guest(name);
+        upload(wasm, iface)
+    };
+    let create = |name: &str, init: Option<(&str, Vec<u8>)>| {
+        let (wasm, iface) = guest(name);
+        Action::CreateProgram {
+            wasm_hash: hex::encode(digest::wasm_hash(&wasm)),
+            interface_hash: hex::encode(digest::interface_hash(&iface)),
+            authority: None,
+            upgrade_delay_blocks: 0,
+            policy: ProgramPolicy::Open,
+            accepts_transfers: false,
+            fuel_limit: if init.is_some() { FUEL } else { 0 },
+            init: init.map(|(method, input)| InitCall { method: method.into(), input: HexBytes(input), value: 0 }),
+            storage_limit: FANG,
+            bindings: vec![],
+        }
+    };
+    let version = |r: &Recorder, program: &str| {
+        let rec = &r.c.state.programs.records[program];
+        hex::encode(digest::version_digest(program, &rec.wasm_hash, &rec.interface_hash, rec.version))
+    };
+    let call = |r: &Recorder, program: &str, method: &str, input: Vec<u8>, value: u64| ProgramCall { program: program.into(), version_digest: version(r, program), method: method.into(), input: HexBytes(input), value };
+    let calls = |calls: Vec<ProgramCall>, bindings: Vec<Binding>| Action::CallProgram { calls, fuel_limit: FUEL, storage_limit: FANG, bindings };
+    // An interface with the one method the two refused modules export.
+    let x = blockula_vm::interface::encode(&blockula_vm::interface::Interface { methods: vec![blockula_vm::interface::Method { name: "x".into(), kind: blockula_vm::host::MethodKind::Call, payable: false, args: vec![], returns: None }] }).unwrap();
+
+    // Block 1: the four guests' uploads, and two that upload validation refuses (charged, nothing
+    // stored): a module importing a host function v2 doesn't have, and a float.
+    let mut txs: Vec<(Tx, Want)> = ["counter", "token", "escrow", "router"].iter().map(|g| (r.tx("alice", upload_guest(g)), Applied)).collect();
+    txs.push((r.tx("bob", upload(BEACON_IMPORT_WASM.to_vec(), x.clone())), Failed("upload validation rule 5 (Import)")));
+    txs.push((r.tx("bob", upload(FLOAT_WASM.to_vec(), x.clone())), Failed("upload validation rule 4 (Float)")));
+    txs.push((r.tx("carol", Action::Transfer { to: bob.clone(), amount: 3 * FANG }), Applied));
+    r.block(txs);
+    assert_eq!(r.c.state.programs.code.len(), 4, "the refused uploads stored nothing");
+
+    // Block 2: the creates. The token's `init` gives the router (created in the same block, its
+    // address known from alice's nonce) a supply of 1,000.
+    let nonce = r.c.state.account(&alice).nonce;
+    let prefix = r.prefix();
+    let [counter, token, escrow, router] = [0, 1, 2, 3].map(|i| digest::program_address(&prefix, &crate::crypto::address_bytes(&alice).unwrap(), nonce + i));
+    let txs = vec![
+        (r.tx("alice", create("counter", None)), Applied),
+        (r.tx("alice", create("token", Some(("init", [bytes(&router), le(1_000)].concat())))), Applied),
+        (r.tx("alice", create("escrow", None)), Applied),
+        (r.tx("alice", create("router", None)), Applied),
+    ];
+    r.block(txs);
+    assert_eq!(r.c.state.programs.records.len(), 4);
+
+    // Block 3: calls. Bob's batch has the router send carol 250 of its tokens (a binding lets it
+    // reach the token) and opens an escrow deal of 5 FANG with carol as the seller. Carol's
+    // router call has no binding: the token is out of its reach, and the call fails, charged.
+    let route = |to: &str, amount: u64| [bytes(&token), bytes(to), le(amount)].concat();
+    let bind = |r: &Recorder, program: &str| Binding { program: program.into(), version_digest: version(r, program) };
+    let txs = vec![
+        (r.tx("alice", calls(vec![call(&r, &counter, "increment", vec![], 0)], vec![])), Applied),
+        (r.tx("bob", calls(vec![call(&r, &router, "send", route(&carol, 250), 0), call(&r, &escrow, "open", [le(1), bytes(&carol)].concat(), 5 * FANG)], vec![bind(&r, &token)])), Applied),
+        (r.tx("carol", calls(vec![call(&r, &router, "send", route(&carol, 1), 0)], vec![])), Failed("unbound program")),
+    ];
+    r.block(txs);
+
+    // Block 4: bob releases the deal (carol is paid, his deposit comes back); carol sends alice
+    // her tokens; a call that names a digest that isn't the one in force isn't admitted (its
+    // block carries it, execution skips it, uncharged).
+    let mut stale = call(&r, &counter, "increment", vec![], 0);
+    stale.version_digest = "11".repeat(32);
+    let txs = vec![
+        (r.tx("bob", calls(vec![call(&r, &escrow, "release", le(1), 0)], vec![])), Applied),
+        (r.tx("carol", calls(vec![call(&r, &token, "transfer", [bytes(&alice), le(250)].concat(), 0)], vec![])), Applied),
+        (r.tx("alice", calls(vec![stale], vec![])), Skipped),
+    ];
+    r.block(txs);
+
+    // Across two epoch boundaries: the counter counts, tokens move, a transfer in between, and
+    // a call with too little fuel runs out (charged).
+    while r.height() < 24 {
+        let h = r.next();
+        let mut txs = vec![(r.tx("alice", calls(vec![call(&r, &counter, "increment", vec![], 0)], vec![])), Applied)];
+        if h.is_multiple_of(3) {
+            txs.push((r.tx("alice", calls(vec![call(&r, &token, "transfer", [bytes(&bob), le(h)].concat(), 0)], vec![])), Applied));
+        }
+        if h.is_multiple_of(4) {
+            txs.push((r.tx("bob", Action::Transfer { to: carol.clone(), amount: FANG / 2 }), Applied));
+        }
+        if h == 15 {
+            let starved = Action::CallProgram { calls: vec![call(&r, &counter, "increment", vec![], 0)], fuel_limit: 10, storage_limit: FANG, bindings: vec![] };
+            txs.push((r.tx("carol", starved), Failed("")));
+        }
+        r.block(txs);
+    }
+    // In its third epoch the chain still refuses the import: nothing but the version decides it.
+    let txs = vec![(r.tx("carol", upload(BEACON_IMPORT_WASM.to_vec(), x)), Failed("upload validation rule 5 (Import)"))];
+    r.block(txs);
+    r.until(30);
+
+    // A validator pauses programs (one of two is f + 1). From the next block a call isn't
+    // admitted: its block carries it, execution skips it, and a transfer still applies.
+    let q0 = r.addr("q0");
+    let txs = vec![(r.tx_from("q0", &q0, Action::ProgramsPause {}), Applied), (r.tx("alice", calls(vec![call(&r, &counter, "increment", vec![], 0)], vec![])), Applied)];
+    r.block(txs);
+    assert!(r.c.state.programs.meta.as_ref().unwrap().pause.is_some(), "paused");
+    let txs = vec![(r.tx("alice", calls(vec![call(&r, &counter, "increment", vec![], 0)], vec![])), Skipped), (r.tx("bob", Action::Transfer { to: alice.clone(), amount: FANG }), Applied)];
+    r.block(txs);
+    r.until(PROGRAMS_BLOCKS);
     r
 }

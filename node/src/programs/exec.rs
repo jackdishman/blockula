@@ -192,10 +192,14 @@ fn load_and_execute(engine: &mut dyn BlockEngine, codes: &BTreeMap<CodeHash, &[u
 
 /// `UploadCode`'s checks on code the chain doesn't hold (§2.2 step 3): W1's `upload::check`,
 /// validation then a test translation on a throwaway engine, on the transaction's thread (or the
-/// pass's: the throwaway engine is its own either way). A refusal is the upload's failure; a panic
+/// pass's: the throwaway engine is its own either way), under the protocol version in force at
+/// the run's height. A refusal is the upload's failure; a panic
 /// is a `Tx` fault, an engine that won't build `Setup`.
 pub fn check_upload(run: &Run, wasm: &[u8]) -> Result<Result<ModuleInfo, Refusal>, Faulted> {
     let schedule = run.schedule()?;
+    // The version in force at the upload's block decides which host functions its code may
+    // import (PRG 10.1): a function a later version adds is refused until then.
+    let version = run.version;
     #[cfg(test)]
     let tx_id = run.tx.clone();
     on_program_thread(&run.tx, || {
@@ -206,7 +210,7 @@ pub fn check_upload(run: &Run, wasm: &[u8]) -> Result<Result<ModuleInfo, Refusal
         if super::view::inject::armed(&tx_id) == Some(super::view::inject::Injected::Panic) {
             panic!("a fault injected into an upload (test)");
         }
-        upload::check(wasm, schedule).map_err(|f| match f {
+        upload::check(wasm, schedule, version).map_err(|f| match f {
             NodeFault::Engine(_) => Faulted::setup(f),
             _ => Faulted::tx(f),
         })

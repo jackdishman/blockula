@@ -140,6 +140,70 @@ fn write_replay_corpus() {
     assert_covers_v1(&tags);
 }
 
+/// The programs chain's genesis is one a node accepts, born at v2 with programs on.
+#[test]
+fn the_programs_genesis_loads() {
+    let g = programs_genesis();
+    g.check().unwrap();
+    assert_eq!((g.upgrades[0].version, g.upgrades[0].activation_height, g.features.as_slice()), (2, 1, &["programs".to_string()][..]));
+}
+
+/// Replays the committed v2 recording (`v2-programs`), through sync and startup, block for
+/// block: its txs by tag (applied, failed, skipped).
+fn replay_programs() -> BTreeMap<u8, [u64; 3]> {
+    let r = replay(&corpus("v2-programs"), "v2-programs").unwrap_or_else(|e| panic!("v2-programs: {e:#}"));
+    assert_eq!((r.height, r.recorded, r.startup), (PROGRAMS_BLOCKS, PROGRAMS_BLOCKS, Some(PROGRAMS_BLOCKS)));
+    r.tags
+}
+
+/// What the v2 recording must hold: uploads, creates and calls that applied and that failed, a
+/// pause, and a program tx left out of its block.
+fn assert_covers_programs(tags: &BTreeMap<u8, [u64; 3]>) {
+    let n = |tag: u8| tags.get(&tag).copied().unwrap_or_default();
+    assert!(n(62)[0] >= 4 && n(62)[1] >= 3, "uploads: {:?}", n(62));
+    assert!(n(63)[0] >= 4, "creates: {:?}", n(63));
+    assert!(n(64)[0] >= 20 && n(64)[1] >= 2 && n(64)[2] >= 2, "calls: {:?}", n(64));
+    assert_eq!(n(69), [1, 0, 0], "the pause");
+    assert!(n(0)[0] > 0, "plain transfers between them");
+}
+
+/// Writes the v2 recording: `cargo test --release -- --ignored write_v2_replay_corpus`. Only on
+/// purpose, and only with a binary whose v2 rules are the released ones (docs/REPLAY.md
+/// "Changing the corpus"): the committed one was written by v1.0.9's source with this recorder.
+#[test]
+#[ignore]
+fn write_v2_replay_corpus() {
+    let source = "node/src/replay/corpus.rs (cargo test --release -- --ignored write_v2_replay_corpus)";
+    record_programs().write(&corpus("v2-programs"), source, false);
+    let tags = replay_programs();
+    eprintln!("tag: applied/failed/skipped, programs\n{}", tags.iter().map(|(t, n)| format!("{t}: {}/{}/{}", n[0], n[1], n[2])).collect::<Vec<_>>().join("\n"));
+    assert_covers_programs(&tags);
+}
+
+/// The v2 gate: the recorded history of a chain at protocol v2 with programs on replays with
+/// this binary, block for block: every program tx's outcome and receipt, every state root. The
+/// uploads of code importing `beacon_v1` fail in it as they did when it was recorded
+/// (`Rule::Import`), which is what keeps a later version's host functions out of v2.
+#[test]
+fn the_v2_corpus_replays() {
+    assert_covers_programs(&replay_programs());
+    // The recording's refused module: still refused under v2, by the import rule alone.
+    assert_eq!(blockula_vm::validate::validate_at(BEACON_IMPORT_WASM, 2).map(|_| ()).unwrap_err().rule, blockula_vm::validate::Rule::Import);
+    assert!(blockula_vm::validate::validate_at(BEACON_IMPORT_WASM, blockula_vm::abi::RANDOMNESS_VERSION).is_ok(), "and the version that adds it takes the same bytes");
+}
+
+/// Recording the programs chain again gives the committed bytes: the recorder is deterministic,
+/// and this binary's v2 blocks are the recorded ones down to the block log.
+#[test]
+fn recording_the_v2_chain_again_gives_the_committed_bytes() {
+    let dir = scratch("v2-again");
+    record_programs().write(&dir, "node/src/replay/corpus.rs (cargo test --release -- --ignored write_v2_replay_corpus)", false);
+    for f in ["meta.json", "genesis.json", "sync-000000000001.jsonl", "blocks-000000000001.jsonl"] {
+        assert!(std::fs::read(dir.join(f)).unwrap() == std::fs::read(corpus("v2-programs").join(f)).unwrap(), "{f} differs from the committed recording");
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
 /// The gate itself: every recording replays with this binary, through sync and startup, block
 /// for block, and between them every tag a block can carry applied (or, Unbond, failed).
 #[test]

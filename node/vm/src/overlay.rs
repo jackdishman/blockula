@@ -524,6 +524,12 @@ mod tests {
             fn account_creation_fee(&self) -> u64 {
                 FEE
             }
+            fn epoch(&self) -> u64 {
+                0
+            }
+            fn beacon(&self, _: u64) -> Option<crate::host::Beacon> {
+                None
+            }
         }
         const FEE: u64 = 100_000_000;
         const MIN: u64 = MIN_NEW_ACCOUNT;
@@ -595,6 +601,12 @@ mod tests {
         fn account_creation_fee(&self) -> u64 {
             0
         }
+        fn epoch(&self) -> u64 {
+            0
+        }
+        fn beacon(&self, _: u64) -> Option<crate::host::Beacon> {
+            None
+        }
     }
 
     /// Deposits price at the bytes state holds once the write lands, layers included; the
@@ -631,6 +643,12 @@ mod tests {
             }
             fn account_creation_fee(&self) -> u64 {
                 0
+            }
+            fn epoch(&self) -> u64 {
+                0
+            }
+            fn beacon(&self, _: u64) -> Option<crate::host::Beacon> {
+                None
             }
         }
         let (signer, program) = (a(1), a(2));

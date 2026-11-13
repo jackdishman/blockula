@@ -51,7 +51,7 @@ You don't need Rust for web, SDK or MCP work: use the release binary (`curl -fsS
 | The SDK (`sdk-ts/`) | `npm run build -w @blockula/sdk`, `npm run test:kat -w @blockula/sdk`, `npm run test:vectors -w @blockula/sdk`, then the e2e: `blockula dev` in one terminal and `npm test -w @blockula/sdk` in another (`BLOCKULA_RPC` points it at another node) | No |
 | The MCP server (`mcp/`) | `npm run build -w @blockula/sdk`, then `npm test -w @blockula/mcp` (offline) | No |
 | SDK or MCP, end to end | `SKIP_BUILD=1 BIN=$(command -v blockula) bash scripts/local-testnet.sh`, with a release of the version `main` is on: 4 validators, a full node and the SDK e2e | No |
-| The node (`node/`) | `cargo test --release --locked --manifest-path node/Cargo.toml`, the v1 replay gate (`for a in node/testdata/replay/v1-*; do node/target/release/blockula replay "$a"; done`, [docs/REPLAY.md](docs/REPLAY.md)) and `bash scripts/local-testnet.sh` | Yes |
+| The node (`node/`) | `cargo test --release --locked --manifest-path node/Cargo.toml`, the v1 replay gate and the v2 recording (`for a in node/testdata/replay/v[12]-*; do node/target/release/blockula replay "$a"; done`, [docs/REPLAY.md](docs/REPLAY.md)) and `bash scripts/local-testnet.sh` | Yes |
 | The tx encoding | Both sides (`node/src/types.rs` and `sdk-ts/src/tx.ts`) must match byte for byte: the node's tests, the SDK's vectors and the e2e | Yes |
 | The explorer art (`web/lib/ascii`) | `npm run build:haunt`, and commit `node/src/haunt.js` | No |
 

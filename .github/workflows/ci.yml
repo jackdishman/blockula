@@ -74,11 +74,13 @@ jobs:
       # The v1 replay gate (docs/REPLAY.md): this PR's binary replays the recorded v1 history in
       # node/testdata/replay through sync and startup, block by block (every certificate, cited
       # state root, tx outcome, block state root and record). `cargo test` (node-unit) runs the
-      # same corpus in the test build, and shows a binary that diverges from it fails.
-      - name: v1 replay gate (the recorded corpus)
+      # same corpus in the test build, and shows a binary that diverges from it fails. The same
+      # step replays the short v2 recording (v2-programs: programs on, their receipts, and the
+      # refusal of code importing a host function v2 doesn't have).
+      - name: v1 replay gate (the recorded corpus, and the v2 recording)
         run: |
           cargo build --release --locked --manifest-path node/Cargo.toml
-          for archive in node/testdata/replay/v1-*; do node/target/release/blockula replay "$archive"; done
+          for archive in node/testdata/replay/v[12]-*; do node/target/release/blockula replay "$archive"; done
       # The Python SDK (sdk-py/) against the same binary: its signing vectors (shared with the
       # TypeScript SDK) and a transfer and a name on a throwaway dev chain.
       - name: Python SDK (shared signing vectors and local dev-chain e2e)

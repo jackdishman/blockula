@@ -1,4 +1,4 @@
-//! The four guests' interfaces (docs/PROGRAMS-V0.md §3), committed beside their code as the JSON a
+//! The guests' interfaces (docs/PROGRAMS-V0.md §3), committed beside their code as the JSON a
 //! deployer writes (`tests/programs/<guest>.iface.json`, the form `blockula program upload
 //! --interface` reads, §3.4) and the format-1 bytes an `UploadCode` carries
 //! (`tests/programs/<guest>.iface`): what the simulator uploads (§10.2), the `interface_codec`
@@ -31,7 +31,7 @@ use blockula_vm::meter::SCHEDULE_V0;
 use blockula_vm::testing::{MemHost, addr};
 use blockula_vm::validate::validate;
 
-const GUESTS: &[&str] = &["counter", "token", "escrow", "router"];
+const GUESTS: &[&str] = &["counter", "token", "escrow", "router", "dice"];
 
 fn method(name: &str, kind: MethodKind, payable: bool, args: &[(&str, Type)], returns: Option<Type>) -> Method {
     let args = args.iter().map(|(name, ty)| Arg { name: name.to_string(), ty: ty.clone() }).collect();
@@ -41,7 +41,7 @@ fn method(name: &str, kind: MethodKind, payable: bool, args: &[(&str, Type)], re
 /// The guests' interfaces, as their crates' docs (`guests/<guest>/src/lib.rs`) describe them.
 fn guests() -> Vec<(&'static str, Interface)> {
     use MethodKind::{Call, Init, View};
-    use Type::{Address, U64};
+    use Type::{Address, U8, U32, U64};
     let hops = Type::Vec { of: Box::new(Address), max: 8 };
     vec![
         ("counter", Interface { methods: vec![method("get", View, false, &[], Some(U64)), method("increment", Call, false, &[], Some(U64))] }),
@@ -72,6 +72,19 @@ fn guests() -> Vec<(&'static str, Interface)> {
                 methods: vec![
                     method("send", Call, false, &[("hops", hops), ("token", Address), ("to", Address), ("amount", U64)], Some(U64)),
                     method("try_send", Call, false, &[("token", Address), ("to", Address), ("amount", U64)], Some(Type::Bytes { max: 268 })),
+                ],
+            },
+        ),
+        // The randomness guest (docs/RANDOMNESS.md): it imports protocol v3's host functions.
+        // `roll`'s stake is the call's value; `settle` returns the face rolled, 0 for a refund.
+        (
+            "dice",
+            Interface {
+                methods: vec![
+                    method("fund", Call, true, &[], None),
+                    method("init", Init, false, &[("min_reveals", U32)], None),
+                    method("roll", Call, true, &[("pick", U8)], Some(U64)),
+                    method("settle", Call, false, &[("id", U64)], Some(U8)),
                 ],
             },
         ),

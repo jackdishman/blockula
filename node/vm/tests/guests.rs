@@ -14,6 +14,7 @@ use wasmparser::{ExternalKind, FuncType, MemoryType, Parser, Payload, TypeRef, V
 /// Each program and its methods, as its crate's doc comment documents them.
 const PROGRAMS: &[(&str, &[&str])] = &[
     ("counter", &["get", "increment"]),
+    ("dice", &["fund", "init", "roll", "settle"]),
     ("escrow", &["open", "refund", "release"]),
     ("router", &["send", "try_send"]),
     ("token", &["balance_of", "init", "total_supply", "transfer"]),

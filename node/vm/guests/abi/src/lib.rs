@@ -53,8 +53,16 @@ pub mod sys {
         pub safe fn last_abort_code_v1() -> i32;
 
         pub fn emit_v1(name: *const u8, name_len: usize, data: *const u8, data_len: usize);
+
+        // From protocol v3 (`blockula_vm::abi::RANDOMNESS_VERSION`): a program that calls one of
+        // these uploads only on a chain running it.
+        pub fn blake3_v1(ptr: *const u8, len: usize, out: *mut u8);
+        pub safe fn epoch_v1() -> i64;
+        pub fn beacon_v1(epoch: i64, out: *mut u8) -> i32;
     }
 }
+
+pub mod random;
 
 /// Abort codes the wrappers use. Programs number their own from 10, so a receipt's `abort_code`
 /// says whether the program's logic refused or its plumbing did.
@@ -255,6 +263,30 @@ pub fn last_return_into(buf: &mut [MaybeUninit<u8>]) -> Option<&[u8]> {
 /// Emits event `name` (an identifier) with `data`; dropped if this frame rolls back.
 pub fn emit(name: &[u8], data: &[u8]) {
     unsafe { sys::emit_v1(name.as_ptr(), name.len(), data.as_ptr(), data.len()) }
+}
+
+/// The BLAKE3 hash of `data` (protocol v3).
+pub fn blake3(data: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    unsafe { sys::blake3_v1(data.as_ptr(), data.len(), out.as_mut_ptr()) };
+    out
+}
+
+/// The executing block's epoch (protocol v3).
+pub fn epoch() -> u64 {
+    sys::epoch_v1() as u64
+}
+
+/// The randomness beacon of `epoch` and how many validators revealed for it, or `None` if it
+/// isn't derived yet or the chain no longer keeps it (protocol v3). **Not for direct use:** a
+/// value that's readable is public, so a program that reads one and acts on it in the same call
+/// lets its caller choose the outcome. [`random`] has the pattern that's safe.
+pub fn beacon(epoch: u64) -> Option<([u8; 32], u32)> {
+    let mut out = [0u8; 32];
+    match unsafe { sys::beacon_v1(epoch as i64, out.as_mut_ptr()) } {
+        n if n >= 0 => Some((out, n as u32)),
+        _ => None,
+    }
 }
 
 /// The `u64` at `b[at..at + 8]`, little-endian.

@@ -60,6 +60,39 @@ fn arguments_are_checked() {
 /// What `upload` and `create` print as the deposit is what the chain bonds: the upload's receipt and
 /// the created record say the same, for both blobs new, for a new interface over stored code, and for
 /// the record.
+/// New code is checked against the version the next block runs under, from the node's upgrade
+/// schedule: an upgrade that activates at the next block already counts, one after it doesn't
+/// (it is named, with its height), and a node whose `protocol_version` contradicts its own
+/// schedule isn't believed.
+#[test]
+fn an_upload_is_checked_against_the_next_blocks_version() {
+    let at = |v: u32, h: u64| serde_json::json!({ "version": v, "activation_height": h });
+    let upgrade = |height: u64, reported: u32, schedule: Vec<Value>| serde_json::json!({ "height": height, "protocol_version": reported, "schedule": schedule });
+    // A v1 chain with nothing scheduled, and one born at v2.
+    assert_eq!(next_block_version(&upgrade(50, 1, vec![])).unwrap(), (1, vec![]));
+    assert_eq!(next_block_version(&upgrade(50, 2, vec![at(2, 1)])).unwrap(), (2, vec![]));
+    // v3 at block 100. At height 98 the next block (99) is the last v2 one; at 99 it is v3's
+    // first, though the block the node stands on is still v2.
+    let schedule = vec![at(2, 1), at(3, 100)];
+    assert_eq!(next_block_version(&upgrade(98, 2, schedule.clone())).unwrap(), (2, vec![(3, 100)]));
+    assert_eq!(next_block_version(&upgrade(99, 3, schedule.clone())).unwrap(), (3, vec![]));
+    assert_eq!(next_block_version(&upgrade(500, 3, schedule.clone())).unwrap(), (3, vec![]));
+    // Later versions come soonest first.
+    assert_eq!(next_block_version(&upgrade(5, 2, vec![at(4, 900), at(2, 1), at(3, 100)])).unwrap(), (2, vec![(3, 100), (4, 900)]));
+    // The dice's code under each: refused for the last v2 block, taken for v3's first.
+    let dice = std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vm/tests/programs/dice.wasm")).unwrap();
+    let (before, later) = next_block_version(&upgrade(98, 2, schedule.clone())).unwrap();
+    assert!(blockula_vm::validate::validate_at(&dice, before).is_err() && blockula_vm::validate::validate_at(&dice, later[0].0).is_ok());
+    assert!(blockula_vm::validate::validate_at(&dice, next_block_version(&upgrade(99, 3, schedule.clone())).unwrap().0).is_ok());
+    // A node that says one thing and schedules another, or leaves a field out.
+    let err = |v: Value| format!("{:#}", next_block_version(&v).unwrap_err());
+    assert_eq!(err(upgrade(99, 2, schedule.clone())), "it reports protocol v2 for block 100, but its schedule puts v3 in force there");
+    assert_eq!(err(upgrade(98, 3, schedule)), "it reports protocol v3 for block 99, but its schedule puts v2 in force there");
+    assert_eq!(err(serde_json::json!({ "protocol_version": 2, "schedule": [] })), "no height");
+    assert_eq!(err(serde_json::json!({ "height": 1, "schedule": [] })), "no protocol_version");
+    assert_eq!(err(serde_json::json!({ "height": 1, "protocol_version": 2 })), "no schedule");
+}
+
 #[test]
 fn deposits_are_what_the_chain_bonds() {
     let mut d = Dev::new("cli-deposit");

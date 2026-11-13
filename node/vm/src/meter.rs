@@ -45,6 +45,14 @@
 //! | + per page | 2,000 | ~760 ns, touching every page included |
 //! | + per data-segment byte | 1 | 0.04–0.05 ns per fuel |
 //! | Host functions | as 4.5's table | All measured ≤ 1.2 ns per fuel, but `abort_v1` (2.5–2.7: +1,000 here); `debug_log_v1` is priced like `emit_v1` (10.2) |
+//! | `blake3_v1` ‡ | 100 + 200 + 2/B | 4.5's 200 + 1 per byte, doubled per byte: one block at a time (inputs under 1 KiB) BLAKE3 runs its portable or single-block code, ~4–5 cycles per byte |
+//! | `epoch_v1` ‡ | 100 + 200 | A context read |
+//! | `beacon_v1` ‡ | 100 + 1,000 | 4.5's upper figure for a context read: one lookup among the 64 kept values and a 32-byte copy |
+//!
+//! ‡ Importable only from protocol v3 (`abi::RANDOMNESS_VERSION`), so no v2 block can charge
+//! them: they're priced in this schedule rather than a new one because nothing a v2 block runs
+//! changes. Not yet measured on the floor runners (docs/RANDOMNESS.md section 2 has a local
+//! run): the calibration bench's host section has cases for all three.
 //!
 //! Storage costs cover the overlay and the host, not the node's state tree and database at
 //! commit: that's the node's to measure (PROGRAMS-PLAN.md C6).
@@ -92,8 +100,13 @@ pub struct HostCosts {
     /// A nested `call`/`try_call`, plus the callee's instantiation.
     pub call: u64,
     pub call_per_input_byte: u64,
-    /// Context reads (caller, value, height, balance…).
+    /// Context reads (caller, value, height, balance, epoch…).
     pub context: u64,
+    /// `blake3_v1`, on top of `base`, and per byte hashed.
+    pub blake3: u64,
+    pub blake3_per_byte: u64,
+    /// `beacon_v1`, on top of `base`: one read of the state's kept values.
+    pub beacon: u64,
 }
 
 /// What the engine charges per executed Wasm operator, by class: soroban-wasmi's five
@@ -160,6 +173,9 @@ pub const SCHEDULE_V0: Schedule = Schedule {
         call: 20_000,
         call_per_input_byte: 1,
         context: 200,
+        blake3: 200,
+        blake3_per_byte: 2,
+        beacon: 1_000,
     },
     load: LoadCosts {
         load_base: 10_000,

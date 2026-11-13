@@ -455,6 +455,18 @@ fn upload(dir: &Path, code: &Path, interface: &Path, storage_limit: Option<Strin
     with_signer(dir, signer, async |remote, keys, from, bounds| {
         let stored = |path: String| async move { try_get(&remote.rpc, &path).await.map(|v| v.is_some()) };
         let (code_stored, iface_stored) = (stored(format!("/code/{wasm_hash}")).await?, stored(format!("/interface/{interface_hash}")).await?);
+        // The check above takes every host function this release knows. The chain takes the ones
+        // its protocol version has (code importing a later one is refused, and charged): new code
+        // is checked against the version the next block runs under, read from the node's upgrade
+        // schedule. An upload lands in the next block at the earliest, never in the current one.
+        if !code_stored {
+            let (version, later) = next_block_version(&get(&remote.rpc, "/upgrade").await?).with_context(|| format!("{}/api/upgrade", remote.rpc))?;
+            if let Err(e) = blockula_vm::validate::validate_at(&wasm, version) {
+                // The scheduled version that takes it, if the chain has one coming.
+                let when = later.iter().find(|(v, _)| blockula_vm::validate::validate_at(&wasm, *v).is_ok()).map(|(v, at)| format!(" Protocol v{v} takes it and is scheduled for block {at}: upload it from then.")).unwrap_or_default();
+                bail!("the next block runs protocol v{version}, which would refuse this code (upload validation rule {} {:?}: it imports a host function a later protocol version adds): nothing was signed.{when}", e.rule.number(), e.rule);
+            }
+        }
         let deposit = bounds.upload_deposit(&[(wasm.len(), !code_stored), (iface.len(), !iface_stored)]).ok_or_else(|| anyhow!("program state is full: nothing more can be stored at any price"))?;
         println!("deposit   {} bonded for what's new ({}), at today's price; v0 has no way to take a deposit back", fmt_fang(deposit), match (code_stored, iface_stored) {
             (false, false) => "the code and the interface",
@@ -479,6 +491,26 @@ fn upload(dir: &Path, code: &Path, interface: &Path, storage_limit: Option<Strin
         println!("   usable from the block after this one: `blockula program create {wasm_hash} {interface_hash}`");
         Ok(())
     })
+}
+
+/// From `/api/upgrade`: the protocol version in force at the next block (`height + 1`, the first
+/// an upload sent now can land in), worked out from the schedule, and the versions scheduled
+/// after it with their activation heights, soonest first. The node's own `protocol_version` must
+/// say the same, or nothing is signed on its word.
+fn next_block_version(upgrade: &Value) -> Result<(u32, Vec<(u32, u64)>)> {
+    let reported = upgrade["protocol_version"].as_u64().and_then(|v| u32::try_from(v).ok()).ok_or_else(|| anyhow!("no protocol_version"))?;
+    let next = upgrade["height"].as_u64().ok_or_else(|| anyhow!("no height"))?.checked_add(1).ok_or_else(|| anyhow!("no block after that height"))?;
+    let mut schedule = vec![];
+    for u in upgrade["schedule"].as_array().ok_or_else(|| anyhow!("no schedule"))? {
+        let version = u["version"].as_u64().and_then(|v| u32::try_from(v).ok()).ok_or_else(|| anyhow!("a scheduled upgrade has no version"))?;
+        schedule.push((version, u["activation_height"].as_u64().ok_or_else(|| anyhow!("a scheduled upgrade has no activation_height"))?));
+    }
+    // A chain with nothing activated yet runs the version it reports (v1).
+    let in_force = schedule.iter().filter(|(_, at)| *at <= next).map(|(v, _)| *v).max().unwrap_or(reported);
+    ensure!(in_force == reported, "it reports protocol v{reported} for block {next}, but its schedule puts v{in_force} in force there");
+    let mut later: Vec<(u32, u64)> = schedule.into_iter().filter(|(v, at)| *at > next && *v > in_force).collect();
+    later.sort_by_key(|(v, at)| (*at, *v));
+    Ok((in_force, later))
 }
 
 /// What `upload` asks before it signs: the deposit, which v0 never gives back, and the most the fee can be.

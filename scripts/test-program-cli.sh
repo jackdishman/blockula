@@ -146,6 +146,11 @@ refuse over-the-fuel-bound "above program_max_tx_fuel" $P call "$PROGRAM" increm
 refuse send-to-unpayable "isn't payable" $P call "$PROGRAM" increment --value 1 --yes --rpc "$RPC"
 # (Code that is stored already has no deposit to fall short of; the token guest is new.)
 refuse short-storage-limit "is below the deposit" $P upload "$GUESTS/token.wasm" --interface "$GUESTS/token.iface.json" --storage-limit 0.000001 --yes --rpc "$RPC"
+# The dice imports host functions protocol v3 adds (docs/RANDOMNESS.md); this chain runs v2, which
+# would refuse the upload and still charge its fee.
+refuse upload-code-for-a-later-version "the next block runs protocol v2, which would refuse this code" $P upload "$GUESTS/dice.wasm" --interface "$GUESTS/dice.iface.json" --yes --rpc "$RPC"
+has "$LAST" "upload validation rule 5"
+has "$LAST" "nothing was signed"
 
 # The validator pauses programs: from the next block, calls are refused and cost nothing; views go on.
 [[ "$(api /params | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["programs"]["fix_pending"])')" == False ]] || fail "a fix is pending on a fresh dev chain"

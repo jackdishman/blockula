@@ -16,7 +16,7 @@
 
 use crate::engine::{BlockEngine, CodeHash, EngineKind, LoadError, NodeFault, new_block_engine};
 use crate::meter::Schedule;
-use crate::validate::{ModuleInfo, ValidateError, validate};
+use crate::validate::{ModuleInfo, ValidateError, validate_at};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -45,20 +45,22 @@ impl std::error::Error for Refusal {}
 /// and the throwaway engine holds this one code, so any hash will do.
 const TRIAL: CodeHash = [0; 32];
 
-/// [`validate`], then a test translation of `wasm` on a fresh soroban-wasmi engine configured
+/// [`validate_at`] under `protocol_version` (the version in force at the upload's block: it
+/// decides which host functions the code may import), then a test translation of `wasm` on a
+/// fresh soroban-wasmi engine configured
 /// from `schedule` (the node's engine: the `ref038` oracle never decides what uploads). Returns
 /// what validation learned (`ModuleInfo`: the methods to match with the interface, the entity
 /// counts) or why the code is refused, or the node fault that stopped the check. Run it on the
 /// transaction's large-stack thread, as `execute`.
-pub fn check(wasm: &[u8], schedule: &Schedule) -> Result<Result<ModuleInfo, Refusal>, NodeFault> {
-    check_on(wasm, || new_block_engine(EngineKind::Soroban, schedule))
+pub fn check(wasm: &[u8], schedule: &Schedule, protocol_version: u32) -> Result<Result<ModuleInfo, Refusal>, NodeFault> {
+    check_on(wasm, protocol_version, || new_block_engine(EngineKind::Soroban, schedule))
 }
 
 /// [`check`], with the engine `fresh` makes: the tests give it engines that fail.
-fn check_on(wasm: &[u8], fresh: impl FnOnce() -> Result<Box<dyn BlockEngine>, NodeFault>) -> Result<Result<ModuleInfo, Refusal>, NodeFault> {
+fn check_on(wasm: &[u8], protocol_version: u32, fresh: impl FnOnce() -> Result<Box<dyn BlockEngine>, NodeFault>) -> Result<Result<ModuleInfo, Refusal>, NodeFault> {
     // A panic anywhere in here unwinds through the throwaway engine, which goes with it.
     catch_unwind(AssertUnwindSafe(|| {
-        let info = match validate(wasm) {
+        let info = match validate_at(wasm, protocol_version) {
             Ok(info) => info,
             Err(e) => return Ok(Err(Refusal::Invalid(e))),
         };
@@ -73,7 +75,8 @@ mod tests {
     use super::*;
     use crate::engine::{CodeInfo, Host, Invoked};
     use crate::meter::SCHEDULE_V0;
-    use crate::validate::Rule;
+    use crate::abi::{FIRST_VERSION, RANDOMNESS_VERSION};
+    use crate::validate::{Rule, validate};
 
     /// A minimal program: one function `[] -> []` doing nothing, and one memory of one page,
     /// exported (sections: type, function, memory, export, code).
@@ -108,9 +111,9 @@ mod tests {
 
     #[test]
     fn accepts_valid_code_and_refuses_invalid_code() {
-        let info = check(MINIMAL, &SCHEDULE_V0).unwrap().unwrap();
+        let info = check(MINIMAL, &SCHEDULE_V0, FIRST_VERSION).unwrap().unwrap();
         assert_eq!(info, validate(MINIMAL).unwrap());
-        match check(&MINIMAL[..MINIMAL.len() - 1], &SCHEDULE_V0) {
+        match check(&MINIMAL[..MINIMAL.len() - 1], &SCHEDULE_V0, FIRST_VERSION) {
             Ok(Err(Refusal::Invalid(e))) => assert_eq!(e.rule, Rule::Wasm, "{e}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -119,17 +122,48 @@ mod tests {
     // The engine refusing code validation passed is the upload's refusal, on every node alike.
     #[test]
     fn a_translation_refused_is_a_refusal() {
-        assert_eq!(check_on(MINIMAL, failing(false)), Ok(Err(Refusal::Translate(LoadError::Translate("injected refusal".into())))));
+        assert_eq!(check_on(MINIMAL, FIRST_VERSION, failing(false)), Ok(Err(Refusal::Translate(LoadError::Translate("injected refusal".into())))));
     }
 
     // A panic in the test translation, or an engine that can't be made, is the node's trouble:
     // never a refused upload.
     #[test]
     fn a_translator_panic_is_a_node_fault() {
-        assert_eq!(check_on(MINIMAL, failing(true)), Err(NodeFault::Panic));
+        assert_eq!(check_on(MINIMAL, FIRST_VERSION, failing(true)), Err(NodeFault::Panic));
         let broken = || Err(NodeFault::Engine("injected".into()));
-        assert_eq!(check_on(MINIMAL, broken), Err(NodeFault::Engine("injected".into())));
+        assert_eq!(check_on(MINIMAL, FIRST_VERSION, broken), Err(NodeFault::Engine("injected".into())));
         // Code validation refuses never reaches the engine, panicking or not.
-        assert!(matches!(check_on(b"\0asm", failing(true)), Ok(Err(Refusal::Invalid(_)))));
+        assert!(matches!(check_on(b"\0asm", FIRST_VERSION, failing(true)), Ok(Err(Refusal::Invalid(_)))));
+    }
+
+    /// 10.1's admission of imports: code importing a host function protocol v3 adds is refused
+    /// by an upload under v2 (as an import the ABI doesn't have, before any engine sees it) and
+    /// accepted from v3 on; code that imports none of them uploads the same under both.
+    #[test]
+    fn an_import_is_refused_until_its_protocol_version() {
+        let module = |import: &str| {
+            let text = format!(r#"(module {import} (memory (export "memory") 1 1) (func (export "bk_x")))"#);
+            crate::testing::strip_custom_sections(&wat::parse_str(text).unwrap())
+        };
+        for import in [
+            r#"(import "blockula" "blake3_v1" (func (param i32 i32 i32)))"#,
+            r#"(import "blockula" "epoch_v1" (func (result i64)))"#,
+            r#"(import "blockula" "beacon_v1" (func (param i64 i32) (result i32)))"#,
+        ] {
+            let wasm = module(import);
+            for v in [0, 1, FIRST_VERSION] {
+                match check_on(&wasm, v, failing(true)) {
+                    Ok(Err(Refusal::Invalid(e))) => assert_eq!(e.rule, Rule::Import, "{import} under v{v}: {e}"),
+                    other => panic!("{import} under v{v}: expected a refusal, got {other:?}"),
+                }
+            }
+            for v in [RANDOMNESS_VERSION, RANDOMNESS_VERSION + 1, u32::MAX] {
+                let info = check(&wasm, &SCHEDULE_V0, v).unwrap().unwrap_or_else(|e| panic!("{import} under v{v}: {e}"));
+                assert_eq!(info.imports.len(), 1, "{import}");
+            }
+        }
+        let old = module(r#"(import "blockula" "block_height_v1" (func (result i64)))"#);
+        assert_eq!(check(&old, &SCHEDULE_V0, FIRST_VERSION), check(&old, &SCHEDULE_V0, RANDOMNESS_VERSION));
+        assert!(check(&old, &SCHEDULE_V0, FIRST_VERSION).unwrap().is_ok());
     }
 }

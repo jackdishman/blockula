@@ -32,7 +32,7 @@
 
 use blockula_vm::engine::{Address, BlockEngine, CodeHash, EngineKind, Host, Instance, NodeFault, Trap, TrapKind, new_block_engine};
 use blockula_vm::exec::{ANY_VERSION, Call, Entry, FailCode, Receipt, TxLimits, execute};
-use blockula_vm::host::MethodKind;
+use blockula_vm::host::{Beacon, MethodKind};
 use blockula_vm::meter::{SCHEDULE_V0, Schedule};
 use blockula_vm::testing::{MemHost, addr};
 use blockula_vm::upload;
@@ -288,6 +288,9 @@ const IMPORTS: &str = r#"
   (import "blockula" "last_return_len_v1" (func $last_return_len (result i32)))
   (import "blockula" "last_abort_code_v1" (func $last_abort_code (result i32)))
   (import "blockula" "emit_v1" (func $emit (param i32 i32 i32 i32)))
+  (import "blockula" "blake3_v1" (func $blake3 (param i32 i32 i32)))
+  (import "blockula" "epoch_v1" (func $epoch (result i64)))
+  (import "blockula" "beacon_v1" (func $beacon (param i64 i32) (result i32)))
 "#;
 
 /// How many host functions `IMPORTS` declares: all of ABI v1, so module labels can't drift from it.
@@ -784,8 +787,8 @@ fn section_translate() -> Vec<LoadResult> {
             let (l, d) = time_load(kind, &wasm);
             load.push((kind, l, d));
         }
-        assert!(matches!(upload::check(&wasm, SCHEDULE), Ok(Ok(_))), "{name}: the upload is refused");
-        let up = time(|| (upload::check(&wasm, SCHEDULE), blake3::derive_key(CODE_HASH_CONTEXT, &wasm)));
+        assert!(matches!(upload::check(&wasm, SCHEDULE, blockula_vm::abi::LATEST_VERSION), Ok(Ok(_))), "{name}: the upload is refused");
+        let up = time(|| (upload::check(&wasm, SCHEDULE, blockula_vm::abi::LATEST_VERSION), blake3::derive_key(CODE_HASH_CONTEXT, &wasm)));
         results.push(LoadResult { name, size: wasm.len(), validate: v, load, upload: up });
     }
     let mut header = vec!["module".to_string(), "bytes".into(), "validate µs (ns/B)".into()];
@@ -1066,6 +1069,11 @@ fn host_bench_program() -> Vec<u8> {
         ("last_return_len", "", "(drop (call $last_return_len))"),
         ("last_abort_code", "", "(drop (call $last_abort_code))"),
         ("emit", "", "(call $emit (i32.const 60100) (local.get $K) (i32.const 80000) (local.get $L))"),
+        // L: the bytes hashed, from address 0; the digest lands past them.
+        ("blake3", "", "(call $blake3 (i32.const 0) (local.get $L) (i32.const 100000))"),
+        ("epoch", "", "(drop (call $epoch))"),
+        // K: the epoch asked for.
+        ("beacon", "", "(drop (call $beacon (i64.extend_i32_u (local.get $K)) (i32.const 40000)))"),
     ];
     let mut funcs = String::new();
     for (name, setup, body) in methods {
@@ -1206,11 +1214,22 @@ fn host_cases() -> Vec<HostCase> {
         hc("last_abort_code_v1", "", "last_abort_code", 0, 0),
         hc("emit_v1", "8 B name, 0 B data (64 a tx)", "emit", 0, 8).bound(64),
         hc("emit_v1", "32 B name, 16,352 B data (1 a tx)", "emit", 16352, 32).bound(1),
+        hc("blake3_v1", "0 B", "blake3", 0, 0),
+        hc("blake3_v1", "64 B (one block)", "blake3", 64, 0),
+        hc("blake3_v1", "1 KiB (one chunk)", "blake3", 1024, 0),
+        hc("blake3_v1", "64 KiB", "blake3", 65536, 0),
+        hc("epoch_v1", "", "epoch", 0, 0),
+        hc("beacon_v1", "not derived (−1)", "beacon", 0, 99),
+        hc("beacon_v1", "kept, of 64", "beacon", 0, BEACON_EPOCH as u32),
     ]
 }
 
+/// The newest of the 64 beacon values `host_world` keeps (`beacon::VALUES_KEPT`).
+const BEACON_EPOCH: u64 = 63;
+
 fn host_world(case: &HostCase, hb: &[u8], leaf: &[u8], leaf32: &[u8]) -> MemHost {
     let mut host = world();
+    host.beacons = (0..=BEACON_EPOCH).map(|e| (e, Beacon { value: [e as u8; 32], reveals: 4 })).collect();
     host.deploy(addr(HB), hb);
     host.deploy(addr("leaf"), leaf);
     host.deploy(addr("leaf32"), leaf32);
@@ -1293,6 +1312,9 @@ fn section_host() {
         ("call_v1", "callee 1 page, empty method", "callee 1 page, 32 KiB input", 32768.0),
         ("last_return_v1", "0 B", "4 KiB", 4096.0),
         ("emit_v1", "8 B name, 0 B data (64 a tx)", "32 B name, 16,352 B data (1 a tx)", (16352 + 24) as f64),
+        ("blake3_v1", "0 B", "64 B (one block)", 64.0),
+        ("blake3_v1", "64 B (one block)", "1 KiB (one chunk)", 960.0),
+        ("blake3_v1", "1 KiB (one chunk)", "64 KiB", 64512.0),
     ];
     let mut rows = Vec::new();
     for (func, small, large, bytes) in pairs {
