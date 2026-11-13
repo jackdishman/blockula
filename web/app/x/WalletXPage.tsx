@@ -1,7 +1,7 @@
 "use client";
 
 import "@/app/explorer.css";
-import { xHandle, xIntentUrl, xLinkCode, xProofPost, type XLink } from "@blockula/sdk";
+import { booProfileUrl, xHandle, xIntentUrl, xLinkCode, xProofPost, type XLink } from "@blockula/sdk";
 import Link from "next/link";
 import { useState } from "react";
 import { ActionForm } from "@/components/explorer/ActionForm";
@@ -49,7 +49,9 @@ function LinkX() {
     }
   }
   const code = handle && chain ? xLinkCode(chain, wallet.account, handle) : null;
-  const text = code ? xProofPost(code) : null;
+  // The post links the account's page on this chain: this origin's /boo/<name> (the node's own
+  // route in the served wallet, proxy.ts elsewhere). Not on plain http, where no stranger could open it.
+  const text = code ? xProofPost(code, booProfileUrl(window.location.origin, mine?.names[0])) : null;
 
   return (
     <main className="narrow stack-lg">

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import {
-  Client, Wallet, X_CODE_PREFIX, X_OEMBED, X_UNLINK_MEMO, checkXProof, fetchXPost, isXHandle, parseXMemo, parseXOEmbed, sameXHandle, signingBytes, verifyXLink, xHandle, xIntentUrl, xLinkCode, xLinkFrom, xLinkMemo,
+  Client, Wallet, X_CODE_PREFIX, X_OEMBED, X_UNLINK_MEMO, checkXProof, fetchXPost, isXHandle, parseXMemo, parseXOEmbed, sameXHandle, signingBytes, verifyXLink, xHandle, xIntentUrl, booProfileUrl, xLinkCode, xLinkFrom, xLinkMemo,
   xPostRef, xPostUrl, xProofPost, xRecordIn, xRecordOf, type Tx, type XRecordTx,
 } from "../src/index.js";
 
@@ -63,6 +63,14 @@ const ME = me.address;
   assert.ok(text.length <= 280, "fits a post");
   assert.ok(!/[@#$]/.test(text), "nothing X would turn into a mention or a tag");
   assert.deepEqual(text.match(/[a-z0-9-]+(\.[a-z0-9-]+)+/gi), ["blockula.app"], "the only thing X can turn into a link is blockula.app: never a .boo name, which is a web domain too");
+  // With a name and a public node, the link is the account's page on that chain.
+  assert.equal(booProfileUrl("https://demo.blockula.app", "vlad.boo"), "https://demo.blockula.app/boo/vlad");
+  assert.equal(booProfileUrl("https://chain.example/base/", "Vlad"), "https://chain.example/base/boo/vlad");
+  for (const [node, name] of [["http://localhost:7070", "vlad.boo"], ["http://fake.node", "vlad.boo"], ["https://u:p@chain.example", "vlad.boo"], ["not a url", "vlad.boo"], ["https://chain.example", undefined], ["https://chain.example", "v"], ["https://chain.example", "-vlad"], ["https://chain.example", "vl/ad"], ["https://chain.example", "vlad.boo.boo"]] as const)
+    assert.equal(booProfileUrl(node, name), null, `${node} ${name}`);
+  const named = xProofPost(code, booProfileUrl("https://demo.blockula.app", "vlad.boo"));
+  assert.equal(named, `Verifying my Blockula account: https://demo.blockula.app/boo/vlad\n\n${code}`);
+  assert.ok(!/\.boo\b/.test(named) && !/[@#$]/.test(named) && xProofPost(code, booProfileUrl("https://a-long-host-name.chains.example.org", "a".repeat(32))).length <= 280);
   assert.equal(new URL(xIntentUrl(text)).searchParams.get("text"), text);
   assert.equal(new URL(xIntentUrl(text)).origin + new URL(xIntentUrl(text)).pathname, "https://x.com/intent/post");
   console.log("✓ the proof code binds the chain, the account and the handle");
