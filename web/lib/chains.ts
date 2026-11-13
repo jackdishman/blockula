@@ -57,20 +57,37 @@ function folded(s: string): string {
 }
 
 /**
- * The project's own domain. A chain whose node is at one of its subdomains is run by the project
- * (deploy/host-chain.sh hosts them, like the demo chain at dishnet.blockula.app): only the
- * project can serve a name under it, so such a host can't be an impersonation.
+ * The project's own domain. Its subdomains aren't all the project's: `<name>.blockula.app` can be
+ * a boo's own site, pointed there by the owner of `<name>.boo` (sites/README.md). Only the hosts
+ * in `PROJECT_HOSTS` are the project's.
  */
 export const PROJECT_DOMAIN = "blockula.app";
 
-/** Whether `rpc` (a listing's node, an https origin) is a subdomain of the project's domain. */
+/**
+ * The hosts the project runs chains on (deploy/host-chain.sh). A chain whose node is at one of
+ * them is run by the project, and its listing may carry the project's name. A new hosted chain is
+ * added here in the PR that lists it.
+ */
+export const PROJECT_HOSTS: ReadonlySet<string> = new Set(["demo.blockula.app"]);
+
+/** Whether `rpc` (a listing's node, an https origin) is one of the project's own hosts. */
 export function projectRun(rpc: string): boolean {
   try {
     const u = new URL(rpc);
-    return u.protocol === "https:" && u.hostname.endsWith(`.${PROJECT_DOMAIN}`) && !u.port;
+    return u.protocol === "https:" && PROJECT_HOSTS.has(u.hostname) && !u.port;
   } catch {
     return false;
   }
+}
+
+/**
+ * The part of a host that its owner chose: a boo's site at `<name>.blockula.app` chose `<name>`
+ * (the project's domain is in every one of them), a Funnel host its machine's name.
+ */
+export function chosenHost(hostname: string): string {
+  const h = hostname.toLowerCase();
+  if (h.endsWith(`.${PROJECT_DOMAIN}`)) return h.slice(0, -PROJECT_DOMAIN.length - 1);
+  return h.replace(/\.ts\.net$/, "");
 }
 
 /** Whether `s` reads as Blockula itself, or as official: the project lists chains, it doesn't run them. */
@@ -180,7 +197,7 @@ export function checkChain(file: string, raw: unknown): string[] {
       else if (`${u.origin}` !== c.rpc) errors.push(`rpc must be the node's origin alone, with no path, query or trailing slash (like ${u.origin})`);
       const why = publicNameProblem(u.hostname);
       if (why) errors.push(`rpc's host ${u.hostname} ${why}`);
-      else if (!projectRun(c.rpc) && soundsOfficial(u.hostname.replace(/\.ts\.net$/, ""))) errors.push("rpc's host reads as Blockula's own");
+      else if (!projectRun(c.rpc) && soundsOfficial(chosenHost(u.hostname))) errors.push("rpc's host reads as Blockula's own");
     }
   }
 

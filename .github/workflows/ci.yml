@@ -199,6 +199,8 @@ jobs:
       - run: npm test -w @blockula/web
       - name: Chain directory (chains/*.json, listed on blockula.app)
         run: node scripts/check-chains.mjs
+      - name: Name sites (sites/*.json, <name>.blockula.app)
+        run: node scripts/check-sites.mjs
       - name: Explorer backdrop bundle is up to date
         run: npm run build:haunt && git diff --exit-code node/src/haunt.js
 

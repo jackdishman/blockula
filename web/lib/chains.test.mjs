@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { checkChain, checkChains, contactUrl, listingJson, listingLink, projectRun, publicNameProblem, soundsOfficial, units } from "./chains.ts";
+import { checkChain, checkChains, chosenHost, contactUrl, listingJson, listingLink, projectRun, publicNameProblem, soundsOfficial, units } from "./chains.ts";
 
 const GOOD = {
   name: "Jack in the Block",
@@ -33,15 +33,23 @@ test("a good listing, and the optional fields", () => {
   assert.deepEqual(errs({ contact: "https://forum.example.org/u/jack" }), []);
 });
 
-test("the project's own subdomains may say Blockula; look-alikes may not", () => {
-  assert.deepEqual(errs({ rpc: "https://dishnet.blockula.app", p2p: "dishnet.blockula.app:30300" }), []);
-  assert.ok(projectRun("https://dishnet.blockula.app"));
-  for (const rpc of ["https://blockula.app.example.org", "https://myblockula.app", "https://dishnet.blockula.app:8443", "http://dishnet.blockula.app", "https://blockula-chain.example.org"]) {
+test("the project's own hosts may say Blockula; its other subdomains and look-alikes may not", () => {
+  assert.ok(projectRun("https://demo.blockula.app"));
+  for (const rpc of ["https://blood.blockula.app", "https://dishnet.blockula.app", "https://blockula.app", "https://blockula.app.example.org", "https://myblockula.app", "https://demo.blockula.app:8443", "http://demo.blockula.app", "https://blockula-chain.example.org", "not a url"]) {
     assert.ok(!projectRun(rpc), rpc);
   }
   assert.ok(errs({ rpc: "https://blockula.app.example.org" }).some((e) => /reads as Blockula/.test(e)));
   assert.deepEqual(errs({ rpc: "https://demo.blockula.app", p2p: "demo.blockula.app:30300", name: "Blockula", chain_id: "blockula-demo", description: "Blockula's demo chain." }, "blockula-demo.json"), [], "the project's own chain may carry its name");
   assert.ok(errs({ name: "Blockula" }).some((e) => /name reads as Blockula/.test(e)), "anyone else's may not");
+});
+
+test("a boo's site at <name>.blockula.app is listed like any other chain", () => {
+  assert.equal(chosenHost("blood.blockula.app"), "blood");
+  assert.equal(chosenHost("Box.tail1234.ts.net"), "box.tail1234");
+  assert.deepEqual(errs({ rpc: "https://blood.blockula.app", p2p: "blood.blockula.app:30300" }), [], "the domain itself doesn't make it read as Blockula's");
+  assert.ok(errs({ rpc: "https://blood.blockula.app", name: "Blockula" }).some((e) => /name reads as Blockula/.test(e)), "nor does it lend the name");
+  assert.ok(errs({ rpc: "https://official.blockula.app" }).some((e) => /host reads as Blockula/.test(e)));
+  assert.ok(errs({ rpc: "https://blockula-2.blockula.app" }).some((e) => /host reads as Blockula/.test(e)));
 });
 
 test("refuses bad shapes", () => {
