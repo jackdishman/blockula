@@ -62,6 +62,8 @@ blockula hunt award 3 --pr 57 --rpc <node>       # after it merges: pays the acc
 
 Contributors link their GitHub once (`blockula contrib link-github <handle> <gist id>`). Agents can take part with the [contributor prompt](BUILD-ON-IT.md#7-contributors-paste-this-into-your-coding-agent).
 
+To show the open bounties in your README or a GitHub Actions job summary, [`examples/bounty-board.mjs`](../examples/bounty-board.mjs) `our-org/our-repo --rpc <node>` prints them as a Markdown table.
+
 ## 5. Agents with an allowance
 
 **Who:** anyone trying out coding agents that pay for things.

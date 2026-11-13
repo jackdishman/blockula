@@ -10,6 +10,7 @@ Scripts that use [`@blockula/sdk`](../sdk-ts/README.md) the way [docs/INTEGRATIO
 | [`guestbook.mjs`](guestbook.mjs) | `serve` logs each signature (a payment with a memo) sent to a name; `read` prints the latest ones from any node, with no key, as inert text |
 | [`shared-tab.mjs`](shared-tab.mjs) | A shared tab for a trip or a house ([USE-CASES.md](../docs/USE-CASES.md#1-a-shared-tab-for-a-trip-or-a-house)): reads what a group's `.boo` names paid each other, then prints who owes whom and the fewest payments that settle it. Reads only, with no key |
 | [`club-vote.mjs`](club-vote.mjs) | A club that votes ([USE-CASES.md](../docs/USE-CASES.md#3-a-club-that-votes)): lists a chain's open proposals as a voter should see them, what each does rendered from its bound content (never the node's summary), tallies, turnout against quorum, blocks left, and the digest and command to vote. Reads only, with no key |
+| [`bounty-board.mjs`](bounty-board.mjs) | A team's bounty board ([USE-CASES.md](../docs/USE-CASES.md#4-a-teams-bounty-board)): a repo's open Hunts as a Markdown table, biggest first, with the issue linked, the bounty, how many funded it and when it expires, for a README or a [GitHub Actions job summary](#a-bounty-board-in-a-job-summary). Hunt titles are escaped to plain text. Reads only, with no key |
 
 ## Run them against `blockula dev`
 
@@ -63,6 +64,32 @@ node examples/club-vote.mjs --network local --all    # and the closed ones, with
 ```
 
 For each open proposal it prints its id, its title (the proposer's words, quoted), what it does, rendered here from its kind, aye and nay (conviction-weighted) and the FANG behind them, turnout against quorum, blocks left to vote, and the `digest` a vote binds, with the command that votes on it: `blockula gov vote <id> <aye|nay> <amount> --digest <digest>`. That command refuses a proposal whose content reads differently by then. The node's own `summary` of a proposal isn't shown, since no digest covers it. Quorum is set when voting closes, from the supply that's unlocked then, so while a vote is open the script gives the range it can fall in. It signs nothing.
+
+## A bounty board in a job summary
+
+`examples/bounty-board.mjs <owner/repo>` prints a repo's open Hunts as a Markdown table: the issue (linked), its title, the bounty, how many funded it and about when it expires. Paste it into a README, or let a workflow append it to the run's summary page. This one runs every morning and on demand:
+
+```yaml
+# .github/workflows/bounty-board.yml
+name: Bounty board
+on:
+  schedule: [{ cron: "17 6 * * *" }]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  board:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-save @blockula/sdk
+      # Pin the script to a commit you've read rather than to main.
+      - run: curl -fsSLo bounty-board.mjs https://raw.githubusercontent.com/jackdishman/blockula/<commit>/examples/bounty-board.mjs
+      - run: node bounty-board.mjs "${{ github.repository }}" --network demo >> "$GITHUB_STEP_SUMMARY"
+```
+
+On a chain of your own, pass one of its nodes with `--rpc` instead of `--network demo`. A hunt's title is whatever its creator wrote: the script backslash-escapes every punctuation character in it, so a title shows as plain text and can't add a link, an image, HTML or a table cell. The issue links are built from the repo you name, not taken from the node.
 
 ## Play with your agent: trick-or-treat and a guestbook
 

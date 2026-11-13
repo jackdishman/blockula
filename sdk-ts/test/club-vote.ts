@@ -41,7 +41,7 @@ const proposal = (p: Record<string, unknown>) => ({
   ...p,
 });
 
-const thursdays = { kind: { type: "text" } as ProposalKind, title: "Move meetings\nto Thursdays?‮", url: "https://example.com/club/42" };
+const thursdays = { kind: { type: "text" } as ProposalKind, title: "Move meetings\nto Thursdays?\u202e", url: "https://example.com/club/42" };
 const spend = { kind: { type: "treasury_spend", to: LUCY, amount: parseFang("2.5").toString() } as ProposalKind, title: "Pay for the hall" };
 const proposals = [
   // Newest first, as the node serves them.
