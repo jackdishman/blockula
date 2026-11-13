@@ -323,16 +323,15 @@ fn not_built() -> Response {
         .into_response()
 }
 
-/// `/boo/<name>` (`vlad` or `vlad.boo`): an account's page by its name, a link short enough to
+/// `/boo/<name>` (`vlad` or `vlad.boo`): a boo's profile by its name, a link short enough to
 /// post (the X proof post carries it: sdk-ts/src/xlink.ts `booProfileUrl`). It goes on to the
-/// account's page in the wallet, or in the explorer when this binary has no wallet. A temporary
-/// redirect, so the page it lands on can change. Anything that isn't a name is a 404.
+/// name's profile in the wallet (web/app/boo), or to the account in the explorer when this binary
+/// has no wallet. Anything that isn't a name is a 404.
 fn boo(name: &str) -> Response {
     let Ok(label) = crate::types::normalize_name(name) else {
         return (StatusCode::NOT_FOUND, "no such page: /boo/<name> takes a .boo name\n").into_response();
     };
-    let name = format!("{label}{}", crate::types::NAME_SUFFIX);
-    let to = if embedded() { format!("{BASE}/account/{name}/") } else { format!("/#/account/{name}") };
+    let to = if embedded() { format!("{BASE}/boo/{label}/") } else { format!("/#/account/{label}{}", crate::types::NAME_SUFFIX) };
     Redirect::temporary(&to).into_response()
 }
 
@@ -535,11 +534,11 @@ mod tests {
         let res = app.clone().oneshot(axum::http::Request::builder().uri("/wallet").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
         assert_eq!(res.headers()[header::LOCATION], "/wallet/");
-        // /boo/<name> goes on to the account's page, by its full name; nothing else does.
+        // /boo/<name> goes on to the name's profile; nothing that isn't a name does.
         for uri in ["/boo/vlad", "/boo/Vlad.boo"] {
             let res = app.clone().oneshot(axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
             assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
-            assert_eq!(res.headers()[header::LOCATION], if embedded() { "/wallet/account/vlad.boo/" } else { "/#/account/vlad.boo" });
+            assert_eq!(res.headers()[header::LOCATION], if embedded() { "/wallet/boo/vlad/" } else { "/#/account/vlad.boo" });
         }
         for uri in ["/boo/v", "/boo/-vlad", "/boo/vl%2Fad", "/boo/vlad%0d%0aset-cookie", "/boo/vlad/more", "/boo/"] {
             let res = app.clone().oneshot(axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
@@ -566,7 +565,7 @@ mod tests {
             return;
         }
         let w = Wallet::new("x");
-        for route in ["tx", "account", "block", "name", "hunt", "claim", "seance", "program", "programs", "trace"] {
+        for route in ["tx", "account", "block", "name", "boo", "hunt", "claim", "seance", "program", "programs", "trace"] {
             assert!(w.dynamic.contains(route), "{route}/_/index.html is in the export");
             let want = format!("{route}/_/index.html");
             assert_eq!(w.resolve(&format!("{route}/something/")).unwrap(), Some(want.as_str()));

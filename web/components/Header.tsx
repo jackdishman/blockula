@@ -44,7 +44,7 @@ export function Header() {
   const known = Object.values(NETWORKS).filter((n): n is Network => !!n);
   // A program's records (a hunt, a claim, a Séance) belong to Programs; every other chain page to Explore.
   const programs = /^\/(programs?|hunt|claim|seance)(\/|$)/.test(path);
-  const boos = /^\/(boos|guestbook)(\/|$)/.test(path);
+  const boos = /^\/(boos?|guestbook)(\/|$)/.test(path);
   const explore = isExplorerPath(path) && !programs && !boos;
   return (
     <>

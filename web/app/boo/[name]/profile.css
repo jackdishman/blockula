@@ -1,0 +1,11 @@
+/* A boo's profile (app/boo/[name]): the name first, then who they say they are and what they've done. */
+.profile-head { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 20px; align-items: center; }
+.profile-sigil { width: 84px; height: 84px; display: grid; place-items: center; border: 2px solid var(--ink); background: var(--paper-hi); font: 400 48px/1 var(--display); color: var(--ink); box-shadow: 4px 4px 0 var(--ink); }
+.profile-head .page-head { min-width: 0; }
+.profile-head h1 { overflow-wrap: anywhere; }
+.profile-ids { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+.profile-more { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: baseline; }
+@media (max-width: 640px) {
+  .profile-head { grid-template-columns: minmax(0, 1fr); }
+  .profile-sigil { width: 60px; height: 60px; font-size: 34px; box-shadow: 3px 3px 0 var(--ink); }
+}

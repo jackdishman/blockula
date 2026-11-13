@@ -49,8 +49,9 @@ function LinkX() {
     }
   }
   const code = handle && chain ? xLinkCode(chain, wallet.account, handle) : null;
-  // The post links the account's page on this chain: this origin's /boo/<name> (the node's own
-  // route in the served wallet, proxy.ts elsewhere). Not on plain http, where no stranger could open it.
+  // The post links the account's profile on this chain: this origin's /boo/<name> (app/boo; in
+  // the served wallet the node sends it on to /wallet/boo/<name>/). Not on plain http, where no
+  // stranger could open it.
   const text = code ? xProofPost(code, booProfileUrl(window.location.origin, mine?.names[0])) : null;
 
   return (

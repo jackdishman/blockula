@@ -147,7 +147,7 @@ function SignatureRow({ s, me, head, blockMs }: { s: Signature; me: string | nul
         {named ? (s.from.name as string)[0].toUpperCase() : "·"}
       </Link>
       <div className="person-who">
-        <Link className="person-name" href={to.account(ref)} data-testid="signature-from">
+        <Link className="person-name" href={named ? to.boo(ref) : to.account(ref)} data-testid="signature-from">
           {s.from.name ? whoText(s.from) : <span className="mono">{s.from.short}</span>}
         </Link>
         {yours && <span className="you">you</span>}

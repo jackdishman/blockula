@@ -162,7 +162,7 @@ function PersonRow({ row, rank, me, head, blockMs }: { row: DirectoryAccount; ra
         {name ? name[0].toUpperCase() : "·"}
       </Link>
       <div className="person-who">
-        <Link className="person-name" href={to.account(ref)}>
+        <Link className="person-name" href={name ? to.boo(name) : to.account(ref)}>
           {title ? system && !name ? <i>{title}</i> : title : <span className="mono">{row.account.short}</span>}
         </Link>
         {yours && <span className="you">you</span>}
