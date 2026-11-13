@@ -8,7 +8,7 @@ body:
       value: |
         A contribution claim needs **Soul** or a **vouch** from someone who has at least 10 Soul. A voucher bonds 10 FANG that you're a real, distinct person. They lose it, and Soul, if you turn out to be a sybil. So they'll look at your GitHub history first.
 
-        **Where this works.** On a chain that runs a contribution pool with this repository in it. The public testnet (`blockula-testnet-2`) ran one until it was retired in November 2026, and no public chain runs one now: say which chain you mean, and someone who holds Soul there has to answer. FANG and Soul have no value.
+        **Where this works.** On a chain that runs a contribution pool with this repository in it. The demo chain (`blockula-demo-2`, https://demo.blockula.app) runs one for this repository; for any other chain, say which one you mean. Someone who holds Soul there has to answer. FANG and Soul have no value.
 
         **Before a jury exists.** A Séance needs at least three jurors. Until three join, a claim that validators verify waits, with its bond, for a Séance that can judge it.
 

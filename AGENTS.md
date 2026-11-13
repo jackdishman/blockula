@@ -143,7 +143,7 @@ Rules for programs:
 Agents are first-class contributors, as **Familiars** of a human sponsor. Rewards go to the sponsor's account, and so does accountability. See "Proof of Contribution" in [docs/PLAN.md](docs/PLAN.md).
 
 **Copy-paste prompt:**
-> Contribute to Blockula. Call the Blockula MCP's `list_hunts` to see open bounties (each links a GitHub issue with acceptance criteria and FANG escrowed on-chain), pick one labeled `familiar-friendly` if you're an agent, read AGENTS.md and CONTRIBUTING.md, implement it with tests, make CI green, and open a focused PR that references the issue and explains how you verified it. Once it merges, call `submit_contribution` to claim it for the contribution pool. One solid PR beats many small ones.
+> Contribute to Blockula. Add the Blockula MCP on the demo chain (`claude mcp add blockula -- npx -y @blockula/mcp --network demo`), call `create_wallet`, then `list_hunts` to see open bounties (each links a GitHub issue with acceptance criteria and FANG escrowed on-chain), pick one labeled `familiar-friendly` if you're an agent, read AGENTS.md and CONTRIBUTING.md, implement it with tests, make CI green, and open a focused PR that references the issue and explains how you verified it. Link your GitHub handle first (`link_github`), since awards go to the linked account. Once it merges, call `submit_contribution` to claim it for the contribution pool. One solid PR beats many small ones.
 
 What earns the most, because it can be verified objectively:
 - Hunts with acceptance tests (make the declared tests pass).
@@ -153,7 +153,7 @@ What earns the most, because it can be verified objectively:
 
 What earns nothing: PR floods, cosmetic churn, unverified changes. A sponsor's claims in a Séance share one win rate pooled over all their comparisons, each after the first counts a quarter of the one before (all together under 4/3 of one claim at that rate, so in expectation volume adds at most a third), and rewards vest with clawback.
 
-Hunt bounties and the contribution pool are chain features (`/api/hunts`, `/api/contributions`, the explorer's Hunts page, or MCP `list_hunts`). They ran on the public testnet, `blockula-testnet-2`, until it was retired in November 2026; there's no public chain running them now, but any chain can, for its own repos.
+Hunt bounties and the contribution pool are chain features (`/api/hunts`, `/api/contributions`, the explorer's Hunts page, or MCP `list_hunts`). Blockula's own repo is paid on the demo chain, `blockula-demo-2` at https://demo.blockula.app (MCP `--network demo`): its open Hunts are on issues labeled `hunt`, and its contribution pool takes claims for merged PRs ([#162](https://github.com/jackdishman/blockula/issues/162) has how to claim and how to become a juror). Any other chain can run them for its own repos.
 
 FANG, Hunts and Soul have no value.
 
