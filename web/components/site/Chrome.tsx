@@ -3,34 +3,40 @@
 import { usePathname } from "next/navigation";
 import { MotionToggle } from "@/components/Haunt";
 import { Ornament } from "@/components/Ornament";
+import { Places } from "@/components/Places";
 import { CHAIN_GUIDE, REPO } from "@/components/Landing";
+import { DEMO_NODE } from "@/lib/config";
 import { X_ACCOUNT, X_URL } from "@/lib/site";
 
 export const DOCS = `${REPO}/tree/main/docs`;
 
 /**
- * The project site's masthead: the wordmark and the page's own sections. No network badge or
- * wallet links: blockula.app is the project's page, and every chain's wallet is on its own node.
+ * The project site's masthead: the bar that leads to the demo chain's explorer and wallet
+ * (components/Places.tsx), then the wordmark and the page's own sections. No network badge:
+ * blockula.app is the project's page, and every chain's wallet is on its own node.
  */
 export function SiteHeader() {
   // On /x and the legal pages the sections are the home page's.
   const home = usePathname() === "/" ? "" : "/";
   return (
-    <header className="top site-top">
-      <a href={`${home}#top`} className="brand" aria-label="Blockula, top of the page">
-        <span className="wordmark">Blockula</span>
-        <span className="edition">play money for agents</span>
-      </a>
-      <nav aria-label="Sections">
-        <a href={`${home}#agents`}>Agents</a>
-        <a href={`${home}#demo`} className="site-nav-wide">Demo</a>
-        <a href={`${home}#why`} className="site-nav-wide">Why Blockula</a>
-        <a href={`${home}#start`}>Start your own</a>
-        <a href={`${home}#chains`}>Join a chain</a>
-        <a href={REPO}>GitHub</a>
-        <a href={X_URL} className="site-nav-wide" rel="me" aria-label={`@${X_ACCOUNT} on X`}>X</a>
-      </nav>
-    </header>
+    <>
+      {DEMO_NODE && <Places here="site" node={DEMO_NODE} label="Demo" />}
+      <header className="top site-top">
+        <a href={`${home}#top`} className="brand" aria-label="Blockula, top of the page">
+          <span className="wordmark">Blockula</span>
+          <span className="edition">play money for agents</span>
+        </a>
+        <nav aria-label="Sections">
+          <a href={`${home}#agents`}>Agents</a>
+          <a href={`${home}#demo`}>Demo</a>
+          <a href={`${home}#why`} className="site-nav-wide">Why Blockula</a>
+          <a href={`${home}#start`}>Start your own</a>
+          <a href={`${home}#chains`}>Join a chain</a>
+          <a href={REPO} className="site-nav-wide">GitHub</a>
+          <a href={X_URL} className="site-nav-wide" rel="me" aria-label={`@${X_ACCOUNT} on X`}>X</a>
+        </nav>
+      </header>
+    </>
   );
 }
 

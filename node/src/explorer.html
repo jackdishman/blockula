@@ -35,6 +35,18 @@
   a:hover { color:var(--blood); }
   :focus-visible { outline:2px solid var(--blood); outline-offset:2px; }
 
+  /* Where you are: this chain's explorer and its wallet (/wallet/), and the way back to blockula.app.
+     The wallet's header carries the same bar (web/components/Places.tsx), so the two read as one place. */
+  .places { display:flex; justify-content:space-between; align-items:center; gap:2px 16px; flex-wrap:wrap; padding:5px 20px; background:var(--ink); color:var(--paper); font:400 14px/1.5 var(--caps); letter-spacing:.08em; }
+  .places a { display:inline-flex; align-items:center; min-height:30px; padding:0 9px; color:inherit; text-decoration:none; white-space:nowrap; }
+  .places a:hover { color:var(--paper-hi); text-decoration:underline; text-decoration-color:currentColor; }
+  .places a[aria-current] { background:var(--paper); color:var(--ink); text-decoration:none; }
+  .places a[hidden] { display:none; }
+  .places :focus-visible { outline-color:var(--paper-hi); outline-offset:-3px; }
+  .places-group { display:inline-flex; align-items:center; gap:2px; }
+  @media (max-width:520px) { .places { padding:4px 7px; } }
+  @media print { .places { display:none; } }
+
   header { position:relative; display:flex; gap:14px 28px; align-items:center; padding:14px 28px 12px; border-bottom:3px solid var(--ink); margin-bottom:4px; flex-wrap:wrap; }
   header::after { content:""; position:absolute; left:0; right:0; bottom:-7px; height:1px; background:var(--ink); }
   .brand { display:inline-flex; align-items:baseline; gap:10px; text-decoration:none; color:var(--ink); }
@@ -187,6 +199,10 @@
 </style>
 </head>
 <body data-haunt-column="1080">
+<div class="places" role="navigation" aria-label="This chain's apps, and Blockula">
+  <a href="https://blockula.app/">&lsaquo; blockula.app</a>
+  <span class="places-group"><a href="#/" aria-current="page">Explorer</a><a href="/wallet/" data-wallet-link>Wallet</a></span>
+</div>
 <header>
   <a class="brand" href="#/"><span class="wordmark">Blockula</span><span class="edition">The Explorer</span></a>
   <form id="search" role="search"><input id="q" aria-label="Search" placeholder="Search names, addresses, blocks or transactions" autocomplete="off" /></form>
@@ -1382,6 +1398,8 @@ $("#search").addEventListener("submit", async (e) => {
 // one someone made, and its unit has no value either.
 const STATUS = api("/status").then((s) => {
   if (/^[A-Z][A-Z0-9]{1,7}$/.test(s.token || "")) UNIT = s.token;
+  // A node built without the wallet (`wallet: null`) has nowhere for those links to go.
+  if (s.wallet === null) document.querySelectorAll("[data-wallet-link]").forEach((a) => { a.hidden = true; });
   if (s.name) {
     $(".wordmark").textContent = s.name;
     $(".brand").title = `${s.name} (${s.chain_id}), on Blockula`;

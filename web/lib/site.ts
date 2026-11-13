@@ -5,6 +5,9 @@
  * (`<node>/wallet/`, node/src/wallet.rs). No imports, so lib/site.test.mjs runs it under plain Node.
  */
 
+/** The project site itself: what a chain's explorer and wallet link back to (components/Places.tsx). */
+export const SITE_URL = "https://blockula.app";
+
 /** The project's one official X account, without the `@`. Nothing else on X speaks for Blockula. */
 export const X_ACCOUNT = "BlockulaChain";
 /** Its profile: the site's nav and footer, the wallet's landing page, README.md and SUPPORT.md link it. */

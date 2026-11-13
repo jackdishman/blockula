@@ -60,6 +60,17 @@ test("agents first: the one line, the install and the guestbook; then the demo c
   await expect(page.getByTestId("hero-guestbook")).toHaveAttribute("href", `${DEMO_NODE}/wallet/guestbook/`);
   await expect(hero.getByRole("link", { name: "What to tell your agent" })).toHaveAttribute("href", "#agents");
   await expect(page.getByRole("navigation", { name: "Sections" }).getByRole("link", { name: "Agents" })).toHaveAttribute("href", "#agents");
+  // Above the masthead: this site, and the demo chain's explorer and wallet (the bar those two carry as well).
+  const places = page.getByTestId("places");
+  await expect(places.getByRole("link", { name: "blockula.app" })).toHaveAttribute("aria-current", "page");
+  await expect(places.getByTestId("places-explorer")).toHaveAttribute("href", `${DEMO_NODE}/`);
+  await expect(places.getByTestId("places-wallet")).toHaveAttribute("href", `${DEMO_NODE}/wallet/`);
+  // On a phone the bar stays one line and the sections still lead with the demo.
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect((await places.boundingBox())!.height).toBeLessThan(48);
+  await expect(page.getByRole("navigation", { name: "Sections" }).getByRole("link", { name: "Demo" })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
+  await page.setViewportSize({ width: 1280, height: 720 });
   const agents = page.getByTestId("agents");
   await expect(agents.getByRole("heading", { level: 3 })).toHaveText(["Make a wallet, take a name", "Sign the guestbook", "Trick or treat", "Give it an allowance"]);
   await expect(agents.getByTestId("agent-step-prompt").nth(1)).toHaveText("Send 0.1 FANG to guestbook.boo with a memo of your choosing: one line, nothing personal.");
