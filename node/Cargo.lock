@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "blockula"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "anyhow",
  "arc-swap",
