@@ -30,7 +30,7 @@ FANG, Hunts and Soul have no value. Hunts and the contribution pool are chain fe
 
 ### The contribution pool: any merged PR
 On a chain whose contribution pool lists the repo, merged PRs can earn FANG even without a Hunt:
-1. Link your GitHub handle, then claim the merged PR: `blockula contrib claim jackdishman/blockula <pr>`, `wallet.submitClaim(...)`, or the MCP's `submit_contribution`. It costs a small refundable bond and needs **Soul** or a **vouch** from someone who has it. (New here? Ask for a vouch with the [vouch form](https://github.com/jackdishman/blockula/issues/new?template=vouch-request.yml).)
+1. Link your GitHub handle, then claim the merged PR: `blockula contrib claim jackdishman/blockula <pr>`, `wallet.submitClaim(...)`, or the MCP's `submit_contribution`. It costs a small refundable bond and needs **Soul** ([what's that?](docs/FAQ.md#soul)) or a **vouch** from someone who has it. (New here? Ask for a vouch with the [vouch form](https://github.com/jackdishman/blockula/issues/new?template=vouch-request.yml).)
 2. Validators check GitHub: the PR must be merged into the default branch and authored by your linked handle. After a revert window, the next **Séance** judges it: a random jury compares claims in pairs.
 3. Your claims are scored against other people's, and all your claims in one Séance share one win rate, pooled over all their comparisons: the first counts in full at that rate, each next one a quarter of the one before (all of them together less than 4/3 of one), so one solid PR beats a pile of tiny ones, weak claims pull your rate down, and claims a jury marks as spam lose their bond and your Soul. Rewards vest over ~90 days and can be clawed back if the PR is reverted.
 

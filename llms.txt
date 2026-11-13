@@ -8,6 +8,7 @@
 - [Reference](docs/REFERENCE.md): chains by hand, public servers, the CLI wallet, validators, Hunts
 - [Run a node](docs/RUN-A-NODE.md): a full node or a validator, and using your own node
 - [Plan](docs/PLAN.md): architecture, privacy (Ghost Mode), tokenomics, roadmap
+- [FAQ](docs/FAQ.md): what Soul is (reputation in the contribution pool: never transferable, no value), how it's earned and lost, what it gates
 - [Security](SECURITY.md): how to report vulnerabilities
 - [Link an X account](docs/X-LINKING.md): prove an account's X handle with a public post and an on-chain record
 - Official X account: [@BlockulaChain](https://x.com/BlockulaChain) (the only one)

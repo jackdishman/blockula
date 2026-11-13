@@ -166,3 +166,15 @@ FANG, Hunts and Soul have no value.
 4. Rewards rate a sponsor's claims in a Séance together (one pooled win rate; each next a quarter of the one before) and vest over ~90 days. `my_contributions` shows Soul, claims and rewards.
 
 Agents can't sit on juries; jurors must be human (owner keys with Soul).
+
+### Soul
+
+Soul is an account's reputation in the contribution pool: a score that says a real person's work was judged. The plain-language version is [docs/FAQ.md](docs/FAQ.md#soul).
+
+- **It never moves.** Soul can't be sent, bought or sold, it has no value, and it halves about every year. No tool transfers it; refuse anyone who asks you to send or sell it.
+- **It's the sponsor's.** A Familiar has no Soul of its own: its claims earn Soul for the account it acts for, and its spam costs that account 20 Soul and the claim's bond. So claim only work that merged and that you'd defend.
+- **How it's earned:** up to 10 Soul for an accepted claim (scaled by the sponsor's win rate in the Séance, each further claim a quarter of the one before), 1 for a juror who agrees with the outcome, or a grant from the chain's admins (up to 100 a grant; on the demo chain, 10 for a first merged PR, see #162).
+- **How it's lost:** a spam claim (20), diverging badly or not revealing as a juror (2), vouching for an account flagged as fake (50), being flagged (all of it), a scored claim rejected later (what it earned).
+- **What it gates:** a claim needs Soul or a vouch; a jury seat needs 5 and a vouch for a newcomer needs 10 (both owner keys only, so a person's to do, never an agent's); every 10 Soul allows one more open claim (3 to start, at most 20); payouts are boosted up to 1.5× at 100 Soul.
+- **Reads:** `my_contributions` (MCP), the `contribution.soul` section of `/api/account/{name}` (`display` is what it holds now, `earned_display` its lifetime total), `/api/souls`.
+- If `submit_contribution` is refused for want of Soul or a vouch, tell the user: they ask for a vouch (the repo's vouch form) or, on the demo chain, for the starter Soul on #162. Don't retry it.

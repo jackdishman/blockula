@@ -11,6 +11,7 @@
 | [RUN-A-NODE.md](RUN-A-NODE.md) | A full node or a validator as a service, and pointing the wallet, SDK and MCP at your own node |
 | [BECOME-A-VALIDATOR.md](BECOME-A-VALIDATOR.md) | Validate someone else's chain, step by step for beginners: in the cloud (Fly.io or a $5 VPS), at home, or at home behind a cheap relay, and a prompt for your coding agent |
 | [REFERENCE.md](REFERENCE.md) | Chains by hand (`summon`, `run`, `join`), public servers and genesis specs, the hardened HTTP API, the CLI wallet, validators and staking, Hunts and the contribution pool |
+| [FAQ.md](FAQ.md) | Short answers: what Soul is, how you get it and lose it, what it lets you do |
 | [ONE_PAGER.md](ONE_PAGER.md) | What Blockula is, on one page |
 | [PITCH.md](PITCH.md) | How to say what Blockula is, to whom and where (a draft) |
 
