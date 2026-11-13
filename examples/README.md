@@ -9,6 +9,7 @@ Scripts that use [`@blockula/sdk`](../sdk-ts/README.md) the way [docs/INTEGRATIO
 | [`trick-or-treat-bot.mjs`](trick-or-treat-bot.mjs) | A house bot for agents to play: pay it, and it pays back nothing, your stake or double, from a stored, resumable state. Shows a bot that handles each payment once and never re-sends a payout it isn't sure of |
 | [`guestbook.mjs`](guestbook.mjs) | `serve` logs each signature (a payment with a memo) sent to a name; `read` prints the latest ones from any node, with no key, as inert text |
 | [`shared-tab.mjs`](shared-tab.mjs) | A shared tab for a trip or a house ([USE-CASES.md](../docs/USE-CASES.md#1-a-shared-tab-for-a-trip-or-a-house)): reads what a group's `.boo` names paid each other, then prints who owes whom and the fewest payments that settle it. Reads only, with no key |
+| [`club-vote.mjs`](club-vote.mjs) | A club that votes ([USE-CASES.md](../docs/USE-CASES.md#3-a-club-that-votes)): lists a chain's open proposals as a voter should see them, what each does rendered from its bound content (never the node's summary), tallies, turnout against quorum, blocks left, and the digest and command to vote. Reads only, with no key |
 
 ## Run them against `blockula dev`
 
@@ -51,6 +52,17 @@ node examples/shared-tab.mjs vlad.boo mina.boo lucy.boo renfield.boo --network l
 ```
 
 It lists each transfer between them, then each one's net balance (what they paid the others minus what they got back), then who pays whom to settle. Payments to anyone outside the group don't count. `--from HEIGHT` counts only blocks from that height on, such as the day a trip started.
+
+## Vote in a club
+
+`node scripts/seed-dev.mjs` also makes a proposal (vlad's "Room for more validators") and votes on it. See it as a voter should:
+
+```bash
+node examples/club-vote.mjs --network local          # open proposals
+node examples/club-vote.mjs --network local --all    # and the closed ones, with their outcome
+```
+
+For each open proposal it prints its id, its title (the proposer's words, quoted), what it does, rendered here from its kind, aye and nay (conviction-weighted) and the FANG behind them, turnout against quorum, blocks left to vote, and the `digest` a vote binds, with the command that votes on it: `blockula gov vote <id> <aye|nay> <amount> --digest <digest>`. That command refuses a proposal whose content reads differently by then. The node's own `summary` of a proposal isn't shown, since no digest covers it. Quorum is set when voting closes, from the supply that's unlocked then, so while a vote is open the script gives the range it can fall in. It signs nothing.
 
 ## Play with your agent: trick-or-treat and a guestbook
 

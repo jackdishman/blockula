@@ -93,6 +93,7 @@ await mina.acceptName("castle");
 await vlad.registerName("tomb");
 await vlad.transferName("tomb", "lucy.boo");
 console.log(`✓ a delegation, proposal #${prop.id} (${made.id.slice(0, 8)}…) with a vote, a renewal, castle.boo accepted by mina, tomb.boo offered to lucy`);
+console.log(`  see it as a voter should: node examples/club-vote.mjs --rpc ${rpc}`);
 
 // A 2-of-2 multisig: both owner keys must approve what it does.
 const coven = await wallet("coven");
