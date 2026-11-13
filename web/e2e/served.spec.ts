@@ -121,6 +121,15 @@ test("the explorer links to the wallet, and the node's headers hold", async ({ p
   await page.goto("/");
   const open = page.locator("nav").getByRole("link", { name: "Open wallet" });
   await expect(open).toHaveAttribute("href", "/wallet/");
+  // The bar above the masthead: this page, the wallet, and the way back to blockula.app. The wallet carries it too.
+  const places = page.locator(".places");
+  await expect(places.getByRole("link", { name: "Explorer" })).toHaveAttribute("aria-current", "page");
+  await expect(places.getByRole("link", { name: "Wallet" })).toHaveAttribute("href", "/wallet/");
+  await expect(places.getByRole("link", { name: "blockula.app" })).toHaveAttribute("href", "https://blockula.app/");
+  await page.goto("/wallet/");
+  await expect(page.getByTestId("places-wallet")).toHaveAttribute("aria-current", "page");
+  await expect(page.getByTestId("places-explorer")).toHaveAttribute("href", "/");
+  await page.goto("/");
   await page.goto("/#/start/invite");
   await expect(page.locator("#app")).toContainText("Open the wallet");
   await page.goto("/#/start");

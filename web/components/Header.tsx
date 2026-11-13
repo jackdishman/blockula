@@ -8,6 +8,7 @@ import { isExplorerPath, to } from "@/lib/explorer/routes";
 import { useWallet } from "@/lib/wallet";
 import { CommandPalette, openPalette } from "./CommandPalette";
 import { Alerts } from "./explorer/Alerts";
+import { Places } from "./Places";
 
 /** Which network this is, on every screen. Anything but a known mainnet is stamped as such. */
 export function NetworkBadge() {
@@ -47,6 +48,8 @@ export function Header() {
   const explore = isExplorerPath(path) && !programs && !boos;
   return (
     <>
+      {/* The served wallet sits beside its node's explorer: the same bar leads to it, and back to blockula.app. */}
+      {SERVED && <Places here="wallet" />}
       <header className="top">
         <span className="masthead">
           <Link href="/" className="brand" aria-label="Blockula wallet, home">

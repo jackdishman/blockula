@@ -38,6 +38,24 @@ p { margin: 0 0 10px; }
 code { font-family: var(--mono); font-size: 0.85em; background: var(--paper-lo); padding: 1px 5px; }
 :focus-visible { outline: 2px solid var(--blood); outline-offset: 2px; }
 
+/* Where you are: blockula.app, and a chain's explorer and wallet on its node (components/Places.tsx).
+   The node's explorer draws the same bar (node/src/explorer.html), so the three read as one place. */
+.places { display: flex; justify-content: space-between; align-items: center; gap: 2px 16px; flex-wrap: wrap; padding: 5px 20px; background: var(--ink); color: var(--paper); font: 400 14px/1.5 var(--caps); letter-spacing: 0.08em; }
+.places a { display: inline-flex; align-items: center; min-height: 30px; padding: 0 9px; color: inherit; text-decoration: none; white-space: nowrap; }
+.places a:hover { color: var(--paper-hi); text-decoration: underline; }
+.places a[aria-current] { background: var(--paper); color: var(--ink); text-decoration: none; }
+.places :focus-visible { outline-color: var(--paper-hi); outline-offset: -3px; }
+.places-group { display: inline-flex; align-items: center; gap: 2px; min-width: 0; }
+.places-label { opacity: 0.7; padding: 0 4px 0 9px; white-space: nowrap; }
+@media (max-width: 520px) {
+  .places { padding: 4px 7px; }
+}
+@media (max-width: 350px) {
+  .places { letter-spacing: 0.04em; }
+  .places a { padding: 0 6px; }
+}
+@media print { .places { display: none; } }
+
 /* Masthead */
 header.top { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 12px 20px; padding: 14px 28px 10px; border-bottom: 3px solid var(--ink); margin-bottom: 4px; flex-wrap: wrap; }
 header.top::after { content: ""; position: absolute; left: 0; right: 0; bottom: -7px; height: 1px; background: var(--ink); }
