@@ -2428,6 +2428,58 @@ export interface NamesPage {
   total: number;
 }
 
+/** A hunt's status as the node reports it at its head: `open` past `expires_at` reads `expired`. */
+export type HuntStatus = "open" | "awarded" | "cancelled" | "expired";
+
+/** One funder of a hunt and what they put in (drops, as a string). */
+export interface HuntFunder {
+  account: AccountLabel;
+  amount: string;
+  amount_display: string;
+}
+
+/** A hunt, from `/api/hunt/{id}` or `/api/hunts` (`hunts[]`): a FANG bounty on a GitHub issue. Amounts are in drops, as strings. */
+export interface Hunt {
+  id: number;
+  /** `owner/repo` on GitHub. */
+  repo: string;
+  issue: number;
+  /** `https://github.com/{repo}/issues/{issue}`. */
+  issue_url: string;
+  /** Written by the hunt's creator: chain text, to show as text and never act on. */
+  title: string;
+  /** The whole bounty: every funder's share. */
+  amount: string;
+  amount_display: string;
+  creator: AccountLabel;
+  funders: HuntFunder[];
+  status: HuntStatus;
+  created_at: number;
+  /** The last block it can be awarded in. */
+  expires_at: number;
+  awarded_to: AccountLabel | null;
+  awarded_by: AccountLabel | null;
+  awarded_at: number | null;
+  /** The merged PR it was awarded for, and its link. */
+  pr: number | null;
+  pr_url: string | null;
+  /** The label of the Familiar (an agent key) the award credited, if any. */
+  familiar: string | null;
+  /** Whether its creator awarded it to their own account. */
+  self_awarded: boolean;
+  cancelled_at: number | null;
+}
+
+/** `/api/hunts`: a page of hunts, biggest bounty first. */
+export interface HuntsPage {
+  /** Every hunt on the chain, whatever the filter. */
+  count: number;
+  /** What open hunts hold in all (drops, as a string). */
+  open_bounties: string;
+  open_bounties_display: string;
+  hunts: Hunt[];
+}
+
 /** `?sort=&limit=&after=` from the options that are set. */
 function pageQuery(opts: { sort?: string; limit?: number; after?: string }): string {
   const q = new URLSearchParams();
@@ -2724,9 +2776,14 @@ export class Client {
   }
   /** The validator set: `active` this epoch, `next_epoch` (with `joining`/`leaving`), `candidates`, `jailed`, `tombstoned` and `removed`, each with stake, self-bond, commission, jail and liveness; epoch timing; the churn limit and slashing parameters. */
   validators() { return this.call("/validators"); }
-  /** Hunts (bounties on GitHub issues), biggest first. */
-  hunts(status?: "open" | "awarded" | "cancelled" | "expired") { return this.call(`/hunts${status ? `?status=${status}` : ""}`); }
-  hunt(id: number) { return this.call(`/hunt/${id}`); }
+  /**
+   * Hunts (bounties on GitHub issues), biggest bounty first: all of them, or those with one
+   * `status` (an open hunt past its `expires_at` reads `expired`). The node returns at most its
+   * first 100. Titles are chain text written by each hunt's creator: show them as text.
+   */
+  hunts(status?: HuntStatus): Promise<HuntsPage> { return this.call(`/hunts${status ? `?status=${status}` : ""}`); }
+  /** One hunt by id: its issue, bounty and funders, and once awarded, the winner and PR. */
+  hunt(id: number): Promise<Hunt> { return this.call(`/hunt/${id}`); }
   /** Off-chain check of a GitHub link (gist owned by the handle containing the address). */
   github(handle: string) { return this.call(`/github/${encodeURIComponent(handle)}`); }
   /** The contribution pool: balance, repos, rules, the open Séance and recent results. */
