@@ -18,7 +18,7 @@ for (const route of ["tx", "account", "block", "name", "boo", "program", "progra
   }
 }
 // Add to Home Screen: the manifest (app/manifest.ts; the node renames it for its chain) and its icons.
-for (const file of ["boos/index.html", "guestbook/index.html", "leaderboard/index.html", "x/index.html", "shared/index.html", "shared/review/index.html", "terms/index.html", "privacy/index.html", "manifest.webmanifest", "apple-icon.png", "icon-192.png", "icon-512.png"]) {
+for (const file of ["boos/index.html", "guestbook/index.html", "leaderboard/index.html", "x/index.html", "shared/index.html", "shared/review/index.html", "blackjack/index.html", "blackjack/embed/index.html", "blackjack/share/index.html", "blackjack/poster.png", "terms/index.html", "privacy/index.html", "manifest.webmanifest", "apple-icon.png", "icon-192.png", "icon-512.png"]) {
   if (!existsSync(join(out, file))) {
     console.error(`web/out/${file} is missing from the export.`);
     process.exit(1);

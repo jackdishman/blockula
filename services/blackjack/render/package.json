@@ -1,0 +1,28 @@
+{
+  "name": "@blockula/blackjack-render",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pictures of a blackjack hand on Blockula: deterministic SVG, rendered to PNG",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc --noEmit -p tsconfig.test.json && tsx test/render.ts",
+    "gallery": "tsx src/cli.ts",
+    "poster": "tsx src/cli.ts --poster ../../../web/public/blackjack"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@blockula/blackjack": "0.1.0",
+    "@resvg/resvg-js": "2.6.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsx": "*",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "@blockula/blackjack-dealer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The blackjack dealer daemon: commits hash chains ahead of the bets and reveals each hand's cards in order",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc --noEmit -p tsconfig.test.json && tsx test/store.ts && tsx test/config.ts && tsx test/dealer.ts && tsx test/cli.ts",
+    "test:live": "tsx test/live.ts",
+    "test:soak": "tsx test/soak.ts"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@blockula/blackjack": "0.1.0",
+    "@blockula/sdk": "1.0.10",
+    "@noble/hashes": "2.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsx": "*",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "blackjack-dealer": "dist/cli.js"
+  }
+}

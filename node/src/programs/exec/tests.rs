@@ -1143,3 +1143,5 @@ fn node_faults_are_classed_and_stick() {
     assert!(matches!(&again, Outcome::Failed(why) if why.starts_with("program execution faulted on this node at block")), "{again:?}");
     assert_eq!(counts(), started);
 }
+
+mod randomness;

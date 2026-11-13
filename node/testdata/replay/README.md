@@ -1,4 +1,4 @@
-# The recorded v1 corpus
+# The recorded corpus: v1, and a short v2 history
 
 Every PR's binary replays these recordings (`blockula replay`,
 [docs/REPLAY.md](../../../docs/REPLAY.md)) and must reproduce them block by block: every
@@ -22,8 +22,27 @@ bytes. The v0.5.2 release source replays them with the same result.
 - **`v1-open`:** 1,999 blocks, like testnet-2 (no Season 0 admins).
 - **`v1-season0`:** 200 blocks, like `blockula dev` (its validator is the admin).
 
+- **`v2-programs`:** 40 blocks of a two-validator chain born at protocol v2 with programs on
+  (below). Not part of the v1 gate: it holds v2's program rules the same way.
+
 Don't edit or re-record them to make a replay pass: a difference means the binary changed what a
-v1 block does. Adding coverage: [docs/REPLAY.md](../../../docs/REPLAY.md) "Changing the corpus".
+v1 block does (or, for `v2-programs`, a v2 block). Adding coverage:
+[docs/REPLAY.md](../../../docs/REPLAY.md) "Changing the corpus".
+
+## `v2-programs`
+
+Recorded by the v1.0.9 source (`c34ac95`) with `record_programs` of `node/src/replay/corpus.rs`
+(`cargo test --release -- --ignored write_v2_replay_corpus`); every later binary must replay it
+and record the same bytes ([docs/REPLAY.md](../../../docs/REPLAY.md#the-v2-recording)). Its block
+log holds each program tx's receipt.
+
+| Tag | Action | applied/failed/skipped | What |
+|---|---|---|---|
+| 0 | `transfer` | 7/0/0 | between the program txs |
+| 62 | `upload_code` | 4/3/0 | the four guests; failed: code importing `beacon_v1` (rule 5, `Import`: a host function v2 doesn't have), in two epochs, and a float (rule 4) |
+| 63 | `create_program` | 4/0/0 | the four guests, the token with its `init` |
+| 64 | `call_program` | 32/2/2 | counter, token, a router batch with a binding, an escrow deal with value; failed: unbound program, out of fuel; skipped: a digest not in force, a call during the pause |
+| 69 | `programs_pause` | 1/0/0 | one of two validators (f + 1) |
 
 ## Coverage
 

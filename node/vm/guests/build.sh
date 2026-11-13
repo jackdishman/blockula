@@ -13,7 +13,7 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 out="$here/../tests/programs"
-programs=(counter token escrow router)
+programs=(counter token escrow router dice blackjack)
 
 # .cargo/config.toml is the only place the flags live: these would replace or extend them.
 unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_TARGET_WASM32V1_NONE_RUSTFLAGS \

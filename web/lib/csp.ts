@@ -28,8 +28,19 @@ export function customOrigin(cookie: string | undefined): string | null {
   }
 }
 
-/** The Content-Security-Policy for one response. `dev` relaxes what `next dev` needs (eval, HMR styles). */
-export function contentSecurityPolicy(nonce: string, opts: { custom?: string | null; dev?: boolean } = {}) {
+/**
+ * The one route that may be framed: the blackjack table's spectator view (app/blackjack/embed), a
+ * read-only page with no wallet, shown as a player card on X. Only X's own pages (and this
+ * origin) may frame it; every other route is never framed.
+ */
+export const EMBED_PATH = "/blackjack/embed";
+export const EMBED_ANCESTORS = ["'self'", "https://x.com", "https://twitter.com"];
+export const isEmbedPath = (pathname: string) => pathname === EMBED_PATH || pathname === `${EMBED_PATH}/`;
+/** Every path but the embed's, as a next.config.ts `headers()` source. */
+export const EMBED_SOURCE_EXCEPT = "/((?!blackjack/embed/?$).*)";
+
+/** The Content-Security-Policy for one response. `dev` relaxes what `next dev` needs (eval, HMR styles); `embed` is for `EMBED_PATH` only. */
+export function contentSecurityPolicy(nonce: string, opts: { custom?: string | null; dev?: boolean; embed?: boolean } = {}) {
   const connect = ["'self'", ...nodeOrigins(), ...(opts.custom ? [opts.custom] : [])];
   return [
     "default-src 'self'",
@@ -38,7 +49,7 @@ export function contentSecurityPolicy(nonce: string, opts: { custom?: string | n
     "font-src 'self'",
     "img-src 'self' data:",
     `connect-src ${[...new Set(connect)].join(" ")}`,
-    "frame-ancestors 'none'",
+    `frame-ancestors ${opts.embed ? EMBED_ANCESTORS.join(" ") : "'none'"}`,
     "frame-src 'none'",
     "base-uri 'none'",
     "form-action 'self'",
@@ -57,5 +68,10 @@ export const STATIC_HEADERS: { key: string; value: string }[] = [
   },
   { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
   { key: "Cross-Origin-Resource-Policy", value: "same-origin" },
-  { key: "X-Frame-Options", value: "DENY" },
 ];
+
+/**
+ * `X-Frame-Options: DENY`, on every route but `EMBED_PATH` (next.config.ts): the header can't
+ * name who may frame a page, so the embed goes without it and its CSP's `frame-ancestors` decides.
+ */
+export const FRAME_HEADER = { key: "X-Frame-Options", value: "DENY" };

@@ -1,0 +1,41 @@
+/* The blackjack table (app/blackjack). The drawing is the shared library's SVG; this is its frame. */
+.bj-note { margin: 0; padding: 8px 14px; border: 1.5px dashed var(--blood); color: var(--blood); font: 400 17px/1.4 var(--caps); letter-spacing: 0.04em; text-align: center; }
+.bj-figure { margin: 0; display: flex; flex-direction: column; gap: 10px; }
+.bj-svg { border: 1.5px solid var(--ink); background: var(--paper); line-height: 0; }
+.bj-svg svg { display: block; width: 100%; height: auto; }
+.bj-cards { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 4px 14px; margin: 0; }
+.bj-cards dt { font: 400 16px/1.7 var(--caps); letter-spacing: 0.06em; color: var(--dim); }
+.bj-cards dd { margin: 0; font-size: 20px; }
+.bj-status { font: 500 21px/1.35 var(--serif); }
+.bj-verdict { margin: 0; padding: 10px 14px; border: 1.5px solid var(--ink); background: var(--paper-hi); font: 500 19px/1.35 var(--serif); }
+.bj-verdict.ok { border-color: var(--moss); color: var(--moss); }
+.bj-verdict.bad { border-color: var(--blood); color: var(--blood); }
+.bj-steps { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 8px; }
+.bj-log { margin: 0; padding-left: 22px; }
+.bj-rule { margin: 6px 0 2px; font: 400 19px var(--display); }
+.bj-rule-p { margin: 0 0 6px; font-size: 17px; line-height: 1.45; }
+.bj-gate { display: flex; align-items: center; gap: 10px; font-size: 19px; cursor: pointer; }
+.bj-gate input { width: 20px; height: 20px; accent-color: var(--blood); }
+.bj-summary { cursor: pointer; font: 400 21px var(--display); }
+.bj-balance-body { padding-top: 12px; }
+.bj-poster { display: block; width: 100%; height: auto; border: 1.5px solid var(--ink); }
+
+/* The spectator view (app/blackjack/embed): the table and nothing of the wallet around it. */
+body:has(.bj-embed) > .haunt,
+body:has(.bj-embed) header.top,
+body:has(.bj-embed) .places,
+body:has(.bj-embed) .imprint,
+body:has(.bj-embed) .notices,
+body:has(.bj-embed) .home-hint { display: none !important; }
+main.bj-embed { padding: 0; max-width: none; display: flex; flex-direction: column; min-height: 100vh; }
+.bj-embed .bj-svg { border: 0; }
+.bj-embed .bj-figure { gap: 0; }
+.bj-embed-foot { display: flex; align-items: center; justify-content: space-between; gap: 2px 14px; flex-wrap: wrap; padding: 6px 12px 8px; font-size: 14px; line-height: 1.3; }
+.bj-embed-foot .bj-note { border: 0; padding: 0; font-size: 13px; text-align: left; }
+.bj-embed-foot a { font: 400 15px var(--caps); letter-spacing: 0.04em; white-space: nowrap; }
+.bj-embed-empty { padding: 24px 16px; text-align: center; }
+
+@media (max-width: 720px) {
+  .bj-cards { grid-template-columns: 70px minmax(0, 1fr); }
+  .bj-cards dd { font-size: 18px; }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "@blockula/blackjack-xbot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The blackjack X bot, dry run only: parses commands from posts it is handed, plays the relayer path on a local chain, and writes its replies to files. It has no X client and posts nothing",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc --noEmit -p tsconfig.test.json && tsx test/parse.ts && tsx test/copy.ts && tsx test/store.ts && tsx test/limits.ts && tsx test/links.ts && tsx test/bot.ts && tsx test/threads.ts && tsx test/no-x.ts",
+    "test:live": "tsx test/live.ts",
+    "fixtures": "tsx test/gen-threads.ts",
+    "test:live:chain": "bash test/local-chain.sh"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@blockula/blackjack": "0.1.0",
+    "@blockula/blackjack-render": "0.1.0",
+    "@blockula/sdk": "1.0.10"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsx": "*",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "blackjack-xbot": "dist/cli.js"
+  }
+}

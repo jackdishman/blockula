@@ -38,6 +38,8 @@ With none of these set, the wallet starts on a node on this machine (`http://loc
 | `NEXT_PUBLIC_TESTNET_CHAIN_ID` | `blockula-testnet-2` | Your chain id: the node must report it |
 | `NEXT_PUBLIC_TESTNET_GENESIS_HASH` | the retired testnet's | Your chain's genesis hash: the node must report it |
 | `NEXT_PUBLIC_TESTNET_PREFIX` | `tboo` | The address prefix: `boo` for a chain made with `blockula create` or `summon` |
+| `NEXT_PUBLIC_BLACKJACK_TABLE` | (unset) | The blackjack table's program address (`boo1…`) on your chain: `/blackjack` plays at it, and the Programs page links it. Unset, `/blackjack` says there's no table unless a link names one (`/blackjack?table=boo1…`). A value that isn't an address fails the build |
+| `NEXT_PUBLIC_BLACKJACK_ORIGIN` | `https://` + `NEXT_PUBLIC_RP_ID` | The public https origin in the blackjack share page's card (`/blackjack/share`: X's player card, whose player is `/blackjack/embed`). The served wallet (`npm run build:wallet`) has no default, so its share page carries no card unless this is set |
 | `NEXT_PUBLIC_TESTNET_WITNESSES` | (unset) | Comma-separated `https://` URLs of other nodes of your chain. Names that end up in a signature are proven against them first (audit gap-7-1); without any, a name is the selected node's word and the wallet says so |
 
 The values come from `~/.blockula/<chain id>/README.md` or `curl -s <node>/api/status` (`chain_id`, `genesis_hash`, `address_prefix`).

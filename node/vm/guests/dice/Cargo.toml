@@ -1,0 +1,12 @@
+[package]
+name = "dice"
+description = "A six-sided die settled on the randomness beacon, by hand against host ABI v1 (protocol v3)."
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+abi = { path = "../abi" }

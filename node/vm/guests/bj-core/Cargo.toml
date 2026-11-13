@@ -1,0 +1,13 @@
+[package]
+name = "bj-core"
+description = "Blackjack rules for the `blackjack` guest: cards from a hash chain, totals, the dealer's policy and settlement. no_std, no dependencies, the same code on the chain and in its tests."
+# Written out, not inherited from the guests' workspace: node/vm's tests build this crate too
+# (a dev-dependency by path), and a dependency reads no other workspace's package table.
+edition = "2024"
+version = "0.0.0"
+license = "MIT"
+publish = false
+
+[lib]
+# An rlib only: the guest links it, and node/vm's tests build it for the host.
+crate-type = ["rlib"]

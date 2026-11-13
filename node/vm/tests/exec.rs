@@ -797,6 +797,12 @@ fn a_panic_is_a_node_fault() {
         fn account_creation_fee(&self) -> u64 {
             self.0.account_creation_fee()
         }
+        fn epoch(&self) -> u64 {
+            self.0.epoch()
+        }
+        fn beacon(&self, epoch: u64) -> Option<blockula_vm::host::Beacon> {
+            self.0.beacon(epoch)
+        }
     }
     let s = counter_tx();
     for kind in EngineKind::ALL {
@@ -1225,6 +1231,12 @@ impl View for Patched<'_> {
     }
     fn account_creation_fee(&self) -> u64 {
         self.host.account_creation_fee()
+    }
+    fn epoch(&self) -> u64 {
+        self.host.epoch()
+    }
+    fn beacon(&self, epoch: u64) -> Option<blockula_vm::host::Beacon> {
+        self.host.beacon(epoch)
     }
 }
 

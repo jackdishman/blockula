@@ -30,7 +30,7 @@ FANG, Hunts and Soul have no value. Hunts and the contribution pool are chain fe
 
 ### The contribution pool: any merged PR
 On a chain whose contribution pool lists the repo, merged PRs can earn FANG even without a Hunt:
-1. Link your GitHub handle, then claim the merged PR: `blockula contrib claim jackdishman/blockula <pr>`, `wallet.submitClaim(...)`, or the MCP's `submit_contribution`. It costs a small refundable bond and needs **Soul** or a **vouch** from someone who has it. (New here? Ask for a vouch with the [vouch form](https://github.com/jackdishman/blockula/issues/new?template=vouch-request.yml).)
+1. Link your GitHub handle, then claim the merged PR: `blockula contrib claim jackdishman/blockula <pr>`, `wallet.submitClaim(...)`, or the MCP's `submit_contribution`. It costs a small refundable bond and needs **Soul** ([what's that?](docs/FAQ.md#soul)) or a **vouch** from someone who has it. (New here? Ask for a vouch with the [vouch form](https://github.com/jackdishman/blockula/issues/new?template=vouch-request.yml).)
 2. Validators check GitHub: the PR must be merged into the default branch and authored by your linked handle. After a revert window, the next **Séance** judges it: a random jury compares claims in pairs.
 3. Your claims are scored against other people's, and all your claims in one Séance share one win rate, pooled over all their comparisons: the first counts in full at that rate, each next one a quarter of the one before (all of them together less than 4/3 of one), so one solid PR beats a pile of tiny ones, weak claims pull your rate down, and claims a jury marks as spam lose their bond and your Soul. Rewards vest over ~90 days and can be clawed back if the PR is reverted.
 
@@ -51,7 +51,7 @@ You don't need Rust for web, SDK or MCP work: use the release binary (`curl -fsS
 | The SDK (`sdk-ts/`) | `npm run build -w @blockula/sdk`, `npm run test:kat -w @blockula/sdk`, `npm run test:vectors -w @blockula/sdk`, then the e2e: `blockula dev` in one terminal and `npm test -w @blockula/sdk` in another (`BLOCKULA_RPC` points it at another node) | No |
 | The MCP server (`mcp/`) | `npm run build -w @blockula/sdk`, then `npm test -w @blockula/mcp` (offline) | No |
 | SDK or MCP, end to end | `SKIP_BUILD=1 BIN=$(command -v blockula) bash scripts/local-testnet.sh`, with a release of the version `main` is on: 4 validators, a full node and the SDK e2e | No |
-| The node (`node/`) | `cargo test --release --locked --manifest-path node/Cargo.toml`, the v1 replay gate (`for a in node/testdata/replay/v1-*; do node/target/release/blockula replay "$a"; done`, [docs/REPLAY.md](docs/REPLAY.md)) and `bash scripts/local-testnet.sh` | Yes |
+| The node (`node/`) | `cargo test --release --locked --manifest-path node/Cargo.toml`, the v1 replay gate and the v2 recording (`for a in node/testdata/replay/v[12]-*; do node/target/release/blockula replay "$a"; done`, [docs/REPLAY.md](docs/REPLAY.md)) and `bash scripts/local-testnet.sh` | Yes |
 | The tx encoding | Both sides (`node/src/types.rs` and `sdk-ts/src/tx.ts`) must match byte for byte: the node's tests, the SDK's vectors and the e2e | Yes |
 | The explorer art (`web/lib/ascii`) | `npm run build:haunt`, and commit `node/src/haunt.js` | No |
 

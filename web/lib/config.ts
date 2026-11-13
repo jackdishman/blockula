@@ -107,6 +107,17 @@ export const DEMO_NODE = SITE ? demoNode(process.env.NEXT_PUBLIC_DEMO_NODE) : un
  * (next.config.ts, lib/chains.ts). Empty in every other build.
  */
 export const SITE_CHAINS: ListedChain[] = SITE ? (JSON.parse(process.env.BLOCKULA_SITE_CHAINS || "[]") as ListedChain[]) : [];
+/**
+ * NEXT_PUBLIC_BLACKJACK_TABLE: the blackjack table's program address on this wallet's chain
+ * (app/blackjack). Unset, the page has no table unless a link names one (`?table=boo1…`).
+ */
+export const BLACKJACK_TABLE = clean(process.env.NEXT_PUBLIC_BLACKJACK_TABLE);
+/**
+ * NEXT_PUBLIC_BLACKJACK_ORIGIN: the public https origin the blackjack share page's card names
+ * (app/blackjack/share). Unset, it's the passkey host's (`https://RP_ID`); the served wallet has
+ * none of its own to name, so its share page then carries no card.
+ */
+export const BLACKJACK_ORIGIN = clean(process.env.NEXT_PUBLIC_BLACKJACK_ORIGIN)?.replace(/\/+$/, "");
 /** Where the app's routes live under the origin: `/wallet` when served, else the root. */
 export const BASE_PATH = SERVED ? "/wallet" : "";
 

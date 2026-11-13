@@ -21,6 +21,8 @@ export const to = {
   program: (id: string) => `/programs/${id}`,
   /** A program anyone deployed, by its address (or a stored code, by its hash). */
   deployed: (address: string) => `/program/${encodeURIComponent(address)}`,
+  /** The blackjack table (app/blackjack): the build's, or the one `table` names. */
+  blackjack: (table?: string) => `/blackjack${table ? `?table=${encodeURIComponent(table)}` : ""}`,
   hunt: (id: number | string) => `/hunt/${encodeURIComponent(String(id))}`,
   claim: (id: number | string) => `/claim/${encodeURIComponent(String(id))}`,
   seance: (id: number | string) => `/seance/${encodeURIComponent(String(id))}`,
@@ -32,5 +34,5 @@ export const searchHref = (hit: { type: string; id: string }) =>
 
 /** Explorer pages are wide (charts, tables); the wallet's own pages are a narrow column. */
 export function isExplorerPath(path: string) {
-  return /^\/(explore|boos?|guestbook|leaderboard|block|tx|account|trace|programs?|hunt|claim|seance)(\/|$)/.test(path) || /^\/name\/[^/]+/.test(path);
+  return /^\/(explore|boos?|guestbook|leaderboard|block|tx|account|trace|programs?|hunt|claim|seance|blackjack)(\/|$)/.test(path) || /^\/name\/[^/]+/.test(path);
 }

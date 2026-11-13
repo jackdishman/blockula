@@ -1,0 +1,32 @@
+{
+  "name": "@blockula/blackjack",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Blackjack on Blockula: the rules, the hash-chain cards and the program's encoding, shared by the table page, the dealer and the X bot",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./rules": "./dist/rules.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc --noEmit -p tsconfig.test.json && tsx test/rules.ts && tsx test/codec.ts && tsx test/svg.ts",
+    "test:live": "tsx test/live.ts"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@blockula/sdk": "1.0.10",
+    "@noble/hashes": "2.4.0",
+    "@scure/base": "2.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsx": "*",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

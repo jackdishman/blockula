@@ -4,7 +4,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { checkChains, type ListedChain } from "./lib/chains";
 import { isNodeUrl, MAINNET_GENESIS_HASH, MAINNET_GENESIS_HASH_ENV, NETWORKS, rpIdProblem } from "./lib/config";
-import { STATIC_HEADERS } from "./lib/csp";
+import { EMBED_SOURCE_EXCEPT, FRAME_HEADER, STATIC_HEADERS } from "./lib/csp";
 
 // Node URLs end up in the CSP and genesis pins in every status check: a malformed one must fail
 // the build, not every request.
@@ -12,6 +12,12 @@ for (const n of Object.values(NETWORKS)) {
   if (n && !isNodeUrl(n.rpc)) throw new Error(`${n.label} RPC ${JSON.stringify(n.rpc)} isn't an http(s) URL.`);
   if (n?.genesisHash && !/^[0-9a-f]{64}$/.test(n.genesisHash)) throw new Error(`${n.label} genesis hash must be 64 hex characters.`);
 }
+
+// The blackjack table (app/blackjack) is a program's address, and its share card's origin an https one.
+const table = process.env.NEXT_PUBLIC_BLACKJACK_TABLE?.trim();
+if (table && !/^t?boo1[02-9ac-hj-np-z]{40,}$/.test(table)) throw new Error(`NEXT_PUBLIC_BLACKJACK_TABLE is ${JSON.stringify(table)}; it must be a program's address (boo1…).`);
+const cardOrigin = process.env.NEXT_PUBLIC_BLACKJACK_ORIGIN?.trim();
+if (cardOrigin && !/^https:\/\/[a-z0-9.-]+(:\d+)?\/?$/i.test(cardOrigin)) throw new Error(`NEXT_PUBLIC_BLACKJACK_ORIGIN is ${JSON.stringify(cardOrigin)}; it must be an https origin.`);
 
 // A mainnet deployment must pin its domain and its chain before it can build (DEC-8, WAL-4).
 if (process.env.NEXT_PUBLIC_NETWORK === "mainnet") {
@@ -99,7 +105,11 @@ const nextConfig: NextConfig = {
   experimental: { sri: { algorithm: "sha384" } },
   env: chainEnv,
   async headers() {
-    return [{ source: "/:path*", headers: STATIC_HEADERS }];
+    // Every route is never framed, but the blackjack embed (lib/csp.ts): its CSP names who may frame it.
+    return [
+      { source: "/:path*", headers: STATIC_HEADERS },
+      { source: EMBED_SOURCE_EXCEPT, headers: [FRAME_HEADER] },
+    ];
   },
 };
 

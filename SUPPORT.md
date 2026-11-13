@@ -12,6 +12,7 @@ Blockula is an open-source project with one maintainer today. Help is best effor
 | Giving an agent a wallet | [AGENTS.md](AGENTS.md) and [mcp/README.md](mcp/README.md) |
 | Running a node or validator | [docs/RUN-A-NODE.md](docs/RUN-A-NODE.md), then [docs/OPERATIONS.md](docs/OPERATIONS.md) |
 | Contributing | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Wondering what Soul is | [docs/FAQ.md](docs/FAQ.md) |
 
 ## Ask
 

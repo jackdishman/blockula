@@ -5,14 +5,20 @@
   "description": "🧛 Blockula passkey web wallet",
   "scripts": {
     "dev": "next dev --port 3000",
+    "prebuild": "npm run build --prefix ../services/blackjack/core",
     "build": "next build",
+    "prebuild:served": "npm run build --prefix ../services/blackjack/core",
     "build:served": "BLOCKULA_SERVED=1 next build",
     "start": "next start",
+    "pretypecheck": "npm run build --prefix ../services/blackjack/core",
     "typecheck": "tsc --noEmit",
+    "pretest:e2e": "npm run build --prefix ../services/blackjack/core",
     "test:e2e": "playwright test",
+    "pretest": "npm run build --prefix ../services/blackjack/core",
     "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test 'lib/*.test.mjs'"
   },
   "dependencies": {
+    "@blockula/blackjack": "0.1.0",
     "@blockula/sdk": "^1.0.0",
     "@noble/hashes": "2.4.0",
     "@scure/base": "2.4.0",

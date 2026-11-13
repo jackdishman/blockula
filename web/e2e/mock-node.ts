@@ -4,7 +4,7 @@
 // shapes (node/src/api.rs). Submitted txs are checked like the real node does it: ML-DSA
 // signature over the SDK's signing bytes, the signing key authorized on `from` (owner keys for
 // key changes), nonce and balance. e2e/explorer-world.ts fills it with a little of everything.
-import { actionDigest, formatFang, keyId as keyIdOf, parseFang, proposalDigest, seanceCommitment, seancePairsDigest, signingBytes, txSize, verifyKeyGrant, type Action, type ProposalKind, type Tx } from "@blockula/sdk";
+import { actionDigest, formatFang, keyId as keyIdOf, parseFang, proposalDigest, seanceCommitment, seancePairsDigest, signingBytes, txId, txSize, verifyKeyGrant, type Action, type ProposalKind, type Tx } from "@blockula/sdk";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { createHash } from "node:crypto";
@@ -75,9 +75,10 @@ interface MultisigRec extends Json { threshold: number; owners: { key_id: string
 
 /**
  * A program's run, as the mock plays it: it returned `data` (hex; omitted: nothing) and its writes bonded `bonded`
- * drops, or it failed with `outcome` (docs/PROGRAMS-V0.md §8.1's shape: `{ ok: false, number, code, … }`).
+ * drops, emitting `events` (name and data, hex), or it failed with `outcome` (docs/PROGRAMS-V0.md §8.1's shape:
+ * `{ ok: false, number, code, … }`).
  */
-export type ProgramRun = { ok: true; data?: string; bonded?: bigint; apply?: () => void } | { ok: false; outcome: Json };
+export type ProgramRun = { ok: true; data?: string; bonded?: bigint; apply?: () => void; events?: { untrusted_name: string; data: string }[] } | { ok: false; outcome: Json };
 
 /** A chain with programs on, at their genesis prices (node/src/programs/params.rs): fuel schedule 0, the floor rate of 250 milli-drops per fuel. */
 export const PROGRAMS_ON: Json = {
@@ -166,6 +167,8 @@ export class MockNode {
   views = new Map<string, (method: string, input: string) => ProgramRun>();
   /** How a program's calls run, by its address: what they return, bond and pay out, or how they fail. A program without one applies every call and returns nothing. */
   programRuns = new Map<string, (call: { method: string; input: string; value: bigint }, from: string) => ProgramRun>();
+  /** A program's storage entries (key and value, hex), by its address, as `/api/program/{address}/storage` pages them; read when asked, so a world's records are always current. */
+  storage = new Map<string, () => Map<string, string>>();
   /** Merged into `/api/validators` (v1's leaving, tombstoned, admission…). */
   validatorsExtra: Json = {};
   /**
@@ -279,9 +282,9 @@ export class MockNode {
     return [200, { sort, accounts, next, total: list.length, accounts_total: this.accounts.size }];
   }
 
-  private record(r: Omit<TxRec, "id" | "height">) {
+  private record(r: Omit<TxRec, "id" | "height"> & { id?: string }) {
     this.height += 1;
-    const id = this.nextId();
+    const id = r.id ?? this.nextId();
     this.txs.set(id, { ...r, id, height: this.height });
     return id;
   }
@@ -739,11 +742,12 @@ export class MockNode {
         fuel: { limit: act.fuel_limit, load, used: Math.min(act.fuel_limit, 41_000), reserved: act.fuel_limit + load, rate: 250 },
         fee: { bytes: (fee - fuelFee - tip).toString(), fuel: fuelFee.toString(), tip: tip.toString() }, created: null, upload: null,
       },
-      claims: { return_data: run.ok && run.data !== undefined ? [{ program: call.program, untrusted_method: call.method, value: value.toString(), data: run.data }] : [], events: [], omitted: null },
+      claims: { return_data: run.ok && run.data !== undefined ? [{ program: call.program, untrusted_method: call.method, value: value.toString(), data: run.data }] : [], events: run.ok ? (run.events ?? []).map((e) => ({ program: call.program, ...e })) : [], omitted: null },
     };
     const summary = `${this.label(tx.from).short} called program ${this.label(call.program).short}${value > 0n ? ` with ${formatFang(value)}` : ""}`;
     const failed = run.ok ? {} : { status: "failed" as const, error: `program ${this.label(call.program).short} ${String(run.outcome.code)}` };
-    return this.record({ tx, kind: "call_program", from: tx.from, to: null, amount: null, fee, maxFee: fee, tip, signer, nonce: tx.nonce, memo: tx.memo, summary, names: [call.program], program: section, ...failed });
+    // A program call's id is the transaction's own (its hash), as a real node's is: a page knows it before the node answers.
+    return this.record({ id: txId(tx), tx, kind: "call_program", from: tx.from, to: null, amount: null, fee, maxFee: fee, tip, signer, nonce: tx.nonce, memo: tx.memo, summary, names: [call.program], program: section, ...failed });
   }
 
   /** The account's owner key ids, as node/src/governance.rs `owner_keys`. */
@@ -936,6 +940,19 @@ export class MockNode {
       if (req.method() === "GET" && (m = path.match(/^\/program\/(t?boo1[0-9a-z]+)$/))) {
         const p = this.programs.get(m[1]);
         return p ? reply(200, { ...p, height: this.height }) : reply(404, { error: "no program has this address" });
+      }
+      if (req.method() === "GET" && (m = path.match(/^\/program\/(t?boo1[0-9a-z]+)\/storage$/))) {
+        // node/src/programs/api.rs `storage`: the entries in key order from just past `after`, a bounded page at a time.
+        if (!this.programs.has(m[1])) return reply(404, { error: "no program has this address" });
+        const sp = new URL(req.url()).searchParams;
+        const after = sp.get("after") ?? "";
+        if (!/^([0-9a-f]{2}){0,128}$/.test(after)) return reply(400, { error: "`after` is a storage key: lowercase hex, at most 128 bytes" });
+        const limit = Math.min(Math.max(Number(sp.get("limit") ?? 100) || 100, 1), 100);
+        // Hex compares as its bytes do.
+        const all = [...(this.storage.get(m[1])?.() ?? new Map<string, string>())].filter(([k]) => !after || k > after).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+        const page = all.slice(0, limit);
+        const payer = this.label((this.programs.get(m[1]) as { creator: { address: string } }).creator.address);
+        return reply(200, { program: m[1], entries: page.map(([key, value]) => ({ key, value, payer, deposit: "0", capacity: value.length / 2 })), next: all.length > limit ? page[page.length - 1][0] : null, height: this.height });
       }
       if (req.method() === "POST" && (m = path.match(/^\/program\/(t?boo1[0-9a-z]+)\/view$/))) {
         // node/src/programs/api.rs `view`: run as of the newest block; 403 from a node that serves no views.

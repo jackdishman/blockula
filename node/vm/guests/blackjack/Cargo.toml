@@ -1,0 +1,13 @@
+[package]
+name = "blackjack"
+description = "Blackjack against a house bankroll, dealt from the dealer's committed hash chains, by hand against host ABI v1 (protocol v2)."
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+abi = { path = "../abi" }
+bj-core = { path = "../bj-core" }

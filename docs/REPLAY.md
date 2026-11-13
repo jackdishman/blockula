@@ -100,8 +100,8 @@ makes the replay CPU-bound: testnet-2's first 99,093 blocks replay in 11 s on an
 
 ## Every PR: the recorded corpus
 
-[`node/testdata/replay/`](../node/testdata/replay/README.md) holds two recorded chains, about
-2,200 blocks between them. Every tag from 0 to 54 and 60–61 applies at least once, except
+[`node/testdata/replay/`](../node/testdata/replay/README.md) holds two recorded v1 chains, about
+2,200 blocks between them (and a short v2 one, [below](#the-v2-recording)). Every tag from 0 to 54 and 60–61 applies at least once, except
 `Unbond` (7), which v1 always fails.
 
 | Chain | Like | What only it covers |
@@ -149,9 +149,38 @@ the corpus is v1 as released, not just as main ran it.
 
 ```
 cargo build --release --locked --manifest-path node/Cargo.toml
-for a in node/testdata/replay/v1-*; do node/target/release/blockula replay "$a"; done
+for a in node/testdata/replay/v[12]-*; do node/target/release/blockula replay "$a"; done
 cargo test --release --locked --manifest-path node/Cargo.toml replay::
 ```
+
+### The v2 recording
+
+`v2-programs` (40 blocks) is a third recording, of a two-validator chain born at **protocol v2
+with programs on**. It isn't part of the v1 gate; it holds v2's program rules the same way, in
+the same CI step and in `cargo test` (`the_v2_corpus_replays`): every block's state root, every
+tx's outcome and every program receipt (`Block.programs` in the block log) must come out as
+recorded.
+
+| What it holds | Txs (applied/failed/skipped) |
+|---|---|
+| Uploads (62): the four guests of `node/vm/tests/programs`; three that fail, charged: a module that imports `beacon_v1` (twice, in two epochs: upload validation rule 5, `Import`) and a float (rule 4) | 4/3/0 |
+| Creates (63): the four guests, the token with its `init` | 4/0/0 |
+| Calls (64): the counter, token transfers, a batch through the router with a binding, an escrow deal opened with value and released; failed: an unbound program, too little fuel; left out of their blocks: a version digest that isn't in force, a call during a pause | 32/2/2 |
+| A validator's pause (69) | 1/0/0 |
+| Plain transfers (0) between them | 7/0/0 |
+
+The refused `beacon_v1` uploads are why it exists: host functions that a later protocol
+version adds ([RANDOMNESS.md](RANDOMNESS.md)) must stay refused under v2, in the same words and
+at the same charge, and a v2 block must end as it did before that version's code was written.
+
+**It was recorded by the v1.0.9 source** (`upstream/main` at `c34ac95`, before the randomness
+ABI), with the recorder in `node/src/replay/corpus.rs` (`record_programs`) copied onto it, and a
+binary with the ABI records the same bytes (`recording_the_v2_chain_again_gives_the_committed_bytes`).
+To change it, do the same: edit the recorder, write the recording with a released binary's
+source (`cargo test --release --locked --manifest-path node/Cargo.toml -- --ignored
+write_v2_replay_corpus`), and check that the current source writes the same files. The four
+guests' bytes are in its txs, so it is re-recorded if one of them is ever rebuilt differently
+(`node/vm/guests/SHA256SUMS`); the refused module is fixed bytes in the recorder.
 
 **Changing the corpus** is for adding v1 coverage, never for passing a red gate. C21 adds every
 gated pre-v2 behavior. To change it:

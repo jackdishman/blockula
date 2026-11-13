@@ -16,6 +16,9 @@
 //! (`chain::system_account`) that has no record yet reads as an existing account holding 0, so a
 //! program pays no creation fee to "open" the treasury, as no native action does.
 //!
+//! The epoch is the height's (`Params::epoch_of`), and a beacon value is the state's
+//! (`beacon::value`, with its reveal count): derived and still kept, or none.
+//!
 //! Every answer is a function of the state and the height, so every node gets the same ones.
 
 use super::digest;
@@ -26,7 +29,7 @@ use crate::chain::{system_account, State};
 use crate::crypto;
 use blockula_vm::engine::{Address, CodeHash, Digest};
 use blockula_vm::exec::Entry;
-use blockula_vm::host::{MethodInfo, View};
+use blockula_vm::host::{Beacon, MethodInfo, View};
 use blockula_vm::interface::Interface;
 use std::collections::BTreeMap;
 
@@ -163,6 +166,17 @@ impl View for ProgramView<'_> {
 
     fn account_creation_fee(&self) -> u64 {
         self.state.chain_params.account_creation_fee
+    }
+
+    fn epoch(&self) -> u64 {
+        self.state.params.epoch_of(self.height)
+    }
+
+    /// `beacon::value` with its reveal count, as the state holds it: an epoch's value is filed
+    /// at the end of the epoch before it and dropped `beacon::VALUES_KEPT` epochs later, both in
+    /// `end_block`, so every transaction of a block reads the same answer.
+    fn beacon(&self, epoch: u64) -> Option<Beacon> {
+        self.state.beacon.values.get(&epoch).map(|v| Beacon { value: v.value, reveals: v.reveals })
     }
 }
 

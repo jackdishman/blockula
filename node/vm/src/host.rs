@@ -44,6 +44,19 @@ pub trait View {
     fn storage_price(&self, used: u64) -> Option<u64>;
     /// What opening an account burns.
     fn account_creation_fee(&self) -> u64;
+    /// The executing block's epoch.
+    fn epoch(&self) -> u64;
+    /// The randomness beacon of `epoch` (10.3) as the state holds it before the executing block:
+    /// `None` until it's derived, and again once the state no longer keeps it.
+    fn beacon(&self, epoch: u64) -> Option<Beacon>;
+}
+
+/// An epoch's randomness beacon, as `beacon_v1` reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Beacon {
+    pub value: [u8; 32],
+    /// The validators' reveals that went into it (0: the hash-chain fallback).
+    pub reveals: u32,
 }
 
 /// A method's kind (11.1): what may call it and what it may do (8.1, 8.2).
@@ -115,6 +128,9 @@ const LAST_RETURN: usize = index("last_return_v1");
 const LAST_RETURN_LEN: usize = index("last_return_len_v1");
 const LAST_ABORT_CODE: usize = index("last_abort_code_v1");
 const EMIT: usize = index("emit_v1");
+const BLAKE3: usize = index("blake3_v1");
+const EPOCH: usize = index("epoch_v1");
+const BEACON: usize = index("beacon_v1");
 
 /// A pointer argument and a length as a range of memory, or a trap.
 fn range(memory: &[u8], ptr: i64, len: usize) -> Result<Range<usize>, Trap> {
@@ -321,6 +337,28 @@ impl Host for Run<'_> {
                 let program = self.frame()?.program;
                 self.overlay.emit(Event { program, name, data })?;
                 Ok(0)
+            }
+            // The three below are in force from protocol v3 (`abi::RANDOMNESS_VERSION`). Nothing
+            // here asks the version: upload validation refused them before it, so no code a v2
+            // block runs imports them (10.1).
+            BLAKE3 => {
+                let len = length(args[1], abi::MAX_HASH_INPUT)?;
+                instance.charge(h.base.saturating_add(h.blake3).saturating_add(per_byte(h.blake3_per_byte, len)))?;
+                let memory = instance.memory();
+                let digest = *blake3::hash(&memory[range(memory, args[0], len)?]).as_bytes();
+                write(instance, args[2], &digest)?;
+                Ok(0)
+            }
+            EPOCH => {
+                instance.charge(context)?;
+                Ok(i64::try_from(self.view.epoch()).map_err(|_| NodeFault::Host("an epoch outside i64"))?)
+            }
+            BEACON => {
+                instance.charge(h.base.saturating_add(h.beacon))?;
+                // A negative epoch is no epoch: −1, like one not derived yet.
+                let Some(beacon) = u64::try_from(args[0]).ok().and_then(|epoch| self.view.beacon(epoch)) else { return Ok(-1) };
+                write(instance, args[1], &beacon.value)?;
+                Ok(i64::from(i32::try_from(beacon.reveals).map_err(|_| NodeFault::Host("beacon reveals outside i32"))?))
             }
             _ => Err(NodeFault::Host("an import outside ABI v1").into()),
         }

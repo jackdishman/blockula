@@ -33,6 +33,9 @@ ref038 = ["dep:wasmi", "testing"]
 # The crate itself with `testing`, so its tests, benches and the guests' checks get `MemHost`.
 blockula-vm = { path = ".", features = ["testing"] }
 wat = "1"
+# The blackjack guest's rules (guests/bj-core: no_std, no dependencies), built for the host so
+# tests/blackjack_rules.rs holds them to an independent reference and writes the TypeScript vectors.
+bj-core = { path = "guests/bj-core" }
 
 # Calibration (`cargo bench --bench calibrate`): plain std timing, no harness.
 [[bench]]

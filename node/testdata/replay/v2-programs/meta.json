@@ -1,0 +1,22 @@
+{
+  "blocks": [
+    {
+      "file": "blocks-000000000001.jsonl",
+      "from": 1,
+      "sha256": "f014f257d38d37433876da083c4ca974a5ba1410b678acfc43954716c5fc2f8a",
+      "to": 40
+    }
+  ],
+  "chain_id": "replay-v2-programs",
+  "genesis_hash": "d6ef7f7015b67b3d1c2203e52a2523967811501019c67fa409a459efd9811ee4",
+  "open": null,
+  "segments": [
+    {
+      "file": "sync-000000000001.jsonl",
+      "from": 1,
+      "sha256": "2e82508d13a67c9e624ccc02550a7fbac3e83b4c073fc57aee070cc0453d5062",
+      "to": 40
+    }
+  ],
+  "source": "node/src/replay/corpus.rs (cargo test --release -- --ignored write_v2_replay_corpus)"
+}

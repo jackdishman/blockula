@@ -4,7 +4,7 @@
 # Its own workspace, like node/vm and node/ghost: profiles are per workspace, and a program's
 # (opt-level "z", panic = "abort") must never reach the node's.
 [workspace]
-members = ["abi", "counter", "token", "escrow", "router"]
+members = ["abi", "counter", "token", "escrow", "router", "dice", "bj-core", "blackjack"]
 resolver = "3"
 
 [workspace.package]
@@ -26,3 +26,9 @@ debug = false
 strip = true
 overflow-checks = true
 incremental = false
+
+# The blackjack rules hash (BLAKE3, compiled in): built for speed, not size. Every instruction a
+# program runs is fuel its caller pays, and at "z" the compression function runs about three
+# times the instructions.
+[profile.release.package.bj-core]
+opt-level = 3

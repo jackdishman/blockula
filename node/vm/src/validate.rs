@@ -216,9 +216,20 @@ fn bounded(s: &str) -> String {
     out
 }
 
-/// Validates an upload against PROGRAMS.md 4.2 and returns what an engine and the fee schedule
-/// need to know about it. Never panics.
+/// [`validate_at`] with every host function the ABI has, whichever protocol version added it
+/// (`abi::LATEST_VERSION`): for tools, tests and code the chain already stores, which passed
+/// under the version its upload ran at. **Never an upload's check:** `upload::check` takes the
+/// protocol version in force and asks [`validate_at`].
 pub fn validate(wasm: &[u8]) -> Result<ModuleInfo, ValidateError> {
+    validate_at(wasm, abi::LATEST_VERSION)
+}
+
+/// Validates an upload against PROGRAMS.md 4.2 under `protocol_version`, the version in force at
+/// the block that uploads it, and returns what an engine and the fee schedule need to know about
+/// it. The version decides one thing: which host functions may be imported (`abi::host_fn_at`),
+/// so code importing one a later version adds is refused (`Rule::Import`) until that version is
+/// in force. Never panics.
+pub fn validate_at(wasm: &[u8], protocol_version: u32) -> Result<ModuleInfo, ValidateError> {
     if wasm.len() > config::MAX_CODE_BYTES {
         return Err(ValidateError {
             rule: Rule::Size,
@@ -233,7 +244,7 @@ pub fn validate(wasm: &[u8]) -> Result<ModuleInfo, ValidateError> {
     // where Wasm 1.0 requires a single zero byte.
     parser.set_features(FEATURES);
     let mut validator = Validator::new_with_features(FEATURES);
-    let mut checker = Checker { wasm, ..Checker::default() };
+    let mut checker = Checker { wasm, protocol_version, ..Checker::default() };
     let mut allocs = FuncValidatorAllocations::default();
     for payload in parser.parse_all(wasm) {
         let payload = payload?;
@@ -263,6 +274,8 @@ pub fn validate(wasm: &[u8]) -> Result<ModuleInfo, ValidateError> {
 #[derive(Default)]
 struct Checker<'a> {
     wasm: &'a [u8],
+    /// The protocol version the upload runs under: which host functions it may import.
+    protocol_version: u32,
     /// The type section's function types, by type index.
     types: Vec<FuncType>,
     /// Each defined function's type index, in order.
@@ -318,7 +331,9 @@ impl Checker<'_> {
                     let TypeRef::Func(ty) = import.ty else {
                         return Err(err(Rule::Import, offset, format!("import {} isn't a function: programs import only host functions", what())));
                     };
-                    let host = abi::host_fn(import.name).filter(|_| import.module == abi::MODULE).ok_or_else(|| {
+                    // A function a later protocol version adds isn't one yet (10.1): refused in
+                    // the same words as a name the ABI never had.
+                    let host = abi::host_fn_at(import.name, self.protocol_version).filter(|_| import.module == abi::MODULE).ok_or_else(|| {
                         err(Rule::Import, offset, format!("import {} isn't a host function of ABI v1", what()))
                     })?;
                     let signature_matches = self.types.get(ty as usize).is_some_and(|ty| {

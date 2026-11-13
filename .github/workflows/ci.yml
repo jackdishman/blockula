@@ -74,11 +74,13 @@ jobs:
       # The v1 replay gate (docs/REPLAY.md): this PR's binary replays the recorded v1 history in
       # node/testdata/replay through sync and startup, block by block (every certificate, cited
       # state root, tx outcome, block state root and record). `cargo test` (node-unit) runs the
-      # same corpus in the test build, and shows a binary that diverges from it fails.
-      - name: v1 replay gate (the recorded corpus)
+      # same corpus in the test build, and shows a binary that diverges from it fails. The same
+      # step replays the short v2 recording (v2-programs: programs on, their receipts, and the
+      # refusal of code importing a host function v2 doesn't have).
+      - name: v1 replay gate (the recorded corpus, and the v2 recording)
         run: |
           cargo build --release --locked --manifest-path node/Cargo.toml
-          for archive in node/testdata/replay/v1-*; do node/target/release/blockula replay "$archive"; done
+          for archive in node/testdata/replay/v[12]-*; do node/target/release/blockula replay "$archive"; done
       # The Python SDK (sdk-py/) against the same binary: its signing vectors (shared with the
       # TypeScript SDK) and a transfer and a name on a throwaway dev chain.
       - name: Python SDK (shared signing vectors and local dev-chain e2e)
@@ -190,7 +192,8 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22, cache: npm }
       - run: npm ci
-      - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp && npm run build -w @blockula/web
+      # The wallet's table page imports @blockula/blackjack (services/blackjack/core), so it's built before the wallet.
+      - run: npm run build -w @blockula/sdk && npm run build -w @blockula/blackjack && npm run build -w @blockula/mcp && npm run build -w @blockula/web
       - name: ML-DSA-65 KATs and Rust ⇄ TS cross vectors (SDK)
         run: npm run test:kat -w @blockula/sdk
       - name: Passkey, state-proof and protocol v1 helper vectors (SDK)
@@ -198,6 +201,14 @@ jobs:
       - name: MCP network pinning and release checks
         run: npm test -w @blockula/mcp
       - run: npm test -w @blockula/web
+      # Blackjack (docs/BLACKJACK.md), offline: the rules and codec against the program's vectors, the
+      # card renderer, the dealer daemon's store and planner, and the X bot's dry run (no X client).
+      - name: Blackjack packages (rules, renderer, dealer, X bot dry run)
+        run: |
+          npm test -w @blockula/blackjack
+          npm run build -w @blockula/blackjack-render && npm test -w @blockula/blackjack-render
+          npm test -w @blockula/blackjack-dealer
+          npm test -w @blockula/blackjack-xbot
       - name: Chain directory (chains/*.json, listed on blockula.app)
         run: node scripts/check-chains.mjs
       - name: Explorer backdrop bundle is up to date
@@ -217,7 +228,7 @@ jobs:
       # ships Chrome, so Chromium's system libraries are already there, and a job that needs
       # Ubuntu's package servers fails whenever the runners can't reach them (2026-11-11).
       - run: npx playwright install chromium
-      - run: npm run build -w @blockula/sdk
+      - run: npm run build -w @blockula/sdk && npm run build -w @blockula/blackjack
       # Testnet and mainnet production builds, a PRF virtual authenticator and a mock node
       # (web/playwright.config.ts).
       - run: npm run test:e2e -w @blockula/web

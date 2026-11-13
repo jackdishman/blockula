@@ -1,0 +1,422 @@
+{
+  "format": 1,
+  "methods": [
+    {
+      "name": "approve_relayer",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "relayer",
+          "type": "address"
+        },
+        {
+          "name": "on",
+          "type": "bool"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "bet",
+      "kind": "call",
+      "payable": true,
+      "args": [
+        {
+          "name": "client_seed",
+          "type": "hash32"
+        }
+      ],
+      "returns": "u64"
+    },
+    {
+      "name": "commit_batch",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "first",
+          "type": "u64"
+        },
+        {
+          "name": "commitments",
+          "type": {
+            "vec": [
+              "hash32",
+              64
+            ]
+          }
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "commitment",
+      "kind": "view",
+      "payable": false,
+      "args": [
+        {
+          "name": "index",
+          "type": "u64"
+        }
+      ],
+      "returns": "hash32"
+    },
+    {
+      "name": "defund",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "amount",
+          "type": "fang"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "deposit",
+      "kind": "call",
+      "payable": true,
+      "args": [],
+      "returns": null
+    },
+    {
+      "name": "fund",
+      "kind": "call",
+      "payable": true,
+      "args": [],
+      "returns": null
+    },
+    {
+      "name": "game",
+      "kind": "view",
+      "payable": false,
+      "args": [
+        {
+          "name": "game",
+          "type": "u64"
+        }
+      ],
+      "returns": {
+        "bytes": 159
+      }
+    },
+    {
+      "name": "hit",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "game",
+          "type": "u64"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "house",
+      "kind": "view",
+      "payable": false,
+      "args": [],
+      "returns": {
+        "bytes": 130
+      }
+    },
+    {
+      "name": "init",
+      "kind": "init",
+      "payable": false,
+      "args": [
+        {
+          "name": "dealer",
+          "type": "address"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "limits",
+      "kind": "view",
+      "payable": false,
+      "args": [],
+      "returns": {
+        "bytes": 96
+      }
+    },
+    {
+      "name": "open_games",
+      "kind": "view",
+      "payable": false,
+      "args": [],
+      "returns": {
+        "vec": [
+          "u64",
+          32
+        ]
+      }
+    },
+    {
+      "name": "pause",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "on",
+          "type": "bool"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "player",
+      "kind": "view",
+      "payable": false,
+      "args": [
+        {
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "returns": {
+        "bytes": 203
+      }
+    },
+    {
+      "name": "relay_bet",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "player",
+          "type": "address"
+        },
+        {
+          "name": "amount",
+          "type": "fang"
+        },
+        {
+          "name": "post_id",
+          "type": "u64"
+        }
+      ],
+      "returns": "u64"
+    },
+    {
+      "name": "relay_hit",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "game",
+          "type": "u64"
+        },
+        {
+          "name": "post_id",
+          "type": "u64"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "relay_stand",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "game",
+          "type": "u64"
+        },
+        {
+          "name": "post_id",
+          "type": "u64"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "relay_withdraw",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "player",
+          "type": "address"
+        },
+        {
+          "name": "post_id",
+          "type": "u64"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "reveal",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "game",
+          "type": "u64"
+        },
+        {
+          "name": "links",
+          "type": {
+            "vec": [
+              "hash32",
+              12
+            ]
+          }
+        }
+      ],
+      "returns": "u16"
+    },
+    {
+      "name": "revoke",
+      "kind": "call",
+      "payable": false,
+      "args": [],
+      "returns": null
+    },
+    {
+      "name": "set_dealer",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "dealer",
+          "type": "address"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "set_limits",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "min_bet",
+          "type": "fang"
+        },
+        {
+          "name": "max_bet",
+          "type": "fang"
+        },
+        {
+          "name": "daily_cap",
+          "type": "fang"
+        },
+        {
+          "name": "day_blocks",
+          "type": "u64"
+        },
+        {
+          "name": "max_open_games",
+          "type": "u64"
+        },
+        {
+          "name": "bankroll_divisor",
+          "type": "u64"
+        },
+        {
+          "name": "max_exposure",
+          "type": "fang"
+        },
+        {
+          "name": "reveal_blocks",
+          "type": "u64"
+        },
+        {
+          "name": "idle_blocks",
+          "type": "u64"
+        },
+        {
+          "name": "deposit_cap",
+          "type": "fang"
+        },
+        {
+          "name": "relay_max_bet",
+          "type": "fang"
+        },
+        {
+          "name": "grant_max_blocks",
+          "type": "u64"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "set_relayer",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "relayer",
+          "type": "address"
+        },
+        {
+          "name": "max_bet",
+          "type": "fang"
+        },
+        {
+          "name": "daily_cap",
+          "type": "fang"
+        },
+        {
+          "name": "expires_at",
+          "type": "u64"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "skip_commits",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "count",
+          "type": "u32"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "stand",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "game",
+          "type": "u64"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "timeout",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "game",
+          "type": "u64"
+        }
+      ],
+      "returns": "u16"
+    },
+    {
+      "name": "withdraw",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "amount",
+          "type": "fang"
+        }
+      ],
+      "returns": null
+    }
+  ]
+}

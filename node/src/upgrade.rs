@@ -137,6 +137,16 @@ const _: () = assert!(MAINNET_PROGRAMS_ACTIVATION_VERSION > MAINNET_GENESIS_VERS
 /// before a v3 that governance schedules there.
 pub const PREVIEW_PROTOCOL_VERSION: u32 = 3;
 
+// The VM marks each host function with the protocol version that adds it (`HostFn::since`), in a
+// crate that can't see these constants. Tie them here, so neither side moves alone: host ABI v1's
+// first functions come with programs, and the randomness functions (docs/RANDOMNESS.md) with the
+// preview version. When the release that ships v3 raises `PREVIEW_PROTOCOL_VERSION`, the second
+// assert fails on purpose: name the version that carries randomness there instead (v3).
+const _: () = assert!(blockula_vm::abi::FIRST_VERSION == PROGRAMS_VERSION);
+const _: () = assert!(blockula_vm::abi::RANDOMNESS_VERSION == PREVIEW_PROTOCOL_VERSION);
+// No host function is marked with a version this binary can't run.
+const _: () = assert!(blockula_vm::abi::LATEST_VERSION <= PREVIEW_PROTOCOL_VERSION);
+
 /// A version-gated rule that only tests have (docs/PROGRAMS-PLAN.md P7): it shows that every path
 /// that admits, executes or replays a block reads the protocol version in force at that block's
 /// height, so a real gated rule flips at its activation height everywhere and nowhere else. It

@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { RPC_COOKIE, SITE } from "./lib/config";
-import { contentSecurityPolicy, customOrigin } from "./lib/csp";
+import { contentSecurityPolicy, customOrigin, isEmbedPath } from "./lib/csp";
 
 /** The project site's pages: the landing page, its legal pages, and how to link an X account. */
 const SITE_PATHS = new Set(["/", "/terms", "/privacy", "/x", "/x/"]);
@@ -17,6 +17,8 @@ export function proxy(request: NextRequest) {
   const csp = contentSecurityPolicy(nonce, {
     custom: SITE ? null : customOrigin(request.cookies.get(RPC_COOKIE)?.value),
     dev: process.env.NODE_ENV === "development",
+    // The blackjack spectator view is the one page X may frame (lib/csp.ts).
+    embed: !SITE && isEmbedPath(request.nextUrl.pathname),
   });
   const headers = new Headers(request.headers);
   headers.set("content-security-policy", csp);

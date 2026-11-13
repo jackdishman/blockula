@@ -4,9 +4,12 @@
 //!
 //! This is a subset of 10.2: input and output, storage, context, transfers, cross-program calls
 //! and events, plus `last_return_len_v1` and `last_abort_code_v1`, which 10.2 lacks. Functions
-//! are only ever added, and only with a protocol version (10.1), so what this table holds when
-//! programs activate is frozen; the rest of 10.2 (`storage_next`, the beacon, names, crypto,
-//! `origin_session`, `caller_auth`, `epoch`, `chain_instance`, `tx_hash`) comes with a later one.
+//! are only ever added, and only with a protocol version (10.1): each entry says which
+//! ([`HostFn::since`]), and upload validation refuses an import whose version isn't in force yet
+//! (`validate::validate_at`), so no stored code ever meets a function that appeared under it.
+//! Protocol v3 adds `blake3_v1`, `epoch_v1` and `beacon_v1` (docs/RANDOMNESS.md); the rest of
+//! 10.2 (`storage_next`, names, the other crypto, `origin_session`, `caller_auth`,
+//! `chain_instance`, `tx_hash`) comes with a later one.
 
 /// The import module every host function lives in.
 pub const MODULE: &str = "blockula";
@@ -25,12 +28,25 @@ pub struct HostFn {
     pub name: &'static str,
     pub params: &'static [Ty],
     pub results: &'static [Ty],
+    /// The first protocol version whose uploads may import it (10.1, "Admission of imports").
+    pub since: u32,
 }
+
+/// The protocol version programs first run under: every function of the first table is in force
+/// from it.
+pub const FIRST_VERSION: u32 = 2;
+/// The protocol version that adds `blake3_v1`, `epoch_v1` and `beacon_v1`.
+pub const RANDOMNESS_VERSION: u32 = 3;
 
 use Ty::{I32, I64};
 
 const fn f(name: &'static str, params: &'static [Ty], results: &'static [Ty]) -> HostFn {
-    HostFn { name, params, results }
+    HostFn { name, params, results, since: FIRST_VERSION }
+}
+
+/// A function added by protocol version `since`.
+const fn added(since: u32, name: &'static str, params: &'static [Ty], results: &'static [Ty]) -> HostFn {
+    HostFn { name, params, results, since }
 }
 
 /// Host ABI v1. An import not listed here, or listed with another signature, fails upload
@@ -59,6 +75,21 @@ const fn f(name: &'static str, params: &'static [Ty], results: &'static [Ty]) ->
 /// caller reads that first and brings a buffer big enough (it never needs more than `MAX_RETURN`).
 /// The abort code has its own function so a caller can branch on it (a token's "balance short",
 /// say) without parsing text; the message is for people.
+///
+/// # Hashing, epochs and the beacon (from protocol v3)
+///
+/// `blake3_v1(ptr, len, out32)` writes the BLAKE3 hash of `len` bytes (any length that lies in
+/// memory, [`MAX_HASH_INPUT`] at most) to `out32`. `epoch_v1()` is the executing block's epoch.
+///
+/// `beacon_v1(epoch, out32)` reads the randomness beacon (10.3): if `epoch`'s value is derived
+/// and the state still keeps it, it writes the 32 bytes to `out32` and returns how many validators
+/// revealed for it (0: the predictable hash-chain fallback). Otherwise it returns −1 and writes
+/// nothing: before the value is derived (the current epoch's is the newest there is), once it's
+/// pruned (the state keeps 64 epochs of values) and for a negative `epoch`. A value never comes
+/// back after it's pruned, and the retention window is part of this function: it changes only
+/// under a new name.
+///
+/// New entries go at the end: an entry's index is how the engines name it.
 pub const HOST_FNS: &[HostFn] = &[
     // Input and output.
     f("input_len_v1", &[], &[I32]),
@@ -89,12 +120,39 @@ pub const HOST_FNS: &[HostFn] = &[
     f("last_abort_code_v1", &[], &[I32]),               // the code after `try_call` returned ERR_ABORT, else 0
     // Events.
     f("emit_v1", &[I32, I32, I32, I32], &[]),           // (name_ptr, name_len, data_ptr, data_len)
+    // Protocol v3: hashing, the epoch and the randomness beacon (see above).
+    added(RANDOMNESS_VERSION, "blake3_v1", &[I32, I32, I32], &[]),   // (ptr, len, out32)
+    added(RANDOMNESS_VERSION, "epoch_v1", &[], &[I64]),
+    added(RANDOMNESS_VERSION, "beacon_v1", &[I64, I32], &[I32]),     // (epoch, out32) -> reveals | -1
 ];
 
-/// The host function named `name`, if ABI v1 has it.
+/// The host function named `name`, if ABI v1 has it under any protocol version: for tools and
+/// for reading code the chain already stores. An upload asks [`host_fn_at`].
 pub fn host_fn(name: &str) -> Option<&'static HostFn> {
     HOST_FNS.iter().find(|h| h.name == name)
 }
+
+/// The host function named `name`, if an upload may import it under `protocol_version`.
+pub fn host_fn_at(name: &str, protocol_version: u32) -> Option<&'static HostFn> {
+    host_fn(name).filter(|h| h.since <= protocol_version)
+}
+
+/// The newest protocol version that adds a host function: under it (or any later one) an upload
+/// may import the whole table.
+pub const LATEST_VERSION: u32 = {
+    let mut latest = FIRST_VERSION;
+    let mut i = 0;
+    while i < HOST_FNS.len() {
+        if HOST_FNS[i].since > latest {
+            latest = HOST_FNS[i].since;
+        }
+        i += 1;
+    }
+    latest
+};
+
+/// Most bytes `blake3_v1` hashes in one call: a program's whole memory (`config::MAX_PAGES`).
+pub const MAX_HASH_INPUT: usize = (crate::config::MAX_PAGES as usize) << 16;
 
 /// Status codes host functions return.
 pub mod status {

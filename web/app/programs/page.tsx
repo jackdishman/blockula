@@ -4,6 +4,8 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Fang, Named, plural, Term } from "@/components/explorer/kit";
+import { COPY, NOTE } from "@/lib/blackjack-copy";
+import { BLACKJACK_TABLE } from "@/lib/config";
 import { inertText, shortAddress, typeText } from "@/lib/explorer/inert";
 import { compactDrops, parseDrops } from "@/lib/explorer/ledger";
 import { NodeError, useNode } from "@/lib/explorer/node";
@@ -55,6 +57,15 @@ export default function ProgramsPage() {
             </ul>
           </Link>
         ))}
+        {/* The blackjack table, when this wallet was built with one (lib/config.ts BLACKJACK_TABLE). */}
+        {BLACKJACK_TABLE && (
+          <Link href={to.blackjack()} className="card program-card" data-testid="blackjack-card">
+            <span className="tag">{COPY.nav.tag}</span>
+            <h2>{COPY.nav.title}</h2>
+            <span className="dim">{COPY.nav.blurb}</span>
+            <span className="figure">{NOTE}</span>
+          </Link>
+        )}
         <div className="card program-card coming">
           <span className="tag">deploy</span>
           <h2>Your program here</h2>

@@ -10,6 +10,7 @@
 //! | [`a_lagging_verifier_replays_each_block_once_and_keeps_voting`] | 3 |
 //! | [`programs_switched_on_by_council_vote_at_a_height`] | 4 |
 //! | [`a_pause_signed_into_full_blocks_lands_through_its_duty_lane`] and [`a_pause_signed_by_an_owner_lands_with_a_tip`] | beside 1: §2.5's lane and the owner form's tip, which blocks full of transactions would otherwise shut a pause out of |
+//! | [`the_dice_settles_identically_on_four_validators`] | docs/RANDOMNESS.md: protocol v3's `beacon_v1` under real beacon rounds: a roll settled on four reveals, one on three after a validator withheld (and was jailed), one refunded on the hash-chain fallback, one settled past its deadline while its value is kept, one forfeited once the value is gone |
 //!
 //! **What every scenario checks at every height** ([`Watch`]): the same block hash, state root and
 //! program receipts (their JSON) on every validator, and the same `fuel_rate` where a validator is
@@ -1496,6 +1497,245 @@ fn a_pause_signed_by_an_owner_lands_with_a_tip() {
         until_height(&context, &mut watch, &vals, pause.from + 3).await;
         assert!(watch.compared() as u64 + 3 >= floor(&vals), "{} heights compared", watch.compared());
         finish(&vals);
+    });
+    std::fs::remove_dir_all(root).ok();
+}
+
+// ------------------------------------------------------------------------------------ randomness
+
+/// The randomness guest (`node/vm/guests/dice`): it imports protocol v3's `blake3_v1`, `epoch_v1`
+/// and `beacon_v1`.
+const DICE: Guest = (include_bytes!("../../vm/tests/programs/dice.wasm"), include_bytes!("../../vm/tests/programs/dice.iface"));
+
+/// docs/RANDOMNESS.md end to end, on four validators running the preview version (v3) from block
+/// 1 with programs on, each doing its beacon duties as node.rs does: the `dice` guest reads the
+/// beacon the validators' commit-reveal rounds derive, and every node computes the same blocks,
+/// roots and receipts at every height ([`Watch`]).
+///
+/// 1. **The hash-chain fallback.** While no validator takes part, a roll's epoch gets a value
+///    with no reveals (BLAKE3 over the last value and the epoch, which anyone can compute ahead):
+///    the dice asks for two, so `settle` refunds the stake.
+/// 2. **A normal roll.** With every validator committing and revealing, a roll can't settle in
+///    its own epoch (abort 35, charged, the same on every node) and settles two epochs later on a
+///    value with four reveals: the face is BLAKE3("dice/roll" ‖ program ‖ id ‖ value) mod 6 + 1.
+/// 3. **A withheld reveal.** Validator 2 commits for an epoch and never reveals. The value is
+///    derived all the same, from the other three reveals; validator 2 is on its `missed` list,
+///    jailed, and out of that epoch's set; the roll that named the epoch settles on it.
+/// 4. **Past the deadline.** A roll nobody settles for 32 epochs past its target still settles
+///    on its value, which the state keeps for 64, and pays its settler the bounty. A roll left
+///    until the value is gone is forfeit: the stake stays in the bank, less the bounty.
+#[test]
+fn the_dice_settles_identically_on_four_validators() {
+    use crate::upgrade::PREVIEW_PROTOCOL_VERSION;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    logs();
+    const EB: u64 = 8;
+    const MIN_REVEALS: u32 = 2;
+    const BANK: u64 = 100 * FANG;
+    /// The dice pays whoever settles a roll a hundredth of its stake.
+    const BOUNTY: u64 = FANG / 100;
+    const NEVER: u64 = u64::MAX;
+    let (root, homes, mut genesis, seeds) = summon_with("dice", EB, &[]);
+    genesis.upgrades = vec![ScheduledUpgrade { version: PREVIEW_PROTOCOL_VERSION, activation_height: 1 }];
+    genesis.features = vec![PROGRAMS_FEATURE.to_string()];
+    genesis.check().unwrap();
+    for h in &homes {
+        std::fs::write(h.join("genesis.json"), serde_json::to_string_pretty(&genesis).unwrap()).unwrap();
+    }
+    let executor = deterministic::Runner::timed(Duration::from_secs(6_000));
+    executor.start(|context| async move {
+        let g = &genesis;
+        let mut oracle = network(&context, g, &[]).await;
+        let node = Node { supported: crate::upgrade::supported_version(g), schedule: vec![], halt_height: None };
+        assert_eq!(node.supported, PREVIEW_PROTOCOL_VERSION);
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start_with(&context, &mut oracle, g, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed), node.clone()).await);
+        }
+        // Beacon duties, as node.rs runs them, from epoch `first` on (nobody takes part before
+        // it); validator 2 does none in the second half of the epoch before `withheld`, where
+        // its reveal for `withheld` is due.
+        let (first, withheld) = (Arc::new(AtomicU64::new(NEVER)), Arc::new(AtomicU64::new(NEVER)));
+        for (i, (v, seed)) in vals.iter().zip(&seeds).enumerate() {
+            let (chain, home, seed, first, withheld) = (v.chain.clone(), v.home.clone(), *seed, first.clone(), withheld.clone());
+            context.child("beacon").with_attribute("idx", i).spawn(move |ctx| async move {
+                let mut secrets = crate::beacon::Secrets::open_deterministic(&home, seed).unwrap();
+                loop {
+                    ctx.sleep(Duration::from_millis(500)).await;
+                    let mut c = chain.lock();
+                    let next = c.height() + 1;
+                    let epoch = next / EB;
+                    let withholds = i == 2 && epoch.checked_add(1) == Some(withheld.load(Ordering::SeqCst)) && next % EB >= EB / 2;
+                    if epoch >= first.load(Ordering::SeqCst) && !withholds {
+                        let _ = crate::beacon::duties(&mut c, &mut secrets);
+                    }
+                }
+            });
+        }
+        let mut watch = Watch::new();
+        until_height(&context, &mut watch, &vals, 3).await;
+        let mut u = Users::new(&seeds);
+        fund(&context, &mut watch, &vals, g, &mut u).await;
+
+        // ---- The dice: uploaded under v3, created with its reveal floor, its bank funded.
+        u.alice.send(&vals[0], g, upload(DICE)).unwrap();
+        until(&context, &mut watch, &vals, "the dice's upload", |vals| vals.iter().all(|v| v.chain.lock().state.programs.code.contains_key(&digest::wasm_hash(DICE.0)))).await;
+        let dice = made_by(g, &u.alice.keys, u.alice.nonce, DICE);
+        u.alice.send(&vals[1], g, create(DICE, Some(("init", MIN_REVEALS.to_le_bytes().to_vec())))).unwrap();
+        until(&context, &mut watch, &vals, "the dice's create", |vals| vals.iter().all(|v| v.chain.lock().state.programs.records.contains_key(&dice.address))).await;
+        let h = floor(&vals);
+        until_height(&context, &mut watch, &vals, h + 1).await;
+        let funded = u.alice.send(&vals[0], g, calls(vec![call(&dice, "fund", vec![], BANK)], 1_000_000, vec![])).unwrap();
+        included_everywhere(&context, &mut watch, &vals, &funded).await;
+        assert!(!failed(&vals[0], &funded));
+
+        let balance = |v: &Val, who: &str| v.chain.lock().state.account(who).balance;
+        let beacon_of = |v: &Val, epoch: u64| v.chain.lock().state.beacon.values.get(&epoch).cloned().unwrap_or_else(|| panic!("no beacon for epoch {epoch}"));
+        let epoch_now = |vals: &[Val]| floor(vals) / EB;
+        // A roll's id and the epochs its event names: its target and its deadline.
+        let rolled = |v: &Val, tx: &str| {
+            let (_, r) = receipt_of(v, tx);
+            assert!(matches!(r.outcome, programs::receipt::ReceiptOutcome::Ok), "{:?}", r.outcome);
+            let (id, data) = (u64::from_le_bytes(r.calls[0].return_data.0[..].try_into().unwrap()), &r.events[0].data.0);
+            let at = |i: usize| u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+            (id, at(49), at(57))
+        };
+        // A settle's return byte (the face, 0 for a refund) and its one event.
+        let settled = |v: &Val, tx: &str| {
+            let (_, r) = receipt_of(v, tx);
+            assert!(matches!(r.outcome, programs::receipt::ReceiptOutcome::Ok), "{:?}", r.outcome);
+            assert_eq!(r.events.len(), 1);
+            (r.calls[0].return_data.0[0], r.events[0].name.clone(), r.events[0].data.0.clone())
+        };
+        let face = |id: u64, value: &[u8; 32]| {
+            let preimage = [&b"dice/roll"[..], &bytes32(&dice.address), &id.to_le_bytes(), value].concat();
+            1 + (u64::from_le_bytes(blake3::hash(&preimage).as_bytes()[..8].try_into().unwrap()) % 6) as u8
+        };
+        let roll = |pick: u8| calls(vec![call(&dice, "roll", vec![pick], FANG)], 1_000_000, vec![]);
+        let settle = |id: u64| calls(vec![call(&dice, "settle", id.to_le_bytes().to_vec(), 0)], 1_000_000, vec![]);
+        let (alice, bob, carol) = (u.alice.address(), u.bob.address(), u.carol.address());
+
+        // ---- 1. A roll while nobody takes part in the beacon: its epoch's value has no reveals.
+        let tx = u.bob.send(&vals[1], g, roll(3)).unwrap();
+        included_everywhere(&context, &mut watch, &vals, &tx).await;
+        let (fallback, fallback_target, _) = rolled(&vals[0], &tx);
+        assert_eq!(fallback, 0);
+        // The validators start in the epoch after the roll's: their first round is for the epoch
+        // after its target.
+        first.store(fallback_target - 1, Ordering::SeqCst);
+
+        // ---- 2. A roll once they do: it names an epoch all four reveal for.
+        until_height(&context, &mut watch, &vals, (fallback_target - 1) * EB).await;
+        let tx = u.carol.send(&vals[2], g, roll(5)).unwrap();
+        included_everywhere(&context, &mut watch, &vals, &tx).await;
+        let (normal, normal_target, normal_deadline) = rolled(&vals[0], &tx);
+        assert_eq!((normal, normal_deadline), (1, normal_target + 32));
+        assert!(normal_target > fallback_target, "its round has commitments");
+        // Too early, in its own epoch or the next: the settle is included, fails and is charged,
+        // on every node alike.
+        let early = u.alice.send(&vals[3], g, settle(normal)).unwrap();
+        let at = included_everywhere(&context, &mut watch, &vals, &early).await;
+        assert!(at / EB < normal_target && failed(&vals[0], &early));
+        for v in &vals {
+            assert!(matches!(receipt_of(v, &early).1.outcome, programs::receipt::ReceiptOutcome::Aborted { abort_code: 35, .. }));
+        }
+
+        // The fallback roll's epoch: derived from nothing but the last value, so refunded.
+        until_height(&context, &mut watch, &vals, fallback_target * EB).await;
+        let (b, prev) = (beacon_of(&vals[0], fallback_target), beacon_of(&vals[0], fallback_target - 1));
+        assert_eq!((b.reveals, b.missed.len()), (0, 0));
+        assert_eq!(b.value, crate::beacon::derive(&prev.value, fallback_target, &[]), "the hash chain's next link");
+        let bank = balance(&vals[0], &dice.address);
+        let tx = u.alice.send(&vals[0], g, settle(fallback)).unwrap();
+        included_everywhere(&context, &mut watch, &vals, &tx).await;
+        assert_eq!(settled(&vals[2], &tx), (0, "refunded".into(), [&fallback.to_le_bytes()[..], &bytes32(&bob), &FANG.to_le_bytes()].concat()), "too few reveals: the whole stake, no bounty");
+        assert_eq!(balance(&vals[0], &dice.address), bank - FANG);
+
+        // The normal roll's epoch: four reveals, nobody missed.
+        until_height(&context, &mut watch, &vals, normal_target * EB).await;
+        let b = beacon_of(&vals[0], normal_target);
+        assert_eq!((b.reveals, b.missed.len()), (4, 0), "epoch {normal_target}'s beacon");
+        let (bank, rolled_face) = (balance(&vals[0], &dice.address), face(normal, &b.value));
+        let tx = u.alice.send(&vals[1], g, settle(normal)).unwrap();
+        included_everywhere(&context, &mut watch, &vals, &tx).await;
+        let payout = if rolled_face == 5 { 6 * FANG } else { 0 };
+        assert_eq!(settled(&vals[3], &tx), (rolled_face, "settled".into(), [&normal.to_le_bytes()[..], &bytes32(&carol), &[rolled_face], &payout.to_le_bytes(), &bytes32(&alice), &BOUNTY.to_le_bytes()].concat()));
+        assert_eq!(balance(&vals[0], &dice.address), bank - payout - BOUNTY, "alice settled carol's roll and got the bounty");
+
+        // ---- 3. Validator 2 withholds its reveal for the next roll's epoch.
+        let tx = u.bob.send(&vals[0], g, roll(1)).unwrap();
+        let at = included_everywhere(&context, &mut watch, &vals, &tx).await;
+        let (biased, biased_target, _) = rolled(&vals[0], &tx);
+        assert_eq!((biased, biased_target), (2, at / EB + 2));
+        assert!(floor(&vals) < (biased_target - 1) * EB + EB / 2, "set before the reveals are due");
+        withheld.store(biased_target, Ordering::SeqCst);
+        until_height(&context, &mut watch, &vals, biased_target * EB).await;
+        let withholder = u.validators[2].address();
+        for (i, v) in vals.iter().enumerate() {
+            let b = beacon_of(v, biased_target);
+            assert_eq!((b.reveals, &b.missed), (3, &vec![withholder.clone()]), "node {i}: the value is derived from the other three");
+            let c = v.chain.lock();
+            assert!(c.state.staking.pools[&withholder].jail.is_some(), "node {i}: the withholder is jailed");
+            assert!(!c.state.active_sets[&biased_target].contains(&withholder) && c.state.active_sets[&biased_target].len() == 3, "node {i}: and out of the epoch it biased");
+            assert!(c.state.active_sets[&(biased_target - 1)].contains(&withholder));
+        }
+        // What it chose between: the value with its reveal and the one without. It got the
+        // second, which the roll settles on: three reveals are above the dice's floor of two.
+        let b = beacon_of(&vals[0], biased_target);
+        let (bank, rolled_face) = (balance(&vals[0], &dice.address), face(biased, &b.value));
+        let tx = u.carol.send(&vals[3], g, settle(biased)).unwrap();
+        included_everywhere(&context, &mut watch, &vals, &tx).await;
+        let payout = if rolled_face == 1 { 6 * FANG } else { 0 };
+        assert_eq!(settled(&vals[1], &tx), (rolled_face, "settled".into(), [&biased.to_le_bytes()[..], &bytes32(&bob), &[rolled_face], &payout.to_le_bytes(), &bytes32(&carol), &BOUNTY.to_le_bytes()].concat()));
+        assert_eq!(balance(&vals[0], &dice.address), bank - payout - BOUNTY);
+
+        // ---- 4. Two rolls left alone until their deadline has passed.
+        let tx = u.carol.send(&vals[1], g, roll(6)).unwrap();
+        let at = included_everywhere(&context, &mut watch, &vals, &tx).await;
+        let (late, late_target, late_deadline) = rolled(&vals[0], &tx);
+        assert_eq!((late, late_deadline), (3, late_target + 32));
+        // The second roll in the same epoch, so one wait covers both.
+        assert!(at % EB < EB - 3, "room for another roll in epoch {}", at / EB);
+        let tx = u.carol.send(&vals[1], g, roll(6)).unwrap();
+        included_everywhere(&context, &mut watch, &vals, &tx).await;
+        let (stale, stale_target, _) = rolled(&vals[0], &tx);
+        assert_eq!((stale, stale_target), (4, late_target));
+        // Each wait is well inside `until`'s ten minutes.
+        let wait = |to: u64| (epoch_now(&vals) + 1..=to).step_by(8).chain([to]);
+        // 33 epochs on three validators: past the deadline, the value is still in the state, so
+        // the roll settles on it like any other. Waiting gave carol nothing.
+        for epoch in wait(late_deadline + 1) {
+            until_height(&context, &mut watch, &vals, epoch * EB).await;
+        }
+        let kept = beacon_of(&vals[0], late_target);
+        assert!(kept.reveals >= MIN_REVEALS);
+        let (bank, rolled_face) = (balance(&vals[0], &dice.address), face(late, &kept.value));
+        let tx = u.bob.send(&vals[0], g, settle(late)).unwrap();
+        included_everywhere(&context, &mut watch, &vals, &tx).await;
+        let payout = if rolled_face == 6 { 6 * FANG } else { 0 };
+        assert_eq!(settled(&vals[2], &tx), (rolled_face, "settled".into(), [&late.to_le_bytes()[..], &bytes32(&carol), &[rolled_face], &payout.to_le_bytes(), &bytes32(&bob), &BOUNTY.to_le_bytes()].concat()), "past the deadline, on the kept value");
+        assert_eq!(balance(&vals[0], &dice.address), bank - payout - BOUNTY);
+        // The value's last epoch is its target + 63. In the next it is gone on every node, and
+        // the other roll is forfeit: nothing for carol, the bounty for bob, the rest to the bank.
+        for epoch in wait(stale_target + crate::beacon::VALUES_KEPT) {
+            until_height(&context, &mut watch, &vals, epoch * EB).await;
+        }
+        for (i, v) in vals.iter().enumerate() {
+            assert!(!v.chain.lock().state.beacon.values.contains_key(&stale_target), "node {i} dropped epoch {stale_target}'s value");
+        }
+        let (bank, carol_before) = (balance(&vals[0], &dice.address), balance(&vals[0], &carol));
+        let tx = u.bob.send(&vals[0], g, settle(stale)).unwrap();
+        included_everywhere(&context, &mut watch, &vals, &tx).await;
+        assert_eq!(settled(&vals[2], &tx), (0, "forfeited".into(), [&stale.to_le_bytes()[..], &bytes32(&carol), &FANG.to_le_bytes(), &bytes32(&bob), &BOUNTY.to_le_bytes()].concat()), "the value is gone");
+        assert_eq!(balance(&vals[0], &dice.address), bank - BOUNTY, "the stake stayed in the bank");
+        assert!(balance(&vals[0], &carol) - carol_before < FANG / 2, "no refund: at most the roll's deposit");
+
+        let h = floor(&vals) + 2;
+        until_height(&context, &mut watch, &vals, h).await;
+        finish(&vals);
+        let c = vals[0].chain.lock();
+        assert!((1..=c.height()).all(|h| c.block(h).unwrap().version == PREVIEW_PROTOCOL_VERSION));
+        println!("✓ the dice on 4 validators under v{PREVIEW_PROTOCOL_VERSION}: refunded on the hash chain (epoch {fallback_target}), settled on 4 reveals (epoch {normal_target}) and on 3 after a withheld reveal (epoch {biased_target}, the withholder jailed), settled past its deadline (epoch {late_deadline}), forfeited once the value was gone (epoch {}); {} heights compared, {} blocks", stale_target + crate::beacon::VALUES_KEPT, watch.compared(), c.height());
     });
     std::fs::remove_dir_all(root).ok();
 }
