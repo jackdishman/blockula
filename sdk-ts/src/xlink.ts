@@ -131,12 +131,13 @@ export function xLinkCode(chain: XLinkChain, account: string, handle: string): s
 }
 
 /**
- * The text to post: a line a person can read, then the code. `label` is how the account is shown
- * (its `.boo` name or address); only the code is checked. No `@`, `#`, `$` or link in it, so X
- * leaves the code as plain text.
+ * The text to post: a line a person can read, then the code; only the code is checked. The one
+ * link in it is blockula.app. It never names the account: `.boo` is also a web domain, so X would
+ * turn `vlad.boo` into a link to a website that isn't Blockula's (and may be anyone's). No `@`,
+ * `#` or `$` either, so X leaves the code as plain text.
  */
-export function xProofPost(code: string, label?: string): string {
-  return `Verifying my Blockula account${label ? ` ${label}` : ""}.\n\n${code}`;
+export function xProofPost(code: string): string {
+  return `Verifying my Blockula account on blockula.app.\n\n${code}`;
 }
 
 /** X's own "write a post" page with `text` filled in (the user still presses Post). */

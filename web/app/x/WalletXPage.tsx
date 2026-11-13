@@ -49,7 +49,7 @@ function LinkX() {
     }
   }
   const code = handle && chain ? xLinkCode(chain, wallet.account, handle) : null;
-  const text = code ? xProofPost(code, mine?.names[0]) : null;
+  const text = code ? xProofPost(code) : null;
 
   return (
     <main className="narrow stack-lg">

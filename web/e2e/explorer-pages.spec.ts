@@ -774,8 +774,8 @@ test.describe("the explorer from an account holder's side", () => {
     await page.getByLabel("Your X handle").fill("not a handle");
     await expect(page.getByTestId("x-step-code")).toContainText("An X handle is 1 to 15 letters, digits or underscores.");
     await page.getByLabel("Your X handle").fill("@BlockulaChain");
-    await expect(page.getByTestId("x-post-text")).toHaveText(`Verifying my Blockula account vlad.boo.\n\n${code}`);
-    await expect(page.getByRole("link", { name: "Post it on X ↗" })).toHaveAttribute("href", `https://x.com/intent/post?text=${encodeURIComponent(`Verifying my Blockula account vlad.boo.\n\n${code}`)}`);
+    await expect(page.getByTestId("x-post-text")).toHaveText(`Verifying my Blockula account on blockula.app.\n\n${code}`);
+    await expect(page.getByRole("link", { name: "Post it on X ↗" })).toHaveAttribute("href", `https://x.com/intent/post?text=${encodeURIComponent(`Verifying my Blockula account on blockula.app.\n\n${code}`)}`);
 
     // Step 2: a post under another handle is refused before anything is signed; the right one is recorded.
     const step = page.getByTestId("x-step-record");

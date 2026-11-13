@@ -1011,8 +1011,7 @@ export class Wallet {
     const h = xHandle(handle);
     const status = await this.client.status();
     const code = xLinkCode({ chainId: String(status.chain_id), genesisHash: String(status.genesis_hash) }, this.account, h);
-    const names = arr((await this.client.account(this.account).catch(() => null))?.names);
-    const text = xProofPost(code, typeof names[0] === "string" ? names[0] : undefined);
+    const text = xProofPost(code);
     return { handle: h, code, text, intent_url: xIntentUrl(text) };
   }
 
