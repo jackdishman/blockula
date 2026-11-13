@@ -35,9 +35,9 @@ jobs:
       - name: Listings this PR adds or changes
         env: { BASE: "${{ github.event.pull_request.base.sha }}" }
         run: |
-          changed=$(git diff --name-only --diff-filter=AMR "$BASE"...HEAD -- 'sites/*.json' | tr '\n' ' ')
-          echo "changed: ${changed:-none}"
-          if [ -z "$changed" ]; then node scripts/check-sites.mjs; else node scripts/check-sites.mjs --live $changed; fi
+          mapfile -t changed < <(git diff --name-only --diff-filter=AMR "$BASE"...HEAD -- 'sites/*.json')
+          echo "changed: ${changed[*]:-none}"
+          if [ "${#changed[@]}" -eq 0 ]; then node scripts/check-sites.mjs; else node scripts/check-sites.mjs --live "${changed[@]}"; fi
 
   sync:
     name: Sync blockula.app DNS
