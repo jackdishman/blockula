@@ -60,7 +60,9 @@ trap 'rm -rf "$work"' EXIT
 # 4. The app.
 fly apps list --org "$ORG" --json | jq -e --arg a "$APP" '.[] | select(.Name == $a)' >/dev/null \
   || { fly apps create "$APP" --org "$ORG" >/dev/null; echo "✓ created app $APP"; }
-if ! fly volumes list -a "$APP" --json | jq -e '.[] | select(.Name == "data")' >/dev/null; then
+# flyctl's volume listing names the field `name`; older ones printed `Name`. Missing it made a
+# volume on every re-run, each left unattached beside the one the machine mounts.
+if ! fly volumes list -a "$APP" --json | jq -e '.[] | select((.name // .Name) == "data")' >/dev/null; then
   fly volumes create data -a "$APP" -r "$REGION" -s 1 --yes >/dev/null
   echo "✓ volume data (1 GB, $REGION)"
 fi

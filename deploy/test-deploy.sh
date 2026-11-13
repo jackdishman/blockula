@@ -437,5 +437,18 @@ code=$(token FAKE_OTHER_GENESIS=blockula-v2)
 [ "$code" != 0 ] && none_set && expect "token: a validator on another genesis: nothing restarts" "$(cat "$T/token.out")" "serves another genesis" \
   || bad "token: another genesis (exit $code): $(cat "$T/token.out")"
 
+# ---- the hosting scripts find the volume they already have ----
+
+# host-chain.sh, host-validator.sh and host-bots.sh make the `data` volume once. Each one's own
+# check runs here against flyctl's listing as it prints it (`name`) and as older ones did (`Name`):
+# a check that misses the volume makes another on every upgrade.
+for f in deploy/host-chain.sh deploy/host-validator.sh deploy/host-bots.sh; do
+  filter=$(sed -n "s/^if ! fly volumes list -a \"\$APP\" --json | jq -e '\(.*\)' >\/dev\/null; then\$/\1/p" "$f")
+  if [ -z "$filter" ]; then bad "$f: no volume check found"; continue; fi
+  jq -e "$filter" <<<'[{"id":"vol_1","name":"data","attached_machine_id":"m1"}]' >/dev/null && ok "$f: finds its volume in flyctl's listing (name)" || bad "$f: misses a volume listed as name"
+  jq -e "$filter" <<<'[{"ID":"vol_1","Name":"data"}]' >/dev/null && ok "$f: finds its volume in an older listing (Name)" || bad "$f: misses a volume listed as Name"
+  if jq -e "$filter" <<<'[{"id":"vol_2","name":"other"}]' >/dev/null || jq -e "$filter" <<<'[]' >/dev/null; then bad "$f: sees a data volume where there is none"; else ok "$f: no data volume, so it makes one"; fi
+done
+
 if [ $fails -gt 0 ]; then echo "✗ $fails failed" >&2; exit 1; fi
 echo "✓ deploy scripts behave"
