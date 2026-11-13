@@ -13,7 +13,7 @@
 //     of history: a record older than that is gone, so the owner sends a new one);
 //   - https://<target>/.well-known/boo has the owner's address on a line of its own.
 // CI runs the shape check on every PR, and --live on the listings a PR adds or changes
-// (.github/workflows/sites.yml). web/lib/sites.test.mjs tests it.
+// (ci.yml's `sites` job). web/lib/sites.test.mjs tests it.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";

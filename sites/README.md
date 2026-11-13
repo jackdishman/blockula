@@ -52,7 +52,7 @@ No other fields are taken.
 
 ## What gets accepted
 
-`node scripts/check-sites.mjs` checks every listing's shape on every pull request, and `node scripts/check-sites.mjs --live <name>` checks the listings a pull request adds or changes against the chain and the target. A listing is refused when:
+`node scripts/check-sites.mjs` checks every listing's shape on every pull request, and CI (`.github/workflows/ci.yml`, job `sites`) also runs `--live` on the listings a pull request adds or changes, checking them against the chain and the target. A listing is refused when:
 
 - a field is missing or has the wrong shape;
 - the name is one the project keeps (`www`, `demo`, `wallet`, `api`, `docs`, `testnet`, `mainnet`, `mail` and the rest of `RESERVED_LABELS` in `web/lib/sites.ts`), or reads as Blockula's own or as "official" (`blockula`, `b1ockula-wallet`…), or has `--` as its 3rd and 4th characters;
@@ -71,6 +71,6 @@ A maintainer then opens the site before merging. A site that impersonates someon
 
 ## How the sync works
 
-`scripts/sync-sites-dns.mjs` (run by `.github/workflows/sites.yml`) reads this directory and asks the demo chain, pinned to its genesis, whether each name is active and still owned by its listing's `owner`. It then makes blockula.app's DNS hold a CNAME for each one that is, and none for the rest. It touches only records it made itself, which carry the comment `blockula-sites (sites/README.md)`. A subdomain that already has any other record, such as the demo chain's, is left alone. When the chain can't be read, it changes nothing.
+`scripts/sync-sites-dns.mjs` (run by `.github/workflows/sites.yml` on main) reads this directory and asks the demo chain, pinned to its genesis, whether each name is active and still owned by its listing's `owner`. It then makes blockula.app's DNS hold a CNAME for each one that is, and none for the rest. It touches only records it made itself, which carry the comment `blockula-sites (sites/README.md)`. A subdomain that already has any other record, such as the demo chain's, is left alone. When the chain can't be read, it changes nothing.
 
 Only the subdomains in this directory are boos' sites. The project's own hosts (`PROJECT_HOSTS` in `web/lib/chains.ts`, such as `demo.blockula.app`) are the only ones blockula.app marks as run by the project.

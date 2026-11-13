@@ -46,7 +46,8 @@
           { "context": "Supply-chain pins, workflows, monitoring config", "integration_id": 15368 },
           { "context": "ml-dsa (node)", "integration_id": 15368 },
           { "context": "@noble/post-quantum (SDK)", "integration_id": 15368 },
-          { "context": "Fuzz harness", "integration_id": 15368 }
+          { "context": "Fuzz harness", "integration_id": 15368 },
+          { "context": "Name sites (sites/*.json)", "integration_id": 15368 }
         ]
       }
     },
