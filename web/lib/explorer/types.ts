@@ -340,6 +340,10 @@ export interface SeanceJuror {
   agreement_display?: string | null;
   reward_display: string;
   soul_delta_display: string;
+  /** What the juror sealed (BLAKE3 hex), once they have: a ballot kept in this browser is theirs if it recomputes to it. */
+  commitment?: string | null;
+  /** Claim ids of the juror's pairs, in order (`client.seancePairs` reads them with each claim's repo and PR). */
+  assigned_pairs?: [number, number][];
 }
 
 export interface SeanceView {
