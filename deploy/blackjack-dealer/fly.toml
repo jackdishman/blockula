@@ -1,0 +1,47 @@
+# The blackjack dealer daemon (services/blackjack/dealer) on Fly.io: one machine, a volume at /data
+# for its key, secret and seed store, and nothing listening. services/blackjack/dealer/README.md,
+# "Hosting on Fly", has the whole procedure.
+#
+#   Deploy (from the repository's root; one machine, never two: two dealers on one table is the
+#   thing to avoid):
+#     fly deploy . -c deploy/blackjack-dealer/fly.toml \
+#       --dockerfile deploy/blackjack-dealer/Dockerfile \
+#       --ignorefile deploy/blackjack-dealer/Dockerfile.dockerignore --ha=false
+#   Stop:   fly machine stop  -a blockula-blackjack-dealer     (the dealer stops cleanly on the signal)
+#   Start:  fly machine start -a blockula-blackjack-dealer
+#   Logs:   fly logs -a blockula-blackjack-dealer
+#
+# The start gate: the entrypoint deals nothing until /data/ready exists (it logs
+# "waiting for /data/ready"). Copy the encrypted store over first, then `touch /data/ready`.
+#
+# No public ports: there is no [[services]] and no [http_service] here, and there must never be.
+# Do NOT allocate a dedicated IPv4 (or any public IP) for this app: the dealer only makes outbound
+# calls to the node. `fly ips list -a blockula-blackjack-dealer` should be empty.
+#
+# Secrets (the first boot only; see the README): DEALER_KEY_JSON, STORE_SECRET_JSON. Nothing
+# secret belongs in [env].
+app = "blockula-blackjack-dealer"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = 30 # the dealer waits up to 10 s for what it sent to come back
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  BJ_DEALER_RPC = "https://demo.blockula.app"
+  BJ_DEALER_TABLE = "boo13qwnfrysk8fe4ksgyvhtfpn8zf9cgav9vym0pex3tjzn07z5t8kqnvxeus"
+  BJ_DEALER_ALLOW_REMOTE = "true"
+  BJ_DEALER_CHAIN_ID = "blockula-demo-2"
+  BJ_DEALER_GENESIS_HASH = "e712d9376917f0c9d10c164fa7c1a53fef7c8dc1c24100e7924037d0250f705e"
+
+[mounts]
+  source = "data"
+  destination = "/data"
+
+[[restart]]
+  policy = "always"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
