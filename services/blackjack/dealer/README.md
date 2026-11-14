@@ -181,6 +181,53 @@ One JSON object a line on standard output: `time`, `level`, `action`, and what i
 - [ ] The owner knows the lost-store steps above (`pause`, `skip_commits`).
 - [ ] A dry run (`run --dry-run`) against the launch table logged the plan you expect.
 
+## Hosting on Fly
+
+[deploy/blackjack-dealer](../../../deploy/blackjack-dealer) runs the daemon on Fly.io the way the house bots run (`deploy/bots`): one machine, no public ports, a volume at `/data`.
+
+| File | |
+|---|---|
+| `fly.toml` | The app (`blockula-blackjack-dealer`, `iad`), one `shared-cpu-1x` machine that is always restarted, the volume, and the settings that aren't secret (`BJ_DEALER_RPC`, `BJ_DEALER_TABLE`, `BJ_DEALER_ALLOW_REMOTE`, `BJ_DEALER_CHAIN_ID`, `BJ_DEALER_GENESIS_HASH`). No `[[services]]`, no `[http_service]`. |
+| `Dockerfile`, `Dockerfile.dockerignore` | Builds the SDK, `@blockula/blackjack` and this package from the checkout; the image holds the built JS and the locked production dependencies, and the dealer runs as `node`. |
+| `entrypoint.sh` | Starts as root only to own `/data`, puts the first boot's secrets into files, waits at the start gate, then runs `blackjack-dealer run` as `node`. |
+
+The node is another machine's, so the chain is pinned and `allowRemote` is set (see "Settings"). Everything lives on the volume: `/data/dealer-key.json`, `/data/store-secret.json`, `/data/seeds.enc.json` and its backup `/data/seeds.enc.json.backup`. The backup is on the same disk as the store there, so **copy the key file, the secret file and the backup off the machine yourself** (the backup after every batch, or on a schedule): a lost volume is a lost store.
+
+**The start gate.** The entrypoint deals nothing until `/data/ready` exists; until then it logs `waiting for /data/ready` every 15 seconds. That is what lets a table move here without two dealers ever running on it:
+
+```bash
+# 1. Once: the app and its volume. Never allocate a dedicated IPv4 (or any public IP) for it.
+fly apps create blockula-blackjack-dealer
+fly volumes create data -a blockula-blackjack-dealer -r iad -s 1
+
+# 2. The two secrets, each the whole JSON file `init` made (one line), piped in so that neither is
+#    in an argument list. Skip this if you'd rather copy the two files to /data in step 4.
+{ printf 'DEALER_KEY_JSON=%s\n' "$(cat <dir>/dealer-key.json)"
+  printf 'STORE_SECRET_JSON=%s\n' "$(cat <dir>/store-secret.json)"
+} | fly secrets import -a blockula-blackjack-dealer --stage
+
+# 3. Deploy, from the repository's root. One machine: --ha=false.
+fly deploy . -c deploy/blackjack-dealer/fly.toml \
+  --ignorefile deploy/blackjack-dealer/Dockerfile.dockerignore --ha=false
+fly logs -a blockula-blackjack-dealer        # "waiting for /data/ready"
+
+# 4. Stop the dealer that runs now (wait for its "stopped"), then copy its encrypted store over.
+#    A table with no store yet skips the copy.
+fly ssh sftp shell -a blockula-blackjack-dealer   # put <dir>/seeds.enc.json /data/seeds.enc.json
+
+# 5. Open the gate. The dealer starts within 15 seconds.
+fly ssh console -a blockula-blackjack-dealer -C "touch /data/ready"
+
+# 6. Once it logs "started": the key and the secret are on the volume, so the Fly secrets go.
+fly secrets unset -a blockula-blackjack-dealer --stage DEALER_KEY_JSON STORE_SECRET_JSON
+```
+
+- **Secrets.** `DEALER_KEY_JSON` and `STORE_SECRET_JSON` are read on a boot where their file is missing, written to `/data` (mode 0600, owned by `node`), and unset before anything else runs: the dealer's environment never holds one. A file that exists is never overwritten from a secret. Nothing secret goes in `fly.toml`.
+- **Stop and start.** `fly machine stop -a blockula-blackjack-dealer` (the dealer gets SIGTERM, lets what it sent come back and exits 0) and `fly machine start -a blockula-blackjack-dealer`. `/data/ready` stays, so a start or a restart deals at once. To hold the machine at the gate at its next start, remove the file before you stop it (`fly ssh console -a blockula-blackjack-dealer -C "rm /data/ready"`).
+- **Logs.** `fly logs -a blockula-blackjack-dealer`: the daemon's JSON lines ("The log", above).
+- **One machine.** Always deploy with `--ha=false` and never `fly scale count` past 1: the volume and the store's lock belong to one dealer.
+- **Other settings** (`BJ_DEALER_LOW_WATER`, `BJ_DEALER_POLL_MS`, `BJ_DEALER_DRY_RUN`, …) go in `fly.toml`'s `[env]`. The paths are fixed to `/data` by the entrypoint.
+
 ## Tests
 
 ```bash
