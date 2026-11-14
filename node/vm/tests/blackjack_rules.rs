@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use bj_core::{CHAIN_LEN, Hand, MAX_DEALER_CARDS, MAX_PLAYER_CARDS, Outcome, Phase, Step, card, exposure, payout, prev_link, total};
+use bj_core::{CHAIN_LEN, Hand, MAX_DEALER_CARDS, MAX_PLAYER_CARDS, Outcome, Phase, Step, card, exposure, payout, prev_link, seed_hash, total};
 
 const FANG: u64 = 1_000_000_000;
 
@@ -321,16 +321,16 @@ fn payouts_and_exposure() {
         assert_eq!(payout(stake, Outcome::Push), stake);
         assert_eq!(payout(stake, Outcome::Lose), 0);
         assert_eq!(payout(stake, Outcome::Bust), 0);
-        for o in 1..=7 {
+        assert_eq!(payout(stake, Outcome::NoSeed), 0);
+        for o in 1..=8 {
             let o = Outcome::from_u8(o).unwrap();
             assert!(payout(stake, o) <= stake + exposure(stake), "{o:?} pays within the reserve");
         }
     }
     assert_eq!(Outcome::from_u8(0), None);
-    assert_eq!(Outcome::from_u8(8), None);
-    assert_eq!(Phase::from_u8(0), None);
+    assert_eq!(Outcome::from_u8(9), None);
     assert_eq!(Phase::from_u8(6), None);
-    for p in 1..=5 {
+    for p in 0..=5 {
         assert_eq!(Phase::from_u8(p).unwrap() as u8, p);
     }
 }
@@ -440,6 +440,41 @@ fn naturals_and_the_dealers_hole_card() {
     assert_eq!(hand.phase, Phase::Deal);
 }
 
+#[test]
+fn a_committed_hand_waits_for_its_seed_and_nothing_else() {
+    let mut hand = Hand::committed();
+    assert_eq!(hand.phase, Phase::Seed);
+    assert!(!hand.phase.dealers(), "the dealer owes nothing before the seed");
+    assert!(!hand.hit() && !hand.stand());
+    assert_eq!(hand.deal(0), None, "no card is dealt before the seed");
+    assert_eq!(hand, Hand::committed());
+    assert!(hand.seeded());
+    assert_eq!(hand, Hand::new(), "the seed's reveal leaves the hand as a one-transaction bet did");
+    assert!(!hand.seeded(), "once");
+    for c in [4, 9, 5] {
+        hand.deal(c);
+    }
+    assert_eq!(hand.phase, Phase::Player);
+    assert!(!hand.seeded());
+    assert_eq!(hand.phase, Phase::Player);
+}
+
+#[test]
+fn a_seeds_hash_is_blake3_of_the_domain_the_player_and_the_seed() {
+    let mut rng = Rng::new("blackjack/seed-hash");
+    for _ in 0..200 {
+        let (player, seed) = (rng.bytes32(), rng.bytes32());
+        let mut h = blake3::Hasher::new();
+        h.update(b"blockula/blackjack/seed").update(&player).update(&seed);
+        assert_eq!(seed_hash(&player, &seed), *h.finalize().as_bytes());
+        // The player's account is part of it, and it is neither side's other hashes.
+        assert_ne!(seed_hash(&player, &seed), seed_hash(&seed, &player));
+        assert_ne!(seed_hash(&player, &seed), bj_core::blake3(&seed));
+    }
+    assert_eq!(bj_core::SEED_PREIMAGE, 23 + 32 + 32);
+    assert_eq!(bj_core::SEED_DOMAIN.len(), 23);
+}
+
 // ---------------------------------------------------------------------------------- vectors
 
 fn vectors_path() -> PathBuf {
@@ -527,10 +562,21 @@ fn vectors() -> String {
     let stakes = [1u64, 3, FANG, 25 * FANG + 1];
     let mut rows = vec![];
     for stake in stakes {
-        for o in 1..=7u8 {
+        for o in 1..=8u8 {
             rows.push(format!("    {{ \"stake\": \"{stake}\", \"outcome\": {o}, \"payout\": \"{}\" }}", payout(stake, Outcome::from_u8(o).unwrap())));
         }
     }
+    out.push_str(&rows.join(",\n"));
+    out.push_str("\n  ],\n");
+    // What a bet commits to: the hash of the player's account and seed.
+    out.push_str("  \"seed_hashes\": [\n");
+    let mut s = Rng::new("blackjack/vectors/seed-hashes");
+    let rows: Vec<String> = (0..8)
+        .map(|_| {
+            let (player, seed) = (s.bytes32(), s.bytes32());
+            format!("    {{ \"player\": \"{}\", \"client_seed\": \"{}\", \"seed_hash\": \"{}\" }}", hex(&player), hex(&seed), hex(&seed_hash(&player, &seed)))
+        })
+        .collect();
     out.push_str(&rows.join(",\n"));
     out.push_str("\n  ]\n}\n");
     out

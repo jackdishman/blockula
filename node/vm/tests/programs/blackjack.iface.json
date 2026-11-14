@@ -23,7 +23,7 @@
       "payable": true,
       "args": [
         {
-          "name": "client_seed",
+          "name": "seed_hash",
           "type": "hash32"
         }
       ],
@@ -141,7 +141,7 @@
       "payable": false,
       "args": [],
       "returns": {
-        "bytes": 96
+        "bytes": 104
       }
     },
     {
@@ -272,6 +272,22 @@
       "returns": "u16"
     },
     {
+      "name": "reveal_seed",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "game",
+          "type": "u64"
+        },
+        {
+          "name": "client_seed",
+          "type": "hash32"
+        }
+      ],
+      "returns": null
+    },
+    {
       "name": "revoke",
       "kind": "call",
       "payable": false,
@@ -341,6 +357,10 @@
         },
         {
           "name": "grant_max_blocks",
+          "type": "u64"
+        },
+        {
+          "name": "seed_blocks",
           "type": "u64"
         }
       ],

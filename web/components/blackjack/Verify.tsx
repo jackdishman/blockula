@@ -21,8 +21,21 @@ export function VerifyView({ check, mine }: { check: HandCheck; mine: boolean })
         <dd>{check.game.toString()}</dd>
         <dt>{COPY.verify.seed}</dt>
         <dd>
-          <span className="mono break" data-testid="bj-verify-seed">{check.clientSeed}</span>
-          <span className="dim small block">{check.seed === "yours" ? COPY.verify.seedYours : COPY.verify.seedUnknown}</span>
+          {check.clientSeed === null ? (
+            <span className="dim" data-testid="bj-verify-seed">{COPY.verify.seedHidden}</span>
+          ) : (
+            <>
+              <span className="mono break" data-testid="bj-verify-seed">{check.clientSeed}</span>
+              <span className="dim small block">{check.seed === "yours" ? COPY.verify.seedYours : COPY.verify.seedUnknown}</span>
+            </>
+          )}
+        </dd>
+        <dt>{COPY.verify.seedHash}</dt>
+        <dd>
+          {check.seedHash && <span className="mono break" data-testid="bj-verify-seed-hash">{check.seedHash}</span>}
+          <span className="dim small block" data-testid="bj-verify-seed-check">
+            {check.unrevealed ? COPY.verify.seedHashOnly : check.seedCheck === "matches" ? COPY.verify.seedHashMatches : COPY.verify.seedHashUnknown}
+          </span>
         </dd>
         {check.ok && (
           <>
@@ -34,7 +47,7 @@ export function VerifyView({ check, mine }: { check: HandCheck; mine: boolean })
             <dt>Links</dt>
             <dd>
               {check.steps.length === 0 ? (
-                <span className="dim">{COPY.verify.noLinks}</span>
+                <span className="dim">{check.unrevealed && check.outcome !== null ? COPY.verify.noCards : COPY.verify.noLinks}</span>
               ) : (
                 <ol className="bj-steps" data-testid="bj-verify-steps">
                   {check.steps.map((s) => (

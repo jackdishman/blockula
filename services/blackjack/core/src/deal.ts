@@ -25,11 +25,17 @@ export function owedLinks(game: Pick<Game, "id" | "clientSeed" | "phase" | "deal
   if (chain.length !== CHAIN_LEN + 1) throw new Error("a chain is its commitment and 32 links");
   const hand = handOf(game);
   const out: string[] = [];
+  // Before the player's seed is revealed the dealer owes nothing, and no card can be known.
+  const seed = game.clientSeed;
+  if (seed === null) {
+    if (dealers(hand.phase)) throw new Error("a hand the dealer owes a card has its seed");
+    return out;
+  }
   while (dealers(hand.phase)) {
     const j = hand.dealt + 1;
     if (j > CHAIN_LEN) throw new Error("a hand never takes more than 32 cards");
     out.push(chain[j]);
-    hand.deal(card(chain[j], game.clientSeed, game.id, j));
+    hand.deal(card(chain[j], seed, game.id, j));
   }
   return out;
 }

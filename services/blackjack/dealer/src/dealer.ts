@@ -4,15 +4,21 @@
  * The chain is the only state it trusts. Each tick reads the house, the open hands and each
  * hand's record, and from those alone decides what to send:
  *
- * - a `reveal` with exactly the links a hand is owed (`owedLinks`), oldest deadline first;
- * - a `timeout` for a hand whose player let their deadline pass (the program stands them and
- *   the next tick deals the rest). Never for a hand in the dealer's own phase: there a timeout
- *   pays the player;
+ * - nothing for a hand whose bet is placed and whose seed isn't revealed yet (a bet is two
+ *   transactions: the seed's hash, then the seed). No card can be known before the seed is, and
+ *   the program refuses a link until then; the dealer never asks its store for such a hand;
+ * - a `reveal` with exactly the links a hand is owed (`owedLinks`), oldest deadline first, once
+ *   the seed is on the chain;
+ * - a `timeout` for a hand whose player let a deadline pass: the seed's (the hand ends, the stake
+ *   is the house's and the seat is free: outcome 8) or a move's (the program stands them and the
+ *   next tick deals the rest). Never for a hand in the dealer's own phase: there a timeout pays
+ *   the player;
  * - a `commit_batch` when fewer than `lowWater` commitments are left, each chain's secret in the
  *   store and its backup before the commitment leaves this machine.
  *
  * So a restart needs nothing but the chain and the store. Every call is safe to repeat: the
- * program takes a link only as its chain's next (58), a batch only where the last one ended (61)
+ * program takes a link only as its chain's next (58; one the hand already holds is passed over, so
+ * a reveal someone got ahead of still deals the rest), a batch only where the last one ended (61)
  * and a timeout only past the deadline (60), and secrets are kept by game index, so a batch sent
  * again commits the same chains. A transaction whose fate isn't known is followed by its id
  * until it is final, failed, or can no longer run; only one the node has never heard of is
@@ -123,11 +129,12 @@ export interface Health {
   /** Secrets stored for indexes not committed yet (a batch that never landed: they are used next). */
   uncommitted: number;
   stored: number;
-  open: { id: bigint; phase: Phase; deadline: bigint; dealers: boolean; hasSecret: boolean }[];
+  /** `waitsForSeed`: the bet is placed and its seed isn't revealed; the dealer owes nothing yet. */
+  open: { id: bigint; phase: Phase; deadline: bigint; dealers: boolean; waitsForSeed: boolean; hasSecret: boolean }[];
 }
 
-const OUTCOME_NAMES: Record<Outcome, string> = { 1: "blackjack", 2: "win", 3: "push", 4: "lose", 5: "bust", 6: "forfeit", 7: "forfeit_deal" };
-const PHASE_NAMES: Record<Phase, string> = { 1: "deal", 2: "player", 3: "hit", 4: "dealer", 5: "done" };
+const OUTCOME_NAMES: Record<Outcome, string> = { 1: "blackjack", 2: "win", 3: "push", 4: "lose", 5: "bust", 6: "forfeit", 7: "forfeit_deal", 8: "no_seed" };
+const PHASE_NAMES: Record<Phase, string> = { 0: "seed", 1: "deal", 2: "player", 3: "hit", 4: "dealer", 5: "done" };
 /** Aborts that say the table moved on since it was read: someone else's call got there first. */
 const MOVED: Record<string, readonly number[]> = { reveal: [54, 57, 58, 59], timeout: [54, 60], commit: [61] };
 
@@ -156,6 +163,9 @@ function eventFields(events: readonly TableEvent[]): LogFields {
       out.outcome = OUTCOME_NAMES[e.outcome];
       out.stake = fang(e.stake);
       out.payout = fang(e.payout);
+    } else if (e.name === "seed") {
+      // That it came, never what it is.
+      out.seed = "revealed";
     } else if (e.name === "stand") {
       out.stood = e.idle ? "idle" : "player";
     } else if (e.name === "commit") {
@@ -202,7 +212,7 @@ export async function inspect(reader: TableReader, store: SecretStore, address: 
     stored: store.size,
     open: games.map((g) => {
       const top = store.top(g.id);
-      return { id: g.id, phase: g.phase, deadline: g.deadline, dealers: dealers(g.phase), hasSecret: top !== undefined && chainFromTop(top)[g.dealt] === g.link };
+      return { id: g.id, phase: g.phase, deadline: g.deadline, dealers: dealers(g.phase), waitsForSeed: g.phase === Phase.Seed, hasSecret: top !== undefined && chainFromTop(top)[g.dealt] === g.link };
     }),
   };
 }
@@ -346,7 +356,22 @@ export class Dealer {
   }
 
   private planHand(g: Game, height: number, limits: Limits, started: string[]): void {
+    if (g.phase === Phase.Seed) {
+      // The bet is placed; its seed isn't revealed. Nothing is owed, and nothing of the chain is
+      // touched. Once the block a call would land in is past the seed's deadline, the hand is
+      // the house's: the timeout ends it and frees its seat. Short validity, as for an idle
+      // player: a copy that arrives late must not meet the hand dealt and past another deadline.
+      if (BigInt(height) < g.deadline) return;
+      const validForBlocks = Math.max(2, Math.min(this.opts.txValidBlocks, Number(limits.revealBlocks / 2n)));
+      this.begin(`timeout:seed:${g.id}`, "timeout", call.timeout(g.id), { validForBlocks, fuelLimit: FUEL.timeout }, { game: g.id, turn: "seed", deadline: g.deadline, read_at: height }, started);
+      return;
+    }
     if (dealers(g.phase)) {
+      if (g.clientSeed === null) {
+        // Never the case on a real table (the program sets the seed with the phase); never deal blind.
+        this.once(`noseed:${g.id}`, 120, () => this.log.error("hand_without_seed", { game: g.id, height, phase: PHASE_NAMES[g.phase] }));
+        return;
+      }
       const chain = this.chainFor(g);
       if (!chain) {
         this.once(`lost:${g.id}`, 120, () =>
@@ -368,7 +393,7 @@ export class Dealer {
       // Its validity is short, well inside `reveal_blocks`, so a copy that arrives late can't
       // find the hand in the dealer's phase with a deadline already behind it.
       const validForBlocks = Math.max(2, Math.min(this.opts.txValidBlocks, Number(limits.revealBlocks / 2n)));
-      this.begin(`timeout:${g.id}:${g.dealt}`, "timeout", call.timeout(g.id), { validForBlocks, fuelLimit: FUEL.timeout }, { game: g.id, deadline: g.deadline, read_at: height }, started);
+      this.begin(`timeout:${g.id}:${g.dealt}`, "timeout", call.timeout(g.id), { validForBlocks, fuelLimit: FUEL.timeout }, { game: g.id, turn: "player", deadline: g.deadline, read_at: height }, started);
     }
   }
 

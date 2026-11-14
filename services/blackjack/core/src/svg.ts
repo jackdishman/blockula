@@ -104,6 +104,8 @@ export function stampWords(o: Outcome): string {
       return "Dealer wins";
     case Outcome.Bust:
       return "Bust";
+    case Outcome.NoSeed:
+      return "No seed";
   }
 }
 

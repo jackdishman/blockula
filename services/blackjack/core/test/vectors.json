@@ -1143,6 +1143,7 @@
     { "stake": "1", "outcome": 5, "payout": "0" },
     { "stake": "1", "outcome": 6, "payout": "2" },
     { "stake": "1", "outcome": 7, "payout": "2" },
+    { "stake": "1", "outcome": 8, "payout": "0" },
     { "stake": "3", "outcome": 1, "payout": "7" },
     { "stake": "3", "outcome": 2, "payout": "6" },
     { "stake": "3", "outcome": 3, "payout": "3" },
@@ -1150,6 +1151,7 @@
     { "stake": "3", "outcome": 5, "payout": "0" },
     { "stake": "3", "outcome": 6, "payout": "6" },
     { "stake": "3", "outcome": 7, "payout": "7" },
+    { "stake": "3", "outcome": 8, "payout": "0" },
     { "stake": "1000000000", "outcome": 1, "payout": "2500000000" },
     { "stake": "1000000000", "outcome": 2, "payout": "2000000000" },
     { "stake": "1000000000", "outcome": 3, "payout": "1000000000" },
@@ -1157,12 +1159,24 @@
     { "stake": "1000000000", "outcome": 5, "payout": "0" },
     { "stake": "1000000000", "outcome": 6, "payout": "2000000000" },
     { "stake": "1000000000", "outcome": 7, "payout": "2500000000" },
+    { "stake": "1000000000", "outcome": 8, "payout": "0" },
     { "stake": "25000000001", "outcome": 1, "payout": "62500000002" },
     { "stake": "25000000001", "outcome": 2, "payout": "50000000002" },
     { "stake": "25000000001", "outcome": 3, "payout": "25000000001" },
     { "stake": "25000000001", "outcome": 4, "payout": "0" },
     { "stake": "25000000001", "outcome": 5, "payout": "0" },
     { "stake": "25000000001", "outcome": 6, "payout": "50000000002" },
-    { "stake": "25000000001", "outcome": 7, "payout": "62500000002" }
+    { "stake": "25000000001", "outcome": 7, "payout": "62500000002" },
+    { "stake": "25000000001", "outcome": 8, "payout": "0" }
+  ],
+  "seed_hashes": [
+    { "player": "dd340204d27a1f0fd3f9e90265ed6eccc7a84bc4817cbf1a4dae70f40f63b18c", "client_seed": "4ab5008e13aa206d7d2650169252d3798e88fd4d74291643c1095d069a77cb11", "seed_hash": "443d1a551ac37a344a93a5daf5d588837048cbdbd21c143f26bc753f8fa20de5" },
+    { "player": "e8fee0bd11d25092bf1611cbc379f086385c45d73986c02510baeeec3c4784d1", "client_seed": "0964a3f4d46007fd529a5f96405474e68e9134c7b6bb961fbc391dfc0833b965", "seed_hash": "f5cc72a4e407124e2c4b4f2394b657dcada52ca27d5cd9602880143f1bc2c3e7" },
+    { "player": "48208656907bf6707bee73b74407fe5c32fe100f0e5bd85e3f7083d89770745e", "client_seed": "dae738a132555f69d137774a6150da7e81efb3fb02b46ff9740fb9579603bdb8", "seed_hash": "da02f3311fb8c15d2db3b5ff7e3f4eeaedd60df8015532409c081789280dee3e" },
+    { "player": "322d1bbf54ddf368b29925947ac063aecd2ae50ceafadbe3d4168a77ea10a370", "client_seed": "85dd4ca87eacd12296d0e5359296ae0748415323e2015ce7dffceae7a1006e96", "seed_hash": "a274aebd2d8ee7bf7e54c0a7ab4482b15f4e353cea8592e58678e849fdf2342c" },
+    { "player": "da6a2cdc47e6b2c3253766027f5e9632a09fe2b07abd3d9c632f2291bec8445e", "client_seed": "0b29588912338947fd4532d1b27d16b692b2b1900c490fee648c9c938ca5c1ac", "seed_hash": "58c6ff9c1cd894912638bb0f31af141531a5be85cb3ca9fa3ef75450a6dea7d3" },
+    { "player": "33de7144b384404a5cac77fb74b6b9c0d75b03fd9016219e39363d0f1a8f1b5f", "client_seed": "db7fc1c97776f4e3c22716d5ca6483802abbc15df8d4be0fcd68ca2c917ab520", "seed_hash": "f78048646746915d47899c0cc67f5547e11a589a43cdbbcdbb6f85d3a252949e" },
+    { "player": "a3de66ccbd88b7ea3ef6162e2c502051eb74d7f4831a56c0b88b53841e763c45", "client_seed": "fdcf63dbb088ab87fa5a90df1c12e78ca4731181a29929fe12364f1ed2237cf3", "seed_hash": "f6f5283e300f5fe29ed2f3c810daab6f3ca634f601bf5e45b69a974f97e90ffd" },
+    { "player": "dde4551e446d5236575143f21fd10b7812007dc0463b8ad57917aa90ea5ac4ff", "client_seed": "66662a8e06c6c37265bad71f7781c753329957a3adf525fdc50fcc1ddf6f0552", "seed_hash": "639a214620cbab102f69479dac571ca03221d648b42f7ad5cab6c5da1d6c812c" }
   ]
 }

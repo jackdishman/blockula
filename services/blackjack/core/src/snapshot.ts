@@ -77,6 +77,8 @@ export function totalWords(cards: readonly number[]): string {
 export function phaseWords(s: Pick<TableSnapshot, "phase" | "outcome">): string {
   if (s.outcome !== null) return `${outcomeWords(s.outcome)}.`;
   switch (s.phase) {
+    case Phase.Seed:
+      return "The bet is placed. Waiting for the player's seed.";
     case Phase.Deal:
       return "Waiting for the dealer to deal.";
     case Phase.Player:

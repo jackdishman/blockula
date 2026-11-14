@@ -21,7 +21,10 @@
 //! ```
 //!
 //! The player picks `client_seed` after the commitment is fixed and before any link is revealed,
-//! so neither side chooses a card. **The bias.** 2^64 isn't a multiple of 52: the first
+//! so neither side chooses a card. A bet from an account fixes the seed in two steps: the bet
+//! carries only [`seed_hash`], which takes the commitment, and the seed itself follows once the
+//! bet is final, so nobody who sees the seed can still change which commitment it meets.
+//! **The bias.** 2^64 isn't a multiple of 52: the first
 //! 2^64 mod 52 = 16 card numbers are each more likely than the others by one part in 2^64 / 52,
 //! about 3 × 10^-18. No rejection loop is worth that.
 //!
@@ -129,7 +132,7 @@ fn compress(cv: &[u32; 8], block: &[u8; 64], len: u32, flags: u32) -> [u32; 8] {
 }
 
 /// The BLAKE3 hash of `data`, which must be at most [`MAX_HASH_INPUT`] bytes (one chunk). Panics
-/// on anything longer: every input this crate hashes is 32 or 73 bytes.
+/// on anything longer: every input this crate hashes is 32, 73 or 87 bytes.
 pub fn blake3(data: &[u8]) -> [u8; 32] {
     assert!(data.len() <= MAX_HASH_INPUT);
     let mut cv = IV;
@@ -179,6 +182,24 @@ pub fn card(link: &[u8; 32], client_seed: &[u8; 32], game_id: u64, j: u8) -> u8 
     let h = blake3(&pre);
     let n = u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
     (n % DECK) as u8
+}
+
+/// What a seed's hash starts with, before the player and the seed: no other hash this crate
+/// makes is of 87 bytes, or starts with these.
+pub const SEED_DOMAIN: &[u8; 23] = b"blockula/blackjack/seed";
+
+/// Bytes [`seed_hash`] hashes.
+pub const SEED_PREIMAGE: usize = 87;
+
+/// What a bet commits to: `BLAKE3("blockula/blackjack/seed" ‖ player (32) ‖ client_seed (32))`.
+/// The player's account is in it, so a hash copied from someone else's bet can never be opened by
+/// the copier: the seed that opens it under their account would be a different one.
+pub fn seed_hash(player: &[u8; 32], client_seed: &[u8; 32]) -> [u8; 32] {
+    let mut pre = [0u8; SEED_PREIMAGE];
+    pre[..23].copy_from_slice(SEED_DOMAIN);
+    pre[23..55].copy_from_slice(player);
+    pre[55..].copy_from_slice(client_seed);
+    blake3(&pre)
 }
 
 // ---------------------------------------------------------------------------------- hands
@@ -240,6 +261,10 @@ pub enum Outcome {
     /// card against one): the player is paid 3:2. Either way a forfeit pays the most the hand
     /// could have, so the dealer never gains by holding back a card it has seen.
     ForfeitDeal = 7,
+    /// The player never revealed the seed their bet committed to: the stake is the house's. The
+    /// hand had no cards, and the player could know none of them, so withholding a seed is never
+    /// a way out of a hand that would have lost.
+    NoSeed = 8,
 }
 
 impl Outcome {
@@ -252,6 +277,7 @@ impl Outcome {
             5 => Outcome::Bust,
             6 => Outcome::Forfeit,
             7 => Outcome::ForfeitDeal,
+            8 => Outcome::NoSeed,
             _ => return None,
         })
     }
@@ -271,7 +297,7 @@ pub const fn payout(stake: u64, outcome: Outcome) -> u64 {
         Outcome::Blackjack | Outcome::ForfeitDeal => stake + exposure(stake),
         Outcome::Win | Outcome::Forfeit => stake + stake,
         Outcome::Push => stake,
-        Outcome::Lose | Outcome::Bust => 0,
+        Outcome::Lose | Outcome::Bust | Outcome::NoSeed => 0,
     }
 }
 
@@ -299,7 +325,9 @@ pub fn showdown(player: &[u8], dealer: &[u8]) -> Outcome {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Phase {
-    /// The bet is placed; the dealer owes the first three cards.
+    /// The bet is placed with the hash of the player's seed; the player owes the seed.
+    Seed = 0,
+    /// The seed is known; the dealer owes the first three cards.
     Deal = 1,
     /// The player's turn: hit or stand.
     Player = 2,
@@ -314,6 +342,7 @@ pub enum Phase {
 impl Phase {
     pub const fn from_u8(n: u8) -> Option<Phase> {
         Some(match n {
+            0 => Phase::Seed,
             1 => Phase::Deal,
             2 => Phase::Player,
             3 => Phase::Hit,
@@ -360,9 +389,24 @@ impl Default for Hand {
 }
 
 impl Hand {
-    /// A hand whose bet is placed and whose cards aren't dealt.
+    /// A hand whose bet is placed, whose seed is known and whose cards aren't dealt.
     pub const fn new() -> Hand {
         Hand { phase: Phase::Deal, dealt: 0, n_player: 0, n_dealer: 0, player: [0; MAX_PLAYER_CARDS], dealer: [0; MAX_DEALER_CARDS] }
+    }
+
+    /// A hand whose bet is placed with the hash of a seed the player hasn't revealed yet.
+    pub const fn committed() -> Hand {
+        Hand { phase: Phase::Seed, dealt: 0, n_player: 0, n_dealer: 0, player: [0; MAX_PLAYER_CARDS], dealer: [0; MAX_DEALER_CARDS] }
+    }
+
+    /// The player revealed their seed: the dealer owes the deal. `false` (and nothing changes)
+    /// unless the hand was waiting for it.
+    pub fn seeded(&mut self) -> bool {
+        if self.phase != Phase::Seed {
+            return false;
+        }
+        self.phase = Phase::Deal;
+        true
     }
 
     pub fn player_cards(&self) -> &[u8] {
@@ -435,7 +479,7 @@ impl Hand {
                 // Against a natural the dealer turns its hole card and draws no more.
                 if natural(self.player_cards()) || total(self.dealer_cards()).0 >= DEALER_STANDS_ON { self.settle() } else { Step::More }
             }
-            Phase::Player | Phase::Done => return None,
+            Phase::Seed | Phase::Player | Phase::Done => return None,
         };
         Some(step)
     }

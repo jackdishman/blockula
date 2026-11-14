@@ -25,6 +25,7 @@ import {
   cardBackFragment,
   cardBackSvg,
   cardFaceFragment,
+  altText,
   cardFaceSvg,
   cardLabel,
   footerLines,
@@ -210,7 +211,14 @@ assert.equal(statusLine(base), "Your move: hit or stand.");
 assert.equal(statusLine(settled(Outcome.Blackjack)), "Blackjack. 12.5 FANG came back.");
 assert.equal(statusLine(settled(Outcome.Bust)), "Bust. Nothing came back.");
 assert.equal(statusLine(settled(Outcome.Push)), "Push. 5 FANG came back.");
-assert.deepEqual(outcomes.map(stampWords), ["Blackjack", "You win", "Push", "Dealer wins", "Bust", "You win", "You win"]);
+assert.deepEqual(outcomes.map(stampWords), ["Blackjack", "You win", "Push", "Dealer wins", "Bust", "You win", "You win", "No seed"]);
+// A bet waiting for its seed, and one whose seed never came: an empty table, said in words.
+const waiting: TableSnapshot = { ...empty, phase: Phase.Seed };
+assert.equal(statusLine(waiting), "The bet is placed. Waiting for the player's seed.");
+assert.ok(altText(waiting).includes("Waiting for the player's seed."));
+const noSeed: TableSnapshot = { ...empty, phase: Phase.Done, outcome: Outcome.NoSeed, payout: 0n };
+assert.equal(statusLine(noSeed), "The bet is the house's: its seed was never revealed. Nothing came back.");
+assert.ok(tableSvg(noSeed).includes("No seed"));
 // Nothing is stamped on a hand still being played; an empty table shows empty places.
 assert.ok(!tableSvg(base).includes("rotate(-5"));
 assert.equal(tableSvg(empty).split("stroke-dasharray").length - 1, 4);

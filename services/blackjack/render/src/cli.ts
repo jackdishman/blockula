@@ -24,6 +24,7 @@ function settled(id: bigint, player: string, dealer: string, outcome: Outcome, s
 /** The gallery's hands, by file name. */
 export const GALLERY: Readonly<Record<string, TableSnapshot>> = {
   "waiting": { gameId: 40n, playerCards: [], dealerCards: [], holeHidden: false, stake: 5n * FANG, phase: Phase.Deal, outcome: null, payout: null, player: "mina.boo" },
+  "seed-wait": { gameId: 39n, playerCards: [], dealerCards: [], holeHidden: false, stake: 5n * FANG, phase: Phase.Seed, outcome: null, payout: null, player: "mina.boo" },
   "deal": { gameId: 41n, playerCards: cards("9h 7c"), dealerCards: cards("Ks"), holeHidden: true, stake: 5n * FANG, phase: Phase.Player, outcome: null, payout: null, txId: TX, player: "mina.boo" },
   "player-turn": { gameId: 42n, playerCards: cards("5d 3s 2h 6c"), dealerCards: cards("10d"), holeHidden: true, stake: 2n * FANG + FANG / 2n, phase: Phase.Player, outcome: null, payout: null, txId: TX, player: "@a_rather_long_handle_that_keeps_going" },
   "blackjack": settled(43n, "As Kh", "9c", Outcome.Blackjack, 10n * FANG, true),
@@ -33,6 +34,7 @@ export const GALLERY: Readonly<Record<string, TableSnapshot>> = {
   "bust": settled(47n, "9d 6s Kc", "7h", Outcome.Bust, 5n * FANG, true),
   "timeout-dealer": settled(48n, "8h 4d", "Jd", Outcome.Forfeit, 5n * FANG, true),
   "timeout-deal": { ...settled(49n, "As", "9c", Outcome.ForfeitDeal, 5n * FANG), playerCards: [], dealerCards: [], holeHidden: false },
+  "no-seed": { gameId: 50n, playerCards: [], dealerCards: [], holeHidden: false, stake: 5n * FANG, phase: Phase.Done, outcome: Outcome.NoSeed, payout: 0n, player: "mina.boo" },
   "long-hand": {
     gameId: 18446744073709551615n,
     playerCards: cards("As Ah Ad Ac As Ah Ad Ac 2s 2h 2d 2c As Ah Ad Ac As Ah Ad Ac"),

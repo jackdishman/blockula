@@ -322,7 +322,7 @@ const METHODS: &[&str] = &[
     "bet", "hit", "stand", "reveal", "timeout", "commit_batch", "deposit", "withdraw", "set_relayer",
     "relay_bet", "relay_hit", "relay_stand", "relay_withdraw", "revoke", "set_limits", "pause",
     "defund", "set_dealer", "approve_relayer", "skip_commits", "game", "player", "house", "limits",
-    "open_games", "commitment",
+    "open_games", "commitment", "reveal_seed",
 ];
 
 #[derive(Arbitrary, Debug)]

@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { test } from "node:test";
-import { ABORTS, DEFAULT_LIMITS, DROPS_PER_FANG, EMPTY_PLAYER, Outcome, Phase, POSTER_ALT, altText, bytesAddress, exposure, outcomeWords, payout, snapshotOfGame, snapshotOfSettled, tableSvg } from "@blockula/blackjack";
+import { ABORTS, DEFAULT_LIMITS, DROPS_PER_FANG, EMPTY_PLAYER, Outcome, Phase, POSTER_ALT, altText, bytesAddress, exposure, outcomeWords, payout, seedHash, snapshotOfGame, snapshotOfSettled, tableSvg } from "@blockula/blackjack";
 import {
   ADULT_KEY,
   addHandTx,
@@ -25,6 +25,7 @@ import {
   maxBetNow,
   newSeed,
   noteBetTx,
+  noteRevealTx,
   parseAmount,
   payoutWords,
   readStore,
@@ -33,6 +34,7 @@ import {
   seedUsed,
   storeKey,
   storedHand,
+  storedSeedFor,
   tableProblem,
 } from "./blackjack.ts";
 import { COPY, NOTE, rulesText } from "./blackjack-copy.ts";
@@ -63,9 +65,11 @@ function gameAt(h, n, o = {}) {
   cards.forEach((c, i) => (i === 1 || player.length >= h.player.length ? dealer : player).push(c));
   const hits = (h.moves.match(/H/g) ?? []).length;
   const phase = n < 3 ? Phase.Deal : n === h.links.length && h.outcome ? Phase.Done : player.length < 2 + hits ? (n === 3 + (player.length - 2) ? Phase.Player : Phase.Hit) : Phase.Dealer;
-  return { id: BigInt(h.game_id), player: ME, stake: BigInt(h.stake), clientSeed: h.client_seed, link: n === 0 ? h.commit : h.links[n - 1], deadline: 100_150n, postId: 0n, phase, table: false, dealt: n, playerCards: player, dealerCards: dealer, playerTotal: 0, dealerTotal: 0, ...o };
+  return { id: BigInt(h.game_id), player: ME, stake: BigInt(h.stake), clientSeed: h.client_seed, seedHash: null, link: n === 0 ? h.commit : h.links[n - 1], deadline: 100_150n, postId: 0n, phase, table: false, dealt: n, playerCards: player, dealerCards: dealer, playerTotal: 0, dealerTotal: 0, ...o };
 }
-const lastOf = (h) => ({ game: BigInt(h.game_id), outcome: h.outcome, dealt: h.links.length, nPlayer: h.player.length, stake: BigInt(h.stake), payout: BigInt(h.payout), clientSeed: h.client_seed, link: h.links.at(-1) });
+const lastOf = (h) => ({ game: BigInt(h.game_id), outcome: h.outcome, dealt: h.links.length, nPlayer: h.player.length, stake: BigInt(h.stake), payout: BigInt(h.payout), clientSeed: h.client_seed, seedHash: null, link: h.links.at(-1) });
+/** A hand whose bet is in and whose seed isn't revealed: the chain holds the hash `ME`'s bet carried. */
+const waitingFor = (h, o = {}) => gameAt(h, 0, { phase: Phase.Seed, clientSeed: null, seedHash: seedHash(ME, h.client_seed), deadline: 100_300n, ...o });
 
 // ---------------------------------------------------------------------------------- which table
 
@@ -181,6 +185,113 @@ test("an open hand waits for the dealer or the player, and says what a passed de
   assert.match(watch.words, /^The player's move/);
   assert.equal(handState(gameAt(h, 3), OTHER, 100_000).canMove, false);
   assert.match(handState(gameAt(h, 4, { phase: Phase.Hit }), ME, 100_000).words, /to reveal the next card/);
+});
+
+test("a bet waits for its seed: step 2 of 2 while there is time, the house's once there isn't", () => {
+  const h = vectors.hands.find((x) => x.moves === "HS");
+  const g = waitingFor(h);
+  const mine = handState(g, ME, 100_000);
+  assert.deepEqual([mine.mine, mine.waitsFor, mine.seedLate, mine.canMove, mine.canClaim, mine.idle], [true, "seed", false, false, false, false]);
+  assert.equal(mine.words, "Bet placed. Now reveal your seed to be dealt (step 2 of 2). You have 300 blocks (about 5 min) left. If the seed isn't revealed in time, the bet goes to the house.");
+  // A reveal sent at the deadline's own block would land after it.
+  assert.equal(handState(g, ME, 100_299).seedLate, false);
+  const late = handState(g, ME, 100_300);
+  assert.deepEqual([late.seedLate, late.canClaim, late.canMove], [true, false, false]);
+  assert.equal(late.words, "Your seed wasn't revealed in time, so the bet goes to the house. Anyone can end the hand.");
+  // The dealer's missed deadline pays the player; a seed's missed deadline never offers a claim.
+  assert.equal(handState(g, ME, 200_000).canClaim, false);
+  const watch = handState(g, null, 100_000);
+  assert.deepEqual([watch.mine, watch.waitsFor], [false, "seed"]);
+  assert.match(watch.words, /^The bet is placed\. The player has 300 blocks/);
+  assert.match(handState(g, OTHER, 100_300).words, /^The seed wasn't revealed in time/);
+  // Once the seed is in, the dealer owes the deal. A relayed hand never had this step.
+  assert.match(handState(gameAt(h, 0), ME, 100_000).words, /^Seed revealed\. Waiting for the dealer…/);
+  assert.match(handState(gameAt(h, 0, { table: true }), ME, 100_000).words, /^Waiting for the dealer…/);
+});
+
+test("the seed of a bet is found again by the hash the bet carried, and only by the browser that holds it", () => {
+  const store = memory();
+  const key = storeKey("blockula-testnet", TABLE);
+  const seed = "a1".repeat(32);
+  const hash = seedHash(ME, seed);
+  const tx = "c3".repeat(32);
+  rememberSeed(store, key, seed, 1000, hash);
+  rememberSeed(store, key, "b2".repeat(32), 1001, seedHash(ME, "b2".repeat(32)));
+  // Still pending (the page closed before the bet's receipt was read): found by the hash, for the account that bet.
+  assert.deepEqual(storedSeedFor(store, key, ME, hash), { seed, seedHash: hash, txs: [], at: 1000 });
+  assert.equal(storedSeedFor(store, key, OTHER, hash), null, "the hash binds the account");
+  assert.equal(storedSeedFor(store, key, ME, seedHash(OTHER, seed)), null);
+  assert.equal(storedSeedFor(store, key, ME, "zz"), null);
+  assert.equal(storedSeedFor(memory(), key, ME, hash), null, "another browser, or cleared storage, has no seed");
+  assert.equal(storedSeedFor(null, key, ME, hash), null);
+  // A stored hash that isn't the seed's doesn't make a seed open another bet: the hash is recomputed.
+  const forged = memory();
+  forged.setItem(key, JSON.stringify({ v: 1, pending: [{ seed, seedHash: seedHash(ME, "ff".repeat(32)), txs: [], at: 1 }], hands: {} }));
+  assert.equal(storedSeedFor(forged, key, ME, seedHash(ME, "ff".repeat(32))), null);
+  // The open hand's record has only the hash: the hand is found, with its id.
+  const h = vectors.hands[0];
+  const waiting = waitingFor(h, { seedHash: hash });
+  assert.deepEqual(storedHand(store, key, waiting.id, null, { account: ME, seedHash: hash }), { seed, seedHash: hash, txs: [], at: 1000, game: waiting.id.toString() });
+  assert.equal(storedHand(store, key, waiting.id, null, { account: OTHER, seedHash: hash }), null);
+  assert.equal(storedHand(store, key, waiting.id, null), null);
+  // Filed under its hand (the bet's receipt, or the chain showing the hand), the reveal's transaction is kept with it.
+  noteBetTx(store, key, seed, tx);
+  bindBet(store, key, seed, { game: 7n, commit: "d4".repeat(32), txId: tx, seedHash: hash });
+  addHandTx(store, key, 7n, "e5".repeat(32));
+  assert.deepEqual(storedSeedFor(store, key, ME, hash), { seed, seedHash: hash, game: "7", commit: "d4".repeat(32), betTx: tx, txs: [tx, "e5".repeat(32)], at: 1000 });
+  // Filing again (the page found the hand on a reload) keeps what was known.
+  bindBet(store, key, seed, { game: 7n, seedHash: hash });
+  assert.equal(storedHand(store, key, 7n, seed).commit, "d4".repeat(32));
+  // The seed's reveal is noted as the hand's newest reveal (the page warns while it hasn't landed), a second one replaces it,
+  // and both stay in the hand's list. Nothing is noted for a hand that isn't kept, or an id that isn't one.
+  noteRevealTx(store, key, 7n, "f6".repeat(32));
+  noteRevealTx(store, key, 7n, "a7".repeat(32));
+  noteRevealTx(store, key, 7n, "not an id");
+  noteRevealTx(store, key, 8n, "b8".repeat(32));
+  assert.equal(storedHand(store, key, 7n, seed).revealTx, "a7".repeat(32));
+  assert.deepEqual(storedHand(store, key, 7n, seed).txs, [tx, "e5".repeat(32), "f6".repeat(32), "a7".repeat(32)]);
+  assert.equal(readStore(store, key).hands["8"], undefined);
+  assert.match(COPY.seed.unlanded, /isn't in a block .* the bet goes to the house/);
+  assert.match(COPY.seed.sentMany(2), /Your node and 2 other nodes .* its fee is paid once/);
+  assert.match(COPY.seed.sentMany(1), /1 other node of/);
+  assert.match(COPY.seed.unlandedMany(1), /1 other node\./);
+  assert.equal(readStore(store, key).pending.length, 1, "the other seed still waits for its bet");
+});
+
+test("the check knows a hand without its seed, and holds a revealed seed to the hash its bet carried", () => {
+  const h = vectors.hands.find((x) => x.moves === "HS");
+  const hash = seedHash(ME, h.client_seed);
+  const kept = { seed: h.client_seed, seedHash: hash, commit: h.commit, txs: [], at: 0 };
+  // Waiting for the seed: nothing to check yet, and the seed isn't shown as the chain's.
+  const waiting = checkOpenHand(waitingFor(h), kept);
+  assert.deepEqual([waiting.ok, waiting.unrevealed, waiting.clientSeed, waiting.seedHash, waiting.seed, waiting.steps.length, waiting.commit], [true, true, null, hash, "yours", 0, h.commit]);
+  assert.match(waiting.verdict, /^Nothing to check yet\. No card is dealt until the seed is revealed/);
+  assert.equal(checkOpenHand(waitingFor(h)).seed, "unknown");
+  assert.equal(checkOpenHand(waitingFor(h), { ...kept, seed: "5a".repeat(32) }).seed, "unknown", "a seed that doesn't open the hash isn't this hand's");
+  // Revealed and dealt: the seed is the one the bet committed to.
+  const open = checkOpenHand(gameAt(h, 3), kept);
+  assert.deepEqual([open.ok, open.seedCheck, open.commitCheck, open.unrevealed, open.seedHash], [true, "matches", "matches", false, hash]);
+  assert.equal(open.verdict, "Verified. Every card comes from the dealer's commitment and your seed. The seed is the one the bet committed to.");
+  const settled = checkSettledHand(lastOf(h), kept, ME);
+  assert.deepEqual([settled.ok, settled.seedCheck], [true, "matches"]);
+  // Without the account, or without the stored hash, the seed isn't compared (and nothing claims it was).
+  assert.equal(checkSettledHand(lastOf(h), kept).seedCheck, "unknown");
+  assert.equal(checkSettledHand(lastOf(h), { ...kept, seedHash: undefined }, ME).seedCheck, "unknown");
+  // A seed that isn't the one the bet carried a hash of doesn't verify.
+  const wrong = checkSettledHand(lastOf(h), { ...kept, seedHash: seedHash(OTHER, h.client_seed) }, ME);
+  assert.deepEqual([wrong.ok, wrong.verdict], [false, "Not verified: the seed isn't the one the bet committed to."]);
+  // A hand that ended without its seed: no cards, nothing paid, and that is what's verified.
+  const stake = 2n * F;
+  const lost = { game: BigInt(h.game_id), outcome: Outcome.NoSeed, dealt: 0, nPlayer: 0, stake, payout: 0n, clientSeed: null, seedHash: hash, link: h.commit };
+  const none = checkSettledHand(lost, kept, ME);
+  assert.deepEqual([none.ok, none.unrevealed, none.outcome, none.steps.length, none.player, none.dealer, none.seed, none.commitCheck], [true, true, Outcome.NoSeed, 0, [], [], "yours", "matches"]);
+  assert.equal(none.verdict, "Verified. No cards were dealt: the seed was never revealed, so the bet went to the house.");
+  assert.equal(checkSettledHand({ ...lost, payout: 1n }).ok, false);
+  assert.equal(checkSettledHand({ ...lost, outcome: Outcome.ForfeitDeal, payout: payout(stake, Outcome.ForfeitDeal) }).ok, false);
+  assert.equal(checkSettledHand({ ...lost, link: "00".repeat(32) }, kept, ME).ok, false, "not the commitment the bet took");
+  assert.equal(`${outcomeWords(Outcome.NoSeed)}. ${payoutWords(stake, 0n)}`, "The bet is the house's: its seed was never revealed. Nothing came back from the 2 FANG bet.");
+  assert.equal(logLine({ name: "seed", game: 7n, player: ME, clientSeed: h.client_seed, deadline: 0n }, ME), "You revealed your seed.");
+  assert.equal(logLine({ name: "seed", game: 7n, player: OTHER, clientSeed: h.client_seed, deadline: 0n }, ME), "The player revealed their seed.");
 });
 
 test("a seat is the open hand, a hand that settled between two reads, or none, each with the last hand", () => {
@@ -458,6 +569,14 @@ test("the rules state the table's limits as the chain has them, and the game as 
   assert.match(text, /Up to 10 hands can be open at once/);
   assert.match(text, /You have 1,800 blocks \(about 30 min\) to move\. After that your hand stands by itself\. Anyone can trigger that/);
   assert.match(text, /The dealer has 150 blocks \(about 3 min\) to reveal each card it owes\. If it doesn't, you can claim the hand/);
+  // The bet's two steps, the seed's deadline and why a seed that never comes costs the bet.
+  assert.match(text, /you have 300 blocks \(about 5 min\) to reveal your seed\. This page asks for it right away\. If the seed isn't revealed in time, the bet goes to the house/);
+  assert.match(text, /Until you reveal your seed nobody can know a single card, you included/);
+  assert.match(text, /A bet is two steps\. First the bet goes in with only a hash of your seed/);
+  assert.match(text, /The house can't get ahead of your bet, because your seed stays hidden until your bet already holds its commitment/);
+  assert.match(strings(rulesText({ ...DEFAULT_LIMITS, seedBlocks: 60n }, 2000)).join("\n"), /you have 60 blocks \(about 2 min\) to reveal your seed/);
+  assert.match(COPY.seed.missing, /can only be revealed from the browser that placed the bet/);
+  assert.match(COPY.bet.seed, /The bet sends only their hash/);
   assert.match(text, /stands on every 17\. There is no split, no double and no insurance/);
   assert.match(text, /two and a half times your bet/);
   // Other limits, other words: nothing is a constant of the page.
@@ -471,7 +590,15 @@ test("nothing the pages say uses a word the copy rules ban", () => {
     ...strings(COPY),
     ...strings(rulesText(DEFAULT_LIMITS)),
     ...Object.values(ABORTS),
-    ...[1, 2, 3, 4, 5, 6, 7].map(outcomeWords),
+    ...[1, 2, 3, 4, 5, 6, 7, 8].map(outcomeWords),
+    handState(waitingFor(vectors.hands[0]), ME, 100_000).words,
+    handState(waitingFor(vectors.hands[0]), null, 100_000).words,
+    handState(waitingFor(vectors.hands[0]), ME, 200_000).words,
+    handState(waitingFor(vectors.hands[0]), null, 200_000).words,
+    checkOpenHand(waitingFor(vectors.hands[0])).verdict,
+    checkSettledHand({ game: 1n, outcome: Outcome.NoSeed, dealt: 0, nPlayer: 0, stake: F, payout: 0n, clientSeed: null, seedHash: "ab".repeat(32), link: vectors.hands[0].commit }).verdict,
+    logLine({ name: "seed", game: 7n, player: ME, clientSeed: "", deadline: 0n }, ME),
+    logLine({ name: "seed", game: 7n, player: OTHER, clientSeed: "", deadline: 0n }, ME),
     POSTER_ALT,
     ...strings(shareTags("https://wallet.blockula.test", "", {})),
     betProblem("0.5", ctx()),

@@ -17,7 +17,7 @@ import { ErrorNote, Spinner } from "@/components/ui";
 import { COPY } from "@/lib/blackjack-copy";
 import { inertText } from "@/lib/explorer/inert";
 import { formatDrops } from "@/lib/explorer/ledger";
-import { NodeError, submitTx } from "@/lib/explorer/node";
+import { refusedByNode, submitTx, submitTxEverywhere } from "@/lib/explorer/node";
 import { sameCall } from "@/lib/explorer/program-calls";
 import { to } from "@/lib/explorer/routes";
 import { chainUnit, shortAddr } from "@/lib/format";
@@ -35,6 +35,14 @@ export interface CallRequest {
   call: TableCall;
   /** What it does, in the page's words: the review's headline. */
   does: string;
+  /** What to say while it waits for a block ("Placing your bet (step 1 of 2)…"); the page's usual words otherwise. */
+  waiting?: string;
+  /**
+   * Send it through every node this wallet knows, not only the selected one (the seed's reveal:
+   * a node that kept it to itself would cost the player the stake). The same signed transaction
+   * goes to each, and again if it isn't in a block when the wait ends.
+   */
+  everyNode?: boolean;
   /** Extra lines for the review (the bet's seed). */
   notes?: { k: string; v: ReactNode }[];
   /** The transaction's id, the moment it's signed (before the node answers). */
@@ -52,7 +60,7 @@ interface Review {
 }
 
 type Sent =
-  | { state: "waiting"; id: string; does: string }
+  | { state: "waiting"; id: string; does: string; words?: string }
   | { state: "applied"; id: string; does: string; summary: string }
   | { state: "failed"; id: string; does: string; words: string; message: string | null }
   | { state: "refused"; id: string; does: string; words: string }
@@ -168,12 +176,15 @@ export function useTableSigner(program: string, onDone: () => void): TableSigner
     req.onSigned?.(id);
     setBusy(null);
     setReview(null);
-    setSent({ state: "waiting", id, does: req.does });
+    setSent({ state: "waiting", id, does: req.does, words: req.waiting });
     try {
-      id = await submitTx(signed);
+      // Through every node, the id stays the one computed here: no node's answer replaces it.
+      if (req.everyNode) await submitTxEverywhere(signed);
+      else id = await submitTx(signed);
     } catch (e) {
       // A 4xx is the node refusing it at admission: it never ran and nothing was charged. Anything else, it may have arrived.
-      if (e instanceof NodeError && e.status >= 400 && e.status < 500) setSent({ state: "refused", id, does: req.does, words: words(e) });
+      // (Through every node, a refusal is thrown only when every one of them refused it.)
+      if (refusedByNode(e)) setSent({ state: "refused", id, does: req.does, words: words(e) });
       else setSent({ state: "unsure", id, does: req.does, words: `It may have reached your node: ${words(e)}.`, validUntil: signed.valid_until });
       return;
     }
@@ -195,6 +206,9 @@ export function useTableSigner(program: string, onDone: () => void): TableSigner
       req.onApplied?.(id, events);
       setSent({ state: "applied", id, does: req.does, summary: String(done.summary ?? "") });
     } catch (e) {
+      // Not in a block (or dropped unrun) when the wait ended: the same signed transaction goes to
+      // every node once more. It can only run once.
+      if (req.everyNode && ((e instanceof TxFailedError && e.dropped) || e instanceof TxPendingError)) void submitTxEverywhere(signed).catch(() => undefined);
       if (e instanceof TxFailedError && e.dropped) setSent({ state: "unsure", id, does: req.does, words: `Your node dropped it without running it, so nothing was charged (${inertText(e.reason, 300)}). Another node may still include it.`, validUntil: signed.valid_until });
       else if (e instanceof TxFailedError) {
         let receipt: ProgramReceipt | null = null;
@@ -313,7 +327,7 @@ export function useTableSigner(program: string, onDone: () => void): TableSigner
       {sent && (
         <div className="preview" aria-live="polite" data-testid="bj-sent" data-state={sent.state}>
           <span className="eyebrow">{sent.does}</span>
-          {sent.state === "waiting" && <Spinner>{COPY.sent.waiting}</Spinner>}
+          {sent.state === "waiting" && <Spinner>{sent.words ?? COPY.sent.waiting}</Spinner>}
           {sent.state === "applied" && (
             <p className="m0">
               {COPY.sent.applied} <span className="dim small">{inertText(sent.summary, 200)}</span>

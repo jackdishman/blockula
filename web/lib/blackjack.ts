@@ -18,6 +18,7 @@ import {
   fang,
   outcomeWords,
   prefixOf,
+  seedHash,
   total,
   verifyHand,
   type Game,
@@ -182,8 +183,10 @@ export const blocksWords = (blocks: bigint, blockMs = 1000): string => `${blocks
 export interface HandState {
   /** The hand is the viewer's own. */
   mine: boolean;
-  /** Who the hand waits for. */
-  waitsFor: "dealer" | "player";
+  /** Who the hand waits for: the dealer's card, the player's move, or the seed the player's bet committed to. */
+  waitsFor: "dealer" | "player" | "seed";
+  /** The hand waits for its seed and the time to reveal it has passed: the bet goes to the house, and anyone may end the hand. */
+  seedLate: boolean;
   /** The viewer may hit or stand now. */
   canMove: boolean;
   /** The dealer's deadline passed: anyone may claim the hand for the player. */
@@ -198,18 +201,28 @@ export interface HandState {
 /** Where an open hand stands at `height`, for the account `me` (null: a spectator). */
 export function handState(game: Game, me: string | null, height: number, blockMs = 1000): HandState {
   const mine = me !== null && game.player === me;
-  const waitsFor = game.phase === Phase.Player ? "player" : "dealer";
   const cd = countdown(game.deadline, height, blockMs);
+  if (game.phase === Phase.Seed) {
+    // A reveal sent now lands in a later block, so it is in time only while the deadline's block is still ahead.
+    const seedLate = cd.passed;
+    const words = seedLate
+      ? `${mine ? "Your seed" : "The seed"} wasn't revealed in time, so the bet goes to the house. Anyone can end the hand.`
+      : mine
+        ? `Bet placed. Now reveal your seed to be dealt (step 2 of 2). You have ${cd.words} left. If the seed isn't revealed in time, the bet goes to the house.`
+        : `The bet is placed. The player has ${cd.words} left to reveal their seed. Then the dealer deals.`;
+    return { mine, waitsFor: "seed", seedLate, canMove: false, canClaim: false, idle: false, countdown: cd, words };
+  }
+  const waitsFor = game.phase === Phase.Player ? "player" : "dealer";
   const canClaim = waitsFor === "dealer" && cd.passed;
   const idle = waitsFor === "player" && cd.passed;
   const canMove = mine && waitsFor === "player";
   let words: string;
   if (waitsFor === "dealer") {
     if (canClaim) words = "The dealer ran out of time. The hand can be claimed for the player.";
-    else words = `Waiting for the dealer… It has ${cd.words} left to reveal ${game.phase === Phase.Deal ? "the deal" : "the next card"}.`;
+    else words = `${game.phase === Phase.Deal && !game.table ? "Seed revealed. " : ""}Waiting for the dealer… It has ${cd.words} left to reveal ${game.phase === Phase.Deal ? "the deal" : "the next card"}.`;
   } else if (idle) words = `${mine ? "Your" : "The player's"} time to move ran out. The hand stands by itself: anyone can trigger that, and the dealer then finishes it.${mine ? " Until someone does, you can still move." : ""}`;
   else words = `${mine ? "Your move: hit or stand. You have" : "The player's move. They have"} ${cd.words} left. After that the hand stands by itself.`;
-  return { mine, waitsFor, canMove, canClaim, idle, countdown: cd, words };
+  return { mine, waitsFor, seedLate: false, canMove, canClaim, idle, countdown: cd, words };
 }
 
 /** What the table shows for a player, from their record and their open hand's. */
@@ -230,14 +243,18 @@ export function seatOf(player: PlayerRecord, game: Game | null): Seat {
 
 /** What this browser keeps about a hand it bet: the seed it made, and what the bet's receipt said. */
 export interface StoredHand {
-  /** The client seed: 32 random bytes, hex. */
+  /** The client seed: 32 random bytes, hex. Only this browser has it until the hand's second transaction reveals it. */
   seed: string;
+  /** What the bet committed to: the hash of the betting account and the seed. */
+  seedHash?: string;
   /** The hand's id, once the bet's receipt gave it. */
   game?: string;
   /** The commitment the bet took (its `bet` event). */
   commit?: string;
   /** The bet's transaction. */
   betTx?: string;
+  /** The newest transaction this page signed to reveal the seed. Until the hand has its seed, it hasn't landed. */
+  revealTx?: string;
   /** Every transaction of the hand this page sent, the bet first. */
   txs: string[];
   /** When the seed was made (ms). */
@@ -270,9 +287,11 @@ function cleanHand(h: unknown): StoredHand | null {
   if (!isHash(o.seed)) return null;
   return {
     seed: o.seed,
+    ...(isHash(o.seedHash) ? { seedHash: o.seedHash } : {}),
     ...(typeof o.game === "string" && /^\d{1,20}$/.test(o.game) ? { game: o.game } : {}),
     ...(isHash(o.commit) ? { commit: o.commit } : {}),
     ...(isHash(o.betTx) ? { betTx: o.betTx } : {}),
+    ...(isHash(o.revealTx) ? { revealTx: o.revealTx } : {}),
     txs: Array.isArray(o.txs) ? o.txs.filter(isHash).slice(0, 64) : [],
     at: typeof o.at === "number" && Number.isFinite(o.at) ? o.at : 0,
   };
@@ -321,13 +340,38 @@ export function seedUsed(storage: KeyValue | null, key: string, seed: string): b
   return s.pending.some((h) => h.seed === seed) || Object.values(s.hands).some((h) => h.seed === seed);
 }
 
-/** Keeps a seed made for a bet that's about to be reviewed. Throws if this browser used it before. */
-export function rememberSeed(storage: KeyValue | null, key: string, seed: string, now: number): void {
+/**
+ * Keeps a seed made for a bet that's about to be reviewed, with the hash the bet will carry
+ * (`seedHash(account, seed)`). The bet sends only the hash: the seed must still be here to be
+ * revealed once the bet is in a block. Throws if this browser used the seed before.
+ */
+export function rememberSeed(storage: KeyValue | null, key: string, seed: string, now: number, hash?: string): void {
   if (!isHash(seed)) throw new Error("a seed is 32 bytes of hex");
   if (seedUsed(storage, key, seed)) throw new Error("This seed was used before. A new one is made for every bet.");
   const s = readStore(storage, key);
-  s.pending.push({ seed, txs: [], at: now });
+  s.pending.push({ seed, ...(isHash(hash) ? { seedHash: hash } : {}), txs: [], at: now });
   writeStore(storage, key, s);
+}
+
+/** Whether a stored hand's seed is the one `account`'s bet committed to with `hash`. Recomputed, never taken from what was stored. */
+function opens(h: StoredHand, account: string, hash: string): boolean {
+  try {
+    return seedHash(account, h.seed) === hash;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The seed this browser holds for a bet `account` placed with `hash`, among the hands it filed
+ * and the seeds still waiting for theirs; null when it holds none (the bet was placed elsewhere,
+ * or this browser's storage was cleared). This is how a page that was closed between a bet's two
+ * transactions finds the seed to reveal.
+ */
+export function storedSeedFor(storage: KeyValue | null, key: string, account: string, hash: string): StoredHand | null {
+  if (!isHash(hash)) return null;
+  const s = readStore(storage, key);
+  return Object.values(s.hands).find((h) => opens(h, account, hash)) ?? s.pending.find((h) => opens(h, account, hash)) ?? null;
 }
 
 /** Notes the bet's transaction beside its seed, as soon as it's signed (before the node answers). */
@@ -341,13 +385,13 @@ export function noteBetTx(storage: KeyValue | null, key: string, seed: string, t
 }
 
 /** Files a seed under its hand, with the commitment the bet took, once the bet's receipt is read. */
-export function bindBet(storage: KeyValue | null, key: string, seed: string, bet: { game: bigint; commit?: string; txId?: string }): void {
+export function bindBet(storage: KeyValue | null, key: string, seed: string, bet: { game: bigint; commit?: string; txId?: string; seedHash?: string | null }): void {
   const s = readStore(storage, key);
   const i = s.pending.findIndex((h) => h.seed === seed);
   const id = bet.game.toString();
   const from = i >= 0 ? s.pending.splice(i, 1)[0] : (s.hands[id]?.seed === seed ? s.hands[id] : { seed, txs: [], at: 0 });
   const betTx = bet.txId ?? from.betTx;
-  s.hands[id] = { ...from, seed, game: id, ...(isHash(bet.commit) ? { commit: bet.commit } : {}), ...(betTx ? { betTx } : {}), txs: betTx ? [betTx, ...from.txs.filter((t) => t !== betTx && t !== from.betTx)] : from.txs };
+  s.hands[id] = { ...from, seed, game: id, ...(isHash(bet.seedHash) ? { seedHash: bet.seedHash } : {}), ...(isHash(bet.commit) ? { commit: bet.commit } : {}), ...(betTx ? { betTx } : {}), txs: betTx ? [betTx, ...from.txs.filter((t) => t !== betTx && t !== from.betTx)] : from.txs };
   writeStore(storage, key, s);
 }
 
@@ -360,12 +404,28 @@ export function addHandTx(storage: KeyValue | null, key: string, game: bigint, t
   writeStore(storage, key, s);
 }
 
+/** Notes the transaction that reveals hand `game`'s seed, as soon as it's signed, beside the hand's others. */
+export function noteRevealTx(storage: KeyValue | null, key: string, game: bigint, txId: string): void {
+  const s = readStore(storage, key);
+  const h = s.hands[game.toString()];
+  if (!h || !isHash(txId)) return;
+  h.revealTx = txId;
+  if (!h.txs.includes(txId)) h.txs.push(txId);
+  writeStore(storage, key, s);
+}
+
 /**
  * What this browser kept for hand `game`, only if its seed is the one the chain recorded for that
  * hand (`clientSeed`): a hand with the same id on another chain, or one bet elsewhere, isn't it.
  * A seed still waiting for its hand counts too (the bet's receipt wasn't read: `commit` is unset).
+ * While the chain has only the seed's hash (`clientSeed` is null: the hand waits for its seed, or
+ * ended without it), the hand is found by that hash and the account that bet (`by`).
  */
-export function storedHand(storage: KeyValue | null, key: string, game: bigint, clientSeed: string): StoredHand | null {
+export function storedHand(storage: KeyValue | null, key: string, game: bigint, clientSeed: string | null, by?: { account: string; seedHash: string | null }): StoredHand | null {
+  if (clientSeed === null) {
+    const found = by && by.seedHash ? storedSeedFor(storage, key, by.account, by.seedHash) : null;
+    return found ? { ...found, seedHash: by!.seedHash!, game: game.toString() } : null;
+  }
   const s = readStore(storage, key);
   const h = s.hands[game.toString()];
   if (h && h.seed === clientSeed) return h;
@@ -393,7 +453,14 @@ export interface HandCheck {
   /** What doesn't fit, when something doesn't. */
   problem: string | null;
   game: bigint;
-  clientSeed: string;
+  /** The player's seed; null while it isn't revealed (or never was). */
+  clientSeed: string | null;
+  /** The hash the bet committed to, when the chain or this browser has it. */
+  seedHash: string | null;
+  /** Whether the seed was checked against the hash this browser's bet carried: `unknown` when this browser doesn't hold that hash. */
+  seedCheck: "matches" | "unknown";
+  /** The seed isn't revealed: the hand waits for it (nothing to check yet), or ended without it (no card was ever dealt). */
+  unrevealed: boolean;
   /** Whether the seed is the one this browser made for the hand. */
   seed: "yours" | "unknown";
   /** The commitment the links hash down to. */
@@ -429,7 +496,11 @@ function stepsOf(links: readonly string[], cards: readonly number[], nPlayer: nu
 
 interface CheckInput {
   game: bigint;
-  clientSeed: string;
+  /** The account whose hand it is, when known: the seed is checked against the hash its bet carried. */
+  player?: string;
+  clientSeed: string | null;
+  /** The hash the chain holds in the seed's place (a hand without its seed). */
+  seedHash?: string | null;
   link: string;
   dealt: number;
   nPlayer: number;
@@ -441,31 +512,42 @@ interface CheckInput {
 }
 
 function check(input: CheckInput, stored: StoredHand | null | undefined): HandCheck {
-  const kept = stored && stored.seed === input.clientSeed ? stored : null;
-  const base = { game: input.game, clientSeed: input.clientSeed, seed: kept ? ("yours" as const) : ("unknown" as const), stake: input.stake, outcome: input.outcome ?? null, payout: input.payout ?? null };
+  // The stored hand is this one's when its seed is the chain's, or (while the chain has only the hash) when it opens that hash.
+  const kept = !stored ? null : input.clientSeed !== null ? (stored.seed === input.clientSeed ? stored : null) : input.seedHash && input.player && opens(stored, input.player, input.seedHash) ? stored : null;
+  const hash = input.clientSeed === null ? (input.seedHash ?? null) : (kept?.seedHash ?? null);
+  const base = { game: input.game, clientSeed: input.clientSeed, seedHash: hash, unrevealed: input.clientSeed === null, seed: kept ? ("yours" as const) : ("unknown" as const), stake: input.stake, outcome: input.outcome ?? null, payout: input.payout ?? null };
   try {
-    const v = verifyHand({ game: input.game, clientSeed: input.clientSeed, link: input.link, dealt: input.dealt, nPlayer: input.nPlayer, commit: kept?.commit, outcome: input.outcome, stake: input.outcome !== undefined ? input.stake : undefined, payout: input.payout });
+    const v = verifyHand({ game: input.game, clientSeed: input.clientSeed, seedHash: kept?.seedHash, player: input.player, link: input.link, dealt: input.dealt, nPlayer: input.nPlayer, commit: kept?.commit, outcome: input.outcome, stake: input.outcome !== undefined ? input.stake : undefined, payout: input.payout });
     if (input.shown && !(same(v.player, input.shown.player) && same(v.dealer, input.shown.dealer))) throw new Error("the cards on the table aren't the ones the links give");
     const commitCheck = kept?.commit ? "matches" : "unknown";
-    const verdict =
-      commitCheck === "matches"
-        ? `Verified. Every card comes from the dealer's commitment and ${kept ? "your" : "the player's"} seed.`
-        : "The cards fit the links and the seed. This browser doesn't hold the commitment from the bet, so that last step isn't checked here.";
-    return { ...base, ok: true, problem: null, commit: v.commit, commitCheck, steps: stepsOf(v.links, v.cards, v.player.length), player: v.player, dealer: v.dealer, playerTotal: v.playerTotal, dealerTotal: v.dealerTotal, forfeited: v.forfeited, verdict };
+    const seedCheck = v.seedChecked ? "matches" : "unknown";
+    let verdict: string;
+    if (input.clientSeed === null)
+      verdict =
+        input.outcome === undefined
+          ? "Nothing to check yet. No card is dealt until the seed is revealed. So far the chain holds only the seed's hash."
+          : "Verified. No cards were dealt: the seed was never revealed, so the bet went to the house.";
+    else if (commitCheck === "matches") verdict = `Verified. Every card comes from the dealer's commitment and ${kept ? "your" : "the player's"} seed.${seedCheck === "matches" ? " The seed is the one the bet committed to." : ""}`;
+    else verdict = "The cards fit the links and the seed. This browser doesn't hold the commitment from the bet, so that last step isn't checked here.";
+    return { ...base, seedCheck, ok: true, problem: null, commit: v.commit, commitCheck, steps: stepsOf(v.links, v.cards, v.player.length), player: v.player, dealer: v.dealer, playerTotal: v.playerTotal, dealerTotal: v.dealerTotal, forfeited: v.forfeited, verdict };
   } catch (e) {
     const problem = e instanceof Error ? e.message : String(e);
-    return { ...base, ok: false, problem, commit: null, commitCheck: "unknown", steps: [], player: [], dealer: [], playerTotal: 0, dealerTotal: 0, forfeited: false, verdict: `Not verified: ${problem}.` };
+    return { ...base, seedCheck: "unknown", ok: false, problem, commit: null, commitCheck: "unknown", steps: [], player: [], dealer: [], playerTotal: 0, dealerTotal: 0, forfeited: false, verdict: `Not verified: ${problem}.` };
   }
 }
 
 /** The check of an open hand, from its record: every card so far recomputed and held to the cards the record shows. */
 export function checkOpenHand(game: Game, stored?: StoredHand | null): HandCheck {
-  return check({ game: game.id, clientSeed: game.clientSeed, link: game.link, dealt: game.dealt, nPlayer: game.playerCards.length, stake: game.stake, shown: { player: game.playerCards, dealer: game.dealerCards } }, stored);
+  return check({ game: game.id, player: game.player, clientSeed: game.clientSeed, seedHash: game.seedHash, link: game.link, dealt: game.dealt, nPlayer: game.playerCards.length, stake: game.stake, shown: { player: game.playerCards, dealer: game.dealerCards } }, stored);
 }
 
-/** The check of a settled hand, from the player's record of it: the cards, the outcome they give and what it pays. */
-export function checkSettledHand(last: LastHand, stored?: StoredHand | null): HandCheck {
-  return check({ game: last.game, clientSeed: last.clientSeed, link: last.link, dealt: last.dealt, nPlayer: last.nPlayer, stake: last.stake, outcome: last.outcome, payout: last.payout }, stored);
+/**
+ * The check of a settled hand, from the player's record of it: the cards, the outcome they give
+ * and what it pays. `player` is the account whose record it is. A hand whose seed never came has
+ * no cards: the check is that nothing was dealt and nothing was paid.
+ */
+export function checkSettledHand(last: LastHand, stored?: StoredHand | null, player?: string): HandCheck {
+  return check({ game: last.game, player, clientSeed: last.clientSeed, seedHash: last.seedHash, link: last.link, dealt: last.dealt, nPlayer: last.nPlayer, stake: last.stake, outcome: last.outcome, payout: last.payout }, stored);
 }
 
 /** "A♠ 10♥ (blackjack)" style: a hand's cards as text. */
@@ -496,6 +578,8 @@ export function logLine(e: TableEvent, me: string | null): string | null {
   switch (e.name) {
     case "bet":
       return `${who(e.player)} bet ${fangText(e.stake)}. Hand ${e.game}.`;
+    case "seed":
+      return e.player === me ? "You revealed your seed." : "The player revealed their seed.";
     case "hit":
       return `${who(e.player)} hit.`;
     case "stand":

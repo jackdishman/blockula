@@ -56,6 +56,9 @@ interface FakePlayer {
 }
 
 interface FakeGame extends Game {
+  /** A relayed hand's seed is derived at the bet: it never waits for one (`Phase.Seed`). */
+  clientSeed: string;
+  seedHash: null;
   hand: Hand;
   chain: string[];
   /** The block the dealer reveals in, or `null` when it owes nothing or never will. */
@@ -294,13 +297,13 @@ export class FakeTable implements TableDriver {
     this.games.delete(g.id);
     const p = this.rec(g.player);
     p.openGame = null;
-    p.last = { game: g.id, outcome, dealt: g.hand.dealt, nPlayer: g.hand.player.length, stake: g.stake, payout: pays, clientSeed: g.clientSeed, link: g.link };
+    p.last = { game: g.id, outcome, dealt: g.hand.dealt, nPlayer: g.hand.player.length, stake: g.stake, payout: pays, clientSeed: g.clientSeed, seedHash: null, link: g.link };
     if (pays > 0n) {
       p.balance += pays;
       h.table += pays;
       this.led(g.player).paid += pays;
     }
-    const ev = { name: "settled" as const, game: g.id, player: g.player, outcome, stake: g.stake, payout: pays, toTable: pays > 0n, dealt: g.hand.dealt, nPlayer: g.hand.player.length, clientSeed: g.clientSeed, link: g.link, playerTotal: total(g.hand.player).total, dealerTotal: total(g.hand.dealer).total };
+    const ev = { name: "settled" as const, game: g.id, player: g.player, outcome, stake: g.stake, payout: pays, toTable: pays > 0n, dealt: g.hand.dealt, nPlayer: g.hand.player.length, clientSeed: g.clientSeed, seedHash: null, link: g.link, playerTotal: total(g.hand.player).total, dealerTotal: total(g.hand.dealer).total };
     this.settledHands.push(ev);
     return ev;
   }
@@ -367,7 +370,7 @@ export class FakeTable implements TableDriver {
     this.sync();
     const g = this.games.get(id);
     if (!g) return null;
-    return { id: g.id, player: g.player, stake: g.stake, clientSeed: g.clientSeed, link: g.link, deadline: g.deadline, postId: g.postId, phase: g.phase, table: g.table, dealt: g.dealt, playerCards: [...g.playerCards], dealerCards: [...g.dealerCards], playerTotal: g.playerTotal, dealerTotal: g.dealerTotal };
+    return { id: g.id, player: g.player, stake: g.stake, clientSeed: g.clientSeed, seedHash: null, link: g.link, deadline: g.deadline, postId: g.postId, phase: g.phase, table: g.table, dealt: g.dealt, playerCards: [...g.playerCards], dealerCards: [...g.dealerCards], playerTotal: g.playerTotal, dealerTotal: g.dealerTotal };
   }
 
   async granted(): Promise<string[]> {
@@ -424,12 +427,12 @@ export class FakeTable implements TableDriver {
       p.wagered = wagered;
       p.openGame = id;
       const seed = relaySeed(player, postId);
-      const g: FakeGame = { id, player, stake: amount, clientSeed: seed, link: chain[0], deadline: 0n, postId, phase: Phase.Deal, table: true, dealt: 0, playerCards: [], dealerCards: [], playerTotal: 0, dealerTotal: 0, hand: new Hand(), chain, revealAt: null };
+      const g: FakeGame = { id, player, stake: amount, clientSeed: seed, seedHash: null, link: chain[0], deadline: 0n, postId, phase: Phase.Deal, table: true, dealt: 0, playerCards: [], dealerCards: [], playerTotal: 0, dealerTotal: 0, hand: new Hand(), chain, revealAt: null };
       this.games.set(id, g);
       this.owes(g);
       this.maxOpenPerPlayer = Math.max(this.maxOpenPerPlayer, [...this.games.values()].filter((x) => x.player === player).length);
       return [
-        { name: "bet", game: id, player, stake: amount, clientSeed: seed, commit: chain[0], deadline: g.deadline, table: true, postId },
+        { name: "bet", game: id, player, stake: amount, seedHash: null, clientSeed: seed, commit: chain[0], deadline: g.deadline, table: true, postId },
         { name: "relayed", player, relayer: this.relayer, postId, action: "bet", game: id },
       ];
     });

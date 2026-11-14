@@ -1,6 +1,7 @@
 // The table on a real node, through the SDK: `blockula dev --programs` (or BLOCKULA_RPC on any
-// local chain with programs on and a faucet). Creates a table, plays hands from an account and
-// through a relayer, lets a dealer and a player run out of time, and checks after every step that
+// local chain with programs on and a faucet). Creates a table, plays hands from an account (a bet
+// in two transactions: the seed's hash, then the seed) and through a relayer, lets a dealer and a
+// player run out of time, lets a seed never come, and checks after every step that
 // the program's balance is bankroll + reserved + stakes + table and that every card recomputes.
 //
 //   BLOCKULA_HOME=$(mktemp -d) blockula dev --programs --port 38100 &
@@ -9,7 +10,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Client, ProgramFailedError, Wallet } from "@blockula/sdk";
-import { DEFAULT_LIMITS, DROPS_PER_FANG, Outcome, Phase, Table, call, chainFromTop, createTable, decodeGame, decodeGameId, decodeHouse, decodeLimits, decodePlayer, decodeStep, eventNamed, eventsOf, input, owedLinks, payout, relaySeed, send, toHex, verifyHand, viewBytes, type Game, type TableCall } from "../src/index.js";
+import { DEFAULT_LIMITS, DROPS_PER_FANG, Outcome, Phase, Table, call, chainFromTop, createTable, decodeGame, decodeGameId, decodeHouse, decodeLimits, decodePlayer, decodeStep, eventNamed, eventsOf, input, owedLinks, payout, relaySeed, seedHash, send, toHex, verifyHand, viewBytes, type Game, type TableCall } from "../src/index.js";
 
 const RPC = process.env.BLOCKULA_RPC;
 if (!RPC) {
@@ -67,7 +68,10 @@ assert.deepEqual({ ...decodeHouse(houseView.slice(0, 228), table.prefix), height
 
 // ---- the owner: quick deadlines for this test, a bankroll, a relayer ----
 await refused(alice, call.setLimits(DEFAULT_LIMITS), 42, "limits by a stranger");
-const limits = { ...DEFAULT_LIMITS, revealBlocks: 6n, idleBlocks: 8n };
+await refused(owner, call.setLimits({ ...DEFAULT_LIMITS, idleBlocks: 19n }), 45, "a move the player can't make in time");
+await refused(owner, call.setLimits({ ...DEFAULT_LIMITS, seedBlocks: 19n }), 45, "a seed's reveal the player can't make in time");
+await refused(owner, call.setLimits({ ...DEFAULT_LIMITS, revealBlocks: 86_401n }), 45, "a dealer that may stall for good");
+const limits = { ...DEFAULT_LIMITS, revealBlocks: 6n, idleBlocks: 20n, seedBlocks: 20n };
 await go(owner, call.setLimits(limits));
 assert.deepEqual(await table.limits(), limits);
 await go(owner, call.fund(300n * FANG));
@@ -110,19 +114,41 @@ async function playOut(id: bigint, move: (hit: boolean) => Promise<unknown>) {
   }
 }
 
-// ---- a hand from an account ----
+/** A bet from `w`'s account, both transactions: the seed's hash with the stake, then the seed. The hand's id. */
+async function betFrom(w: Wallet, stake: bigint, seed: string): Promise<bigint> {
+  const placed = await go(w, call.bet(stake, seedHash(w.address, seed)));
+  const game = decodeGameId(placed.receipt.claims.return_data[0].data);
+  await go(w, call.revealSeed(game, seed));
+  return game;
+}
+
+// ---- a hand from an account: the bet commits to the seed's hash, the seed follows ----
 await refused(alice, call.bet(FANG - 1n, "11".repeat(32)), 47, "a bet under the minimum");
 await refused(alice, call.bet(16n * FANG, "11".repeat(32)), 48, "a bet over a twentieth of the bankroll");
 const seed = toHex(randomBytes(32));
 const before = await balanceOf(alice.address);
-let r = await go(alice, call.bet(2n * FANG, seed));
+let r = await go(alice, call.bet(2n * FANG, seedHash(alice.address, seed)));
 const id = decodeGameId(r.receipt.claims.return_data[0].data);
 const bet = eventNamed(eventsOf(r.receipt, program), "bet")!;
-assert.deepEqual([bet.game, bet.player, bet.stake, bet.clientSeed, bet.commit, bet.table], [id, alice.address, 2n * FANG, seed, chains.get(id)![0], false]);
+assert.deepEqual([bet.game, bet.player, bet.stake, bet.seedHash, bet.clientSeed, bet.commit, bet.table], [id, alice.address, 2n * FANG, seedHash(alice.address, seed), null, chains.get(id)![0], false]);
 h = await invariant("bet");
 assert.deepEqual([h.reserved, h.stakes, h.open], [3n * FANG, 2n * FANG, 1]);
 assert.deepEqual(await table.openGames(), [id]);
-await refused(alice, call.bet(FANG, seed), 52, "a second hand");
+// The hand waits for its seed: the chain holds the hash, not the seed, and the dealer owes nothing.
+let waiting = (await table.game(id)) as Game;
+assert.deepEqual([waiting.phase, waiting.clientSeed, waiting.seedHash, waiting.link], [Phase.Seed, null, seedHash(alice.address, seed), chains.get(id)![0]]);
+assert.deepEqual(owedLinks(waiting, chains.get(id)!), []);
+await refused(dealer, call.reveal(id, [chains.get(id)![1]]), 57, "a card before the seed");
+await refused(alice, call.revealSeed(id, toHex(randomBytes(32))), 71, "a seed that isn't the committed one");
+await refused(bob, call.revealSeed(id, seed), 55, "the right seed from another account");
+await refused(alice, call.bet(FANG, seedHash(alice.address, seed)), 52, "a second hand");
+r = await go(alice, call.revealSeed(id, seed));
+const opened = eventNamed(eventsOf(r.receipt, program), "seed")!;
+assert.deepEqual([opened.game, opened.player, opened.clientSeed], [id, alice.address, seed]);
+waiting = (await table.game(id)) as Game;
+assert.deepEqual([waiting.phase, waiting.clientSeed, waiting.seedHash, waiting.deadline], [Phase.Deal, seed, null, opened.deadline]);
+await refused(alice, call.revealSeed(id, seed), 70, "a second seed");
+await invariant("seed revealed");
 await refused(bob, call.hit(id), 55, "another account's move");
 await refused(dealer, call.reveal(id, ["00".repeat(32)]), 58, "a link that isn't the chain's");
 // The view of the hand is its stored record and its totals.
@@ -137,13 +163,14 @@ const settled = await (async () => {
   return playOut(id, (hit) => go(alice, hit ? call.hit(id) : call.stand(id)));
 })();
 // Every card recomputes from the settled event alone, down to the bet's commitment.
-const proof = verifyHand({ ...settled, commit: bet.commit });
+const proof = verifyHand({ ...settled, commit: bet.commit, seedHash: bet.seedHash });
+assert.equal(proof.seedChecked, true, "the seed is the one the bet committed to");
 assert.equal(proof.outcome ?? settled.outcome, settled.outcome);
 assert.equal(settled.payout, payout(2n * FANG, settled.outcome));
 assert.equal(settled.toTable, false);
 // The player's record keeps the same hand; the view of it agrees.
 const rec = await table.player(alice.address);
-assert.deepEqual(rec.last, { game: id, outcome: settled.outcome, dealt: settled.dealt, nPlayer: settled.nPlayer, stake: settled.stake, payout: settled.payout, clientSeed: seed, link: settled.link });
+assert.deepEqual(rec.last, { game: id, outcome: settled.outcome, dealt: settled.dealt, nPlayer: settled.nPlayer, stake: settled.stake, payout: settled.payout, clientSeed: seed, seedHash: null, link: settled.link });
 assert.deepEqual(decodePlayer(viewBytes(await view("player", input.player(alice.address))).slice(0, 390), table.prefix), rec);
 assert.equal(await table.game(id), null);
 h = await invariant("settled");
@@ -184,9 +211,28 @@ h = await invariant("relayed hand");
 assert.equal(h.table, 0n);
 console.log(`✓ a relayed hand: seed from post ${post}, outcome ${rsettled.outcome}, paid to the table balance and withdrawn to its depositor`);
 
+// ---- a seed that never comes: the stake is the house's ----
+const withheld = toHex(randomBytes(32));
+r = await go(alice, call.bet(2n * FANG, seedHash(alice.address, withheld)));
+const unopened = decodeGameId(r.receipt.claims.return_data[0].data);
+const unopenedBet = eventNamed(eventsOf(r.receipt, program), "bet")!;
+h = await invariant("a bet waiting for its seed");
+const bankrollBefore = h.bankroll;
+await refused(bob, call.timeout(unopened), 60, "a timeout before the seed's deadline");
+await waitPast(unopenedBet.deadline);
+await refused(alice, call.revealSeed(unopened, withheld), 72, "a seed past its deadline");
+r = await go(bob, call.timeout(unopened));
+assert.deepEqual(decodeStep(r.receipt.claims.return_data[0].data), { phase: Phase.Done, outcome: Outcome.NoSeed });
+const lost = eventNamed(eventsOf(r.receipt, program), "settled")!;
+assert.deepEqual([lost.outcome, lost.payout, lost.dealt, lost.clientSeed, lost.seedHash, lost.link], [Outcome.NoSeed, 0n, 0, null, unopenedBet.seedHash, unopenedBet.commit]);
+assert.equal(verifyHand({ ...lost, commit: unopenedBet.commit }).unrevealed, true);
+h = await invariant("seed timeout");
+assert.deepEqual([h.bankroll, h.reserved, h.stakes, h.open], [bankrollBefore + 3n * FANG + 2n * FANG, 0n, 0n, 0], "the stake and the freed reserve are the bankroll's");
+await refused(alice, call.revealSeed(unopened, withheld), 54, "a seed for a hand that's over");
+console.log("✓ a seed that never came: the stake went to the house by timeout, and the seat is free");
+
 // ---- a dealer that never deals: the player wins ----
-r = await go(alice, call.bet(2n * FANG, toHex(randomBytes(32))));
-const stalled = decodeGameId(r.receipt.claims.return_data[0].data);
+const stalled = await betFrom(alice, 2n * FANG, toHex(randomBytes(32)));
 let g = (await table.game(stalled)) as Game;
 await refused(bob, call.timeout(stalled), 60, "a timeout before the deadline");
 await waitPast(g.deadline);
@@ -204,8 +250,7 @@ console.log("✓ a dealer that never dealt: the player was paid 2.5 × by timeou
 // ---- a player who never moves: they stand, and the dealer finishes ----
 let idle = 0n;
 for (;;) {
-  r = await go(alice, call.bet(FANG, toHex(randomBytes(32))));
-  idle = decodeGameId(r.receipt.claims.return_data[0].data);
+  idle = await betFrom(alice, FANG, toHex(randomBytes(32)));
   if ((await deal(idle)).outcome === null) break; // not a natural: it's the player's turn
 }
 g = (await table.game(idle)) as Game;
@@ -223,7 +268,7 @@ console.log("✓ an idle player stood by timeout and the dealer finished the han
 // ---- a pause stops new bets only ----
 await go(bob, call.deposit(5n * FANG));
 await go(owner, call.pause(true));
-await refused(alice, call.bet(FANG, seed), 46, "a bet while paused");
+await refused(alice, call.bet(FANG, seedHash(alice.address, seed)), 46, "a bet while paused");
 await go(bob, call.withdraw(5n * FANG));
 await go(owner, call.pause(false));
 

@@ -10,15 +10,20 @@
 #   1. creates the table, funds the bankroll, sets limits for a fast test and approves a relayer;
 #   2. starts the dealer daemon (its key, secret and store in the temporary directory);
 #   3. plays HANDS hands from 5 accounts at once (3 signing their own bets and moves, 2 through
-#      the relayer from their table balances) and verifies every settled hand from its `settled`
-#      event down to the commitment in its `bet` event;
+#      the relayer from their table balances). A bet from an account is two transactions: `bet`
+#      with the stake and the hash of the player's seed, then `reveal_seed` once that is final;
+#      the daemon deals only after the seed is on the chain. Every settled hand is verified from
+#      its `settled` event down to the commitment in its `bet` event, and its seed against the
+#      hash the bet committed to;
 #   4. checks at every new block that the program's balance is bankroll + reserved + stakes + table
 #      and that `reserved` and `stakes` are the open hands' sums;
 #   5. kills the daemon with SIGKILL and restarts it twice (once with hands mid-play): no hand may
 #      stall or be forfeited;
-#   6. stops the daemon, bets, lets the reveal deadline pass and has another account call
-#      `timeout`: the player is paid 3:2 from the hand's reserve; then an idle player is stood by
-#      the daemon's own `timeout`;
+#   6. stops the daemon, bets and reveals the seed, lets the dealer's deadline pass and has
+#      another account call `timeout`: the player is paid 3:2 from the hand's reserve; then an
+#      idle player is stood by the daemon's own `timeout`; then three bets never reveal their
+#      seed: the daemon deals none of them and its own `timeout` ends each past the seed's
+#      deadline, the stake going to the bankroll (outcome 8);
 #   7. checks the caps: min bet, max bet, the bankroll's share, the daily limit (and its reset),
 #      the open hands limit, and a pause (bets refused, settlement, timeout and withdraw still work);
 #   8. ends with no open hand, the whole bankroll back with the owner, and all four validators
@@ -26,7 +31,7 @@
 #
 #   scripts/blackjack-e2e.sh                 # 1,000 hands, about 10 minutes
 #   HANDS=60 scripts/blackjack-e2e.sh        # a quick run, about 3 minutes
-#   TEST=live scripts/blackjack-e2e.sh       # the dealer's live test (test/live.ts) on the same chain
+#   TEST=live scripts/blackjack-e2e.sh       # the dealer's live test (test/live.ts) on the same chain, 30 hands
 #   KEEP=1 scripts/blackjack-e2e.sh          # keep the directory (it's printed) and every log
 #   HOLD=1 scripts/blackjack-e2e.sh          # only start the chain and wait (Ctrl-C stops it)
 #   BIN=… BLOCK_MS=400 BASE_PORT=38300 VALIDATORS=4 scripts/blackjack-e2e.sh
@@ -34,11 +39,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BIN=${BIN:-node/target/release/blockula}
-HANDS=${HANDS:-1000}
+TEST=${TEST:-soak}
+# The soak plays 1,000 hands; the dealer's live test 30 (more would pass an account's daily limit).
+if [[ "$TEST" == live ]]; then HANDS=${HANDS:-30}; else HANDS=${HANDS:-1000}; fi
 BLOCK_MS=${BLOCK_MS:-400}
 BASE_PORT=${BASE_PORT:-38300}
 VALIDATORS=${VALIDATORS:-4}
-TEST=${TEST:-soak}
 DIR=${DIR:-$(mktemp -d "${TMPDIR:-/tmp}/blockula-blackjack.XXXXXX")}
 DEALER=services/blackjack/dealer
 export BLOCKULA_HOME="$DIR/cli"

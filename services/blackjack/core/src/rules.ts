@@ -105,15 +105,15 @@ export const natural = (cards: readonly number[]): boolean => cards.length === 2
 export const mayBeNatural = (upcard: number): boolean => points(upcard) === 1 || points(upcard) === 10;
 
 /** How a hand ended: the program's numbers. */
-export const Outcome = { Blackjack: 1, Win: 2, Push: 3, Lose: 4, Bust: 5, Forfeit: 6, ForfeitDeal: 7 } as const;
+export const Outcome = { Blackjack: 1, Win: 2, Push: 3, Lose: 4, Bust: 5, Forfeit: 6, ForfeitDeal: 7, NoSeed: 8 } as const;
 export type Outcome = (typeof Outcome)[keyof typeof Outcome];
 
 export function isOutcome(n: number): n is Outcome {
-  return Number.isInteger(n) && n >= 1 && n <= 7;
+  return Number.isInteger(n) && n >= 1 && n <= 8;
 }
 
 /** A hand's phase: the program's numbers. */
-export const Phase = { Deal: 1, Player: 2, Hit: 3, Dealer: 4, Done: 5 } as const;
+export const Phase = { Seed: 0, Deal: 1, Player: 2, Hit: 3, Dealer: 4, Done: 5 } as const;
 export type Phase = (typeof Phase)[keyof typeof Phase];
 
 /** Whether the next move is the dealer's: a link to reveal. */
@@ -135,8 +135,22 @@ export function payout(stake: bigint, outcome: Outcome): bigint {
       return stake;
     case Outcome.Lose:
     case Outcome.Bust:
+    case Outcome.NoSeed:
       return 0n;
   }
+}
+
+/**
+ * What a bet commits to: BLAKE3("blockula/blackjack/seed" ‖ player (32 bytes) ‖ client seed (32
+ * bytes)), as hex. The player's account is part of it, so a hash copied into another account's
+ * bet can't be opened there. `player` is the account's 32 bytes as hex.
+ */
+export function seedHashOf(playerHex: string, clientSeed: string): string {
+  const pre = new Uint8Array(87);
+  pre.set(new TextEncoder().encode("blockula/blackjack/seed"), 0);
+  pre.set(hexBytes(playerHex, 32), 23);
+  pre.set(hexBytes(clientSeed, 32), 55);
+  return hex(blake3(pre));
 }
 
 /** Final hands compared (the dealer's as far as it was played). */
@@ -154,11 +168,26 @@ export type Step = { kind: "more" } | { kind: "player" } | { kind: "settled"; ou
 
 /** One hand: the cards on the table and whose move it is, as `bj_core::Hand`. */
 export class Hand {
+  /** A new hand's seed is known and the dealer owes the deal; `Hand.committed()` is one whose seed isn't revealed yet. */
   phase: Phase = Phase.Deal;
   /** Cards dealt so far: the chain index of the last. */
   dealt = 0;
   player: number[] = [];
   dealer: number[] = [];
+
+  /** A hand whose bet is placed with the hash of a seed the player hasn't revealed yet. */
+  static committed(): Hand {
+    const hand = new Hand();
+    hand.phase = Phase.Seed;
+    return hand;
+  }
+
+  /** The player revealed their seed: the dealer owes the deal. False (and nothing changes) unless the hand waited for it. */
+  seeded(): boolean {
+    if (this.phase !== Phase.Seed) return false;
+    this.phase = Phase.Deal;
+    return true;
+  }
 
   /** The player hits; false (and nothing changes) unless it's the player's turn. */
   hit(): boolean {
@@ -364,5 +393,7 @@ export function outcomeWords(o: Outcome): string {
       return "You win: the dealer ran out of time";
     case Outcome.ForfeitDeal:
       return "You win: the dealer never dealt";
+    case Outcome.NoSeed:
+      return "The bet is the house's: its seed was never revealed";
   }
 }

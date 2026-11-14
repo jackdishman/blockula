@@ -1,19 +1,25 @@
 "use client";
 
 // The blackjack table (docs/BLACKJACK.md): one hand against the dealer, played with FANG. The
-// player signs `bet`, `hit` and `stand` with their own passkey wallet, each through the wallet's
-// review-then-sign flow for program calls (components/blackjack/TableCall.tsx). A separate dealer
+// player signs `bet`, `reveal_seed`, `hit` and `stand` with their own passkey wallet, each through
+// the wallet's review-then-sign flow for program calls (components/blackjack/TableCall.tsx).
+//
+// A bet is two transactions. The first carries the stake and only the hash of a seed this browser
+// made and keeps (lib/blackjack.ts `rememberSeed`). Once it is in a block the page presents the
+// second, `reveal_seed`, by itself: on the bet's receipt, and on any later load where the player's
+// hand still waits for its seed and this browser holds the seed that opens the hand's hash. A hand
+// whose seed isn't here can't be revealed from here, and the page says so. A separate dealer
 // reveals the cards: this page only waits, shows the deadline, and offers the claim when the dealer
 // misses it. Everything on the table is read from the program's stored records, and every card can
 // be recomputed here ("Check this hand").
 import "@/app/explorer.css";
 import "./blackjack.css";
-import { call, eventNamed, eventsOf, fang, outcomeWords, snapshotOfGame, snapshotOfSettled, type Game, type LastHand, type TableEvent } from "@blockula/blackjack";
+import { Phase, call, eventNamed, eventsOf, fang, outcomeWords, seedHash, snapshotOfGame, snapshotOfSettled, type Game, type LastHand, type TableEvent } from "@blockula/blackjack";
 import { checkReceipt } from "@blockula/sdk";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CallerNote, useTableSigner, type TableSigner } from "@/components/blackjack/TableCall";
+import { CallerNote, useTableSigner, type CallRequest, type TableSigner } from "@/components/blackjack/TableCall";
 import { TableFigure } from "@/components/blackjack/TableFigure";
 import { useTable, type TableState } from "@/components/blackjack/useTable";
 import { VerifyView } from "@/components/blackjack/Verify";
@@ -35,6 +41,7 @@ import {
   maxBetNow,
   newSeed,
   noteBetTx,
+  noteRevealTx,
   parseAmount,
   payoutWords,
   rememberSeed,
@@ -49,7 +56,7 @@ import {
 import { COPY, NOTE, rulesText } from "@/lib/blackjack-copy";
 import { BLACKJACK_TABLE } from "@/lib/config";
 import { inertText } from "@/lib/explorer/inert";
-import { nodeGet } from "@/lib/explorer/node";
+import { OTHER_NODES, nodeGet } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
 import { useWallet } from "@/lib/wallet";
 
@@ -185,8 +192,42 @@ function TablePage({ address }: { address: string }) {
   const open = seat?.state === "open" ? seat.game : null;
   const last = seat?.last ?? null;
   // What this browser kept for the open hand and for the last one, re-read after each of its own writes.
-  const openKept = useMemo(() => (open ? storedHand(storage(), key, open.id, open.clientSeed) : null), [open, key, stored]);
-  const lastKept = useMemo(() => (last ? storedHand(storage(), key, last.game, last.clientSeed) : null), [last, key, stored]);
+  // While the chain has only a seed's hash, the hand's seed is found by that hash.
+  const openKept = useMemo(() => (open ? storedHand(storage(), key, open.id, open.clientSeed, { account: open.player, seedHash: open.seedHash }) : null), [open, key, stored]);
+  const lastKept = useMemo(() => (last && me ? storedHand(storage(), key, last.game, last.clientSeed, { account: me, seedHash: last.seedHash }) : null), [last, me, key, stored]);
+
+  // The hand this browser's seed belongs to is filed under its id as soon as the chain shows it,
+  // so the seed's reveal and every later move are kept with it (the bet's receipt may never have
+  // been read here).
+  const filed = useRef(new Set<string>());
+  useEffect(() => {
+    if (!open || !openKept || open.player !== me) return;
+    const id = `${key}/${open.id}`;
+    if (filed.current.has(id)) return;
+    filed.current.add(id);
+    bindBet(storage(), key, openKept.seed, { game: open.id, seedHash: open.seedHash ?? openKept.seedHash });
+    touch();
+  }, [open, openKept, me, key, touch]);
+
+  // Step 2 of 2, presented by itself: the hand waits for its seed, the seed is here, and there is
+  // still time. Once per hand; after that the hand's own button brings the review back.
+  const canSignNow = signer.caller.kind === "owner";
+  const start = useRef(signer.start);
+  start.current = signer.start;
+  const presented = useRef(new Set<string>());
+  const openId = open?.id ?? null;
+  const awaitsSeed = !!open && open.phase === Phase.Seed && open.player === me && !!openKept && BigInt(s?.house.height ?? 0) < open.deadline;
+  const reveal = useCallback(() => {
+    if (!open || !openKept) return;
+    void start.current(revealRequest(open.id, openKept.seed, key, touch));
+  }, [open, openKept, key, touch]);
+  useEffect(() => {
+    if (!awaitsSeed || openId === null || !canSignNow || signer.active || !signer.info) return;
+    const id = `${key}/${openId}`;
+    if (presented.current.has(id)) return;
+    presented.current.add(id);
+    reveal();
+  }, [awaitsSeed, openId, canSignNow, signer.active, signer.info, key, reveal]);
 
   // A bet whose receipt this page never read (it was closed, or the answer was lost): its hand is
   // found by its seed, and the commitment comes from the bet's receipt once.
@@ -200,8 +241,8 @@ function TablePage({ address }: { address: string }) {
         try {
           const receipt = checkReceipt(client.rpc, tx);
           const bet = receipt && eventNamed(eventsOf(receipt, address), "bet");
-          if (bet && bet.clientSeed === kept.seed) {
-            bindBet(storage(), key, kept.seed, { game: bet.game, commit: bet.commit, txId: kept.betTx });
+          if (bet && me && bet.seedHash === seedHash(me, kept.seed)) {
+            bindBet(storage(), key, kept.seed, { game: bet.game, commit: bet.commit, txId: kept.betTx, seedHash: bet.seedHash });
             touch();
           }
         } catch {
@@ -210,7 +251,7 @@ function TablePage({ address }: { address: string }) {
       },
       () => undefined,
     );
-  }, [open, openKept, client, address, key, touch]);
+  }, [open, openKept, me, client, address, key, touch]);
 
   if (live.error && !s)
     return (
@@ -250,18 +291,18 @@ function TablePage({ address }: { address: string }) {
             ) : seat?.state === "settling" ? (
               <Spinner>{COPY.hand.settling}</Spinner>
             ) : open ? (
-              <OpenHand game={open} me={me} myName={myName} height={height} blockMs={blockMs} adult={adult} signer={signer} kept={openKept} storeKey={key} touch={touch} tick={s} program={address} />
+              <OpenHand game={open} me={me} myName={myName} height={height} blockMs={blockMs} adult={adult} signer={signer} kept={openKept} storeKey={key} touch={touch} tick={s} program={address} reveal={reveal} />
             ) : (
               <>
                 <p className="m0 dim" data-testid="bj-no-hand">{COPY.hand.none}</p>
-                {ctx && <BetForm ctx={ctx} adult={adult} signer={signer} storeKey={key} touch={touch} canSign={canSign} />}
+                {ctx && <BetForm ctx={ctx} me={me} adult={adult} signer={signer} storeKey={key} touch={touch} canSign={canSign} />}
               </>
             )}
             {!open && signer.panel}
           </Section>
 
           <Section title={COPY.hand.lastTitle} aside={last ? <span className="dim small">hand {last.game.toString()}</span> : undefined}>
-            {last ? <LastHandView last={last} kept={lastKept} myName={myName} /> : <p className="m0 dim" data-testid="bj-no-last">{me ? COPY.hand.noLast : COPY.signIn.none}</p>}
+            {last ? <LastHandView last={last} kept={lastKept} myName={myName} me={me} /> : <p className="m0 dim" data-testid="bj-no-last">{me ? COPY.hand.noLast : COPY.signIn.none}</p>}
           </Section>
 
           {me && s.player && <BalancePanel state={s} signer={signer} adult={adult} height={height} prefix={client.pin.prefix} />}
@@ -300,7 +341,36 @@ function TablePage({ address }: { address: string }) {
   );
 }
 
-function BetForm({ ctx, adult, signer, storeKey: key, touch, canSign }: { ctx: BetContext; adult: boolean; signer: TableSigner; storeKey: string; touch: () => void; canSign: boolean }) {
+/** The second transaction of a bet: the seed this browser kept for hand `game`, for review. */
+function revealRequest(game: bigint, seed: string, key: string, touch: () => void): CallRequest {
+  return {
+    call: call.revealSeed(game, seed),
+    does: `Reveal your seed for hand ${game} (${COPY.seed.step})`,
+    waiting: COPY.seed.waiting,
+    notes: [
+      {
+        k: COPY.seed.label,
+        v: (
+          <>
+            <span className="mono break" data-testid="bj-review-seed">{seed}</span>
+            <span className="dim small block">{COPY.seed.note}</span>
+            <span className="warn small block">{COPY.seed.warn}</span>
+          </>
+        ),
+      },
+      {
+        k: COPY.seed.sentLabel,
+        v: <span className={OTHER_NODES.length ? "small" : "warn small"} data-testid="bj-review-nodes">{OTHER_NODES.length ? COPY.seed.sentMany(OTHER_NODES.length) : COPY.seed.sentOne}</span>,
+      },
+    ],
+    // The one call a node could profit from keeping to itself: it goes through every node the wallet knows.
+    everyNode: true,
+    onSigned: (id) => (noteRevealTx(storage(), key, game, id), touch()),
+    onApplied: () => touch(),
+  };
+}
+
+function BetForm({ ctx, me, adult, signer, storeKey: key, touch, canSign }: { ctx: BetContext; me: string; adult: boolean; signer: TableSigner; storeKey: string; touch: () => void; canSign: boolean }) {
   const [raw, setRaw] = useState("");
   const [touched, setTouched] = useState(false);
   const blocked = tableProblem(ctx);
@@ -310,19 +380,22 @@ function BetForm({ ctx, adult, signer, storeKey: key, touch, canSign }: { ctx: B
     setTouched(true);
     const stake = parseAmount(raw);
     if (problem || stake === null || !adult) return;
-    // A new seed for every bet, kept before anything is signed, so the hand can always be checked.
+    // A new seed for every bet, kept in this browser before anything is signed: the bet sends
+    // only its hash, and the seed must still be here to be revealed once the bet is in a block.
     const seed = newSeed();
-    rememberSeed(storage(), key, seed, Date.now());
+    const hash = seedHash(me, seed);
+    rememberSeed(storage(), key, seed, Date.now(), hash);
     touch();
     void signer.start({
-      call: call.bet(stake, seed),
-      does: `Bet ${fangText(stake)} on a new hand`,
+      call: call.bet(stake, hash),
+      does: `Bet ${fangText(stake)} on a new hand (${COPY.bet.step})`,
+      waiting: COPY.bet.waiting,
       notes: [
         {
-          k: "Your seed",
+          k: COPY.bet.seedLabel,
           v: (
             <>
-              <span className="mono break" data-testid="bj-review-seed">{seed}</span>
+              <span className="mono break" data-testid="bj-review-seed-hash">{hash}</span>
               <span className="dim small block">{COPY.bet.seed}</span>
             </>
           ),
@@ -330,8 +403,9 @@ function BetForm({ ctx, adult, signer, storeKey: key, touch, canSign }: { ctx: B
       ],
       onSigned: (id) => (noteBetTx(storage(), key, seed, id), touch()),
       onApplied: (id, events) => {
+        // Filed under its hand with the commitment it took. The page then presents the seed's reveal by itself.
         const bet = eventNamed(events, "bet");
-        if (bet && bet.clientSeed === seed) bindBet(storage(), key, seed, { game: bet.game, commit: bet.commit, txId: id });
+        if (bet && bet.seedHash === hash) bindBet(storage(), key, seed, { game: bet.game, commit: bet.commit, txId: id, seedHash: hash });
         touch();
       },
     });
@@ -357,6 +431,7 @@ function BetForm({ ctx, adult, signer, storeKey: key, touch, canSign }: { ctx: B
               </span>
             )}
           </label>
+          <span className="dim small" data-testid="bj-bet-two">{COPY.bet.two}</span>
           <span className="dim small">{COPY.bet.deposit}</span>
           {!adult && <span className="warn small" data-testid="bj-gate-needed">{COPY.gate.needed}</span>}
           {canSign ? (
@@ -372,7 +447,7 @@ function BetForm({ ctx, adult, signer, storeKey: key, touch, canSign }: { ctx: B
   );
 }
 
-function OpenHand({ game, me, myName, height, blockMs, adult, signer, kept, storeKey: key, touch, tick, program }: { game: Game; me: string; myName?: string; height: number; blockMs: number; adult: boolean; signer: TableSigner; kept: StoredHand | null; storeKey: string; touch: () => void; tick: unknown; program: string }) {
+function OpenHand({ game, me, myName, height, blockMs, adult, signer, kept, storeKey: key, touch, tick, program, reveal }: { game: Game; me: string; myName?: string; height: number; blockMs: number; adult: boolean; signer: TableSigner; kept: StoredHand | null; storeKey: string; touch: () => void; tick: unknown; program: string; reveal: () => void }) {
   const [checking, setChecking] = useState(false);
   const hs = handState(game, me, height, blockMs);
   const snapshot = useMemo(() => snapshotOfGame(game, { player: myName, txId: kept?.betTx }), [game, myName, kept?.betTx]);
@@ -385,6 +460,7 @@ function OpenHand({ game, me, myName, height, blockMs, adult, signer, kept, stor
       onSigned: (id) => (addHandTx(storage(), key, game.id, id), touch()),
     });
   const disabled = !adult || !canSign || signer.active;
+  const seedStep = hs.waitsFor === "seed" && hs.mine;
   return (
     <div className="stack" data-testid="bj-open-hand">
       <TableFigure snapshot={snapshot} mine={hs.mine} />
@@ -395,6 +471,44 @@ function OpenHand({ game, me, myName, height, blockMs, adult, signer, kept, stor
         Deadline: block {game.deadline.toLocaleString("en-US")}. The chain is at block {height.toLocaleString("en-US")}.
       </p>
       {game.table && <p className="m0 dim small">{COPY.moves.relayed}</p>}
+      {seedStep && !hs.seedLate && kept && (
+        // Step 2 of 2. The review is presented by itself; this brings it back after "Back" or a failure.
+        <div className="stack" data-testid="bj-seed-step">
+          <div className="row-gap">
+            <button className="btn primary" disabled={!canSign || signer.active} onClick={reveal} data-testid="bj-reveal">
+              {COPY.seed.reveal}
+            </button>
+            <span className="dim small">{COPY.seed.step}</span>
+          </div>
+          <span className="warn small" data-testid="bj-seed-warn">{COPY.seed.warn}</span>
+          {!canSign && <CallerNote signer={signer} />}
+        </div>
+      )}
+      {seedStep && !hs.seedLate && kept?.revealTx && !signer.active && (
+        // A reveal was signed here and the hand still has no seed: it isn't in a block.
+        <p className="warn m0" role="alert" data-testid="bj-seed-unlanded">
+          {COPY.seed.unlanded} {OTHER_NODES.length ? COPY.seed.unlandedMany(OTHER_NODES.length) : COPY.seed.unlandedOne} {COPY.seed.unlandedAgain}{" "}
+          <Link href={to.tx(kept.revealTx)} data-testid="bj-seed-unlanded-tx">
+            {COPY.seed.unlandedSee}
+          </Link>
+        </p>
+      )}
+      {seedStep && !hs.seedLate && !kept && (
+        <p className="warn m0" role="alert" data-testid="bj-seed-missing">
+          {COPY.seed.missing}
+        </p>
+      )}
+      {hs.waitsFor === "seed" && hs.seedLate && (
+        <div className="stack" data-testid="bj-seed-late">
+          {hs.mine && <p className="warn m0">{COPY.seed.late}</p>}
+          <div className="row-gap">
+            <button className="btn" disabled={!canSign || signer.active} onClick={() => move("timeout", `${COPY.seed.end}: ${COPY.seed.endDoes.toLowerCase()}`)} data-testid="bj-end">
+              {COPY.seed.end}
+            </button>
+          </div>
+          {!canSign && <CallerNote signer={signer} />}
+        </div>
+      )}
       {(hs.canMove || hs.canClaim) && (
         <div className="row-gap" data-testid="bj-moves">
           {hs.canMove && (
@@ -441,10 +555,10 @@ function OpenHand({ game, me, myName, height, blockMs, adult, signer, kept, stor
   );
 }
 
-function LastHandView({ last, kept, myName }: { last: LastHand; kept: StoredHand | null; myName?: string }) {
+function LastHandView({ last, kept, myName, me }: { last: LastHand; kept: StoredHand | null; myName?: string; me: string | null }) {
   const [checking, setChecking] = useState(false);
   // The record keeps no cards: they are recomputed here, which is the check itself.
-  const check = useMemo(() => checkSettledHand(last, kept), [last, kept]);
+  const check = useMemo(() => checkSettledHand(last, kept, me ?? undefined), [last, kept, me]);
   const snapshot = useMemo(() => (check.ok ? snapshotOfSettled(last, { player: check.player, dealer: check.dealer }, { player: myName, txId: kept?.betTx }) : null), [check, last, myName, kept?.betTx]);
   return (
     <div className="stack" data-testid="bj-last-hand">

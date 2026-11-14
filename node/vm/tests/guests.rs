@@ -36,6 +36,7 @@ const PROGRAMS: &[(&str, &[&str])] = &[
             "relay_stand",
             "relay_withdraw",
             "reveal",
+            "reveal_seed",
             "revoke",
             "set_dealer",
             "set_limits",

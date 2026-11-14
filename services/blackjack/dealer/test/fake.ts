@@ -1,7 +1,7 @@
 // A table in memory for the dealer's offline tests: the program's turns, deadlines and abort
 // codes (node/vm/guests/blackjack), without the money. It is both what the dealer reads and what
 // it sends to, and a test can make any send go wrong the ways a real one can.
-import { DEFAULT_LIMITS, Outcome, Phase, card, dealers, hexBytes, natural, payout, prevLink, total, handOf, type Game, type House, type Limits, type TableCall, type TableEvent } from "@blockula/blackjack";
+import { DEFAULT_LIMITS, Outcome, Phase, card, dealers, hexBytes, natural, payout, prevLink, seedHashOf, total, handOf, type Game, type House, type Limits, type TableCall, type TableEvent } from "@blockula/blackjack";
 import type { SendOptions, Sent, TableReader, TxSender } from "../src/dealer.js";
 
 export const DEALER = "boo1dealer";
@@ -23,10 +23,15 @@ function counted(inputHex: string): { head: bigint; items: string[] } {
   return { head: u64(b, 0), items };
 }
 
+/** What a fake player's bet commits to: the program's hash, over a stand-in for the account's bytes (these players' names aren't addresses). */
+export const fakeSeedHash = (player: string, clientSeed: string): string => seedHashOf(Buffer.from(player.padEnd(32, "\0").slice(0, 32), "latin1").toString("hex"), clientSeed);
+
 export interface SettledHand {
   game: bigint;
   outcome: Outcome;
-  clientSeed: string;
+  /** The player's seed; null for a hand whose seed never came. */
+  clientSeed: string | null;
+  seedHash: string | null;
   link: string;
   dealt: number;
   nPlayer: number;
@@ -45,7 +50,7 @@ export class FakeTable implements TableReader, TxSender {
   dealer = DEALER;
   nextCommit = 0n;
   nextGame = 0n;
-  limits_: Limits = { ...DEFAULT_LIMITS, revealBlocks: 20n, idleBlocks: 30n };
+  limits_: Limits = { ...DEFAULT_LIMITS, revealBlocks: 20n, idleBlocks: 30n, seedBlocks: 25n };
   readonly commitments = new Map<bigint, string>();
   readonly games = new Map<bigint, Game>();
   readonly commitOf = new Map<bigint, string>();
@@ -158,7 +163,9 @@ export class FakeTable implements TableReader, TxSender {
     this.height++;
     if (c.method === "timeout") {
       const g = this.games.get(u64(hexBytes(c.input, 8), 0));
-      if (g && dealers(g.phase)) FakeTable.violations.push(`the dealer's timeout met game ${g.id} in the dealer's phase at block ${this.height} (deadline ${g.deadline})`);
+      // A timeout that would pay the player: the hand is the dealer's to deal and past its deadline. (One that
+      // meets a hand whose seed arrived just in time is refused, 60, and harms nobody.)
+      if (g && dealers(g.phase) && BigInt(this.height) > g.deadline) FakeTable.violations.push(`the dealer's timeout met game ${g.id} in the dealer's phase at block ${this.height} (deadline ${g.deadline})`);
     }
     let sent: Sent;
     try {
@@ -191,21 +198,34 @@ export class FakeTable implements TableReader, TxSender {
         const { head: id, items } = counted(c.input);
         const g = this.games.get(id);
         if (!g) throw 54;
-        if (!dealers(g.phase)) throw 57;
         const hand = handOf(g);
         const first = g.dealt + 1;
         const cards: { link: string; card: number }[] = [];
         let link = g.link;
         let outcome: Outcome | null = null;
+        // As the program: a link the hand already holds (the last one revealed, or one before it;
+        // never the commitment) is passed over.
+        const held = (x: string): boolean => {
+          let at = link;
+          for (let back = 0; back < hand.dealt; back++) {
+            if (at === x) return true;
+            at = prevLink(at);
+          }
+          return false;
+        };
         for (const next of items) {
-          if (!dealers(hand.phase)) throw 59;
+          if (prevLink(next) !== link && held(next)) continue;
+          if (!dealers(hand.phase)) throw cards.length ? 59 : 57;
           if (prevLink(next) !== link) throw 58;
+          if (g.clientSeed === null) throw new Error("a hand the dealer owes a card has its seed");
           const cardNo = card(next, g.clientSeed, id, hand.dealt + 1);
           const step = hand.deal(cardNo);
           link = next;
           cards.push({ link: next, card: cardNo });
           if (step?.kind === "settled") outcome = step.outcome;
         }
+        // Nothing new: nothing changes, no event, no deadline moves.
+        if (!cards.length) return [];
         const deadline = hand.phase === Phase.Player ? BigInt(this.height) + this.limits_.idleBlocks : g.deadline;
         const now: Game = { ...g, link, deadline, phase: hand.phase, dealt: hand.dealt, playerCards: [...hand.player], dealerCards: [...hand.dealer], playerTotal: total(hand.player).total, dealerTotal: total(hand.dealer).total };
         const events: TableEvent[] = [{ name: "cards", game: id, player: g.player, first, cards, phase: hand.phase, playerTotal: now.playerTotal, dealerTotal: now.dealerTotal, deadline }];
@@ -218,6 +238,8 @@ export class FakeTable implements TableReader, TxSender {
         const g = this.games.get(id);
         if (!g) throw 54;
         if (BigInt(this.height) <= g.deadline) throw 60;
+        // The seed never came: the stake is the house's.
+        if (g.phase === Phase.Seed) return [this.settle(g, Outcome.NoSeed, by)];
         if (g.phase === Phase.Player) {
           const deadline = BigInt(this.height) + this.limits_.revealBlocks;
           this.games.set(id, { ...g, phase: Phase.Dealer, deadline });
@@ -235,14 +257,21 @@ export class FakeTable implements TableReader, TxSender {
     this.games.delete(g.id);
     this.open = this.open.filter((id) => id !== g.id);
     const paid = payout(g.stake, outcome);
-    this.settled.push({ game: g.id, outcome, clientSeed: g.clientSeed, link: g.link, dealt: g.dealt, nPlayer: g.playerCards.length, stake: g.stake, payout: paid, commit: this.commitOf.get(g.id)!, by });
-    return { name: "settled", game: g.id, player: g.player, outcome, stake: g.stake, payout: paid, toTable: false, dealt: g.dealt, nPlayer: g.playerCards.length, clientSeed: g.clientSeed, link: g.link, playerTotal: g.playerTotal, dealerTotal: g.dealerTotal };
+    this.settled.push({ game: g.id, outcome, clientSeed: g.clientSeed, seedHash: g.seedHash, link: g.link, dealt: g.dealt, nPlayer: g.playerCards.length, stake: g.stake, payout: paid, commit: this.commitOf.get(g.id)!, by });
+    return { name: "settled", game: g.id, player: g.player, outcome, stake: g.stake, payout: paid, toTable: false, dealt: g.dealt, nPlayer: g.playerCards.length, clientSeed: g.clientSeed, seedHash: g.seedHash, link: g.link, playerTotal: g.playerTotal, dealerTotal: g.dealerTotal };
   }
 
   // ---- what players do
 
-  /** A bet: takes the next commitment. Returns the hand's id. */
+  /** A bet, both transactions (the seed's hash, then the seed, a block later): the dealer owes the deal. Returns the hand's id. */
   bet(player: string, clientSeed: string, stake = 1_000_000_000n): bigint {
+    const id = this.commitBet(player, clientSeed, stake);
+    this.revealSeed(id, player, clientSeed);
+    return id;
+  }
+
+  /** A bet's first transaction: the stake and the seed's hash. Takes the next commitment; the hand waits for its seed. */
+  commitBet(player: string, clientSeed: string, stake = 1_000_000_000n): bigint {
     const id = this.nextGame;
     const commit = this.commitments.get(id);
     if (commit === undefined || id >= this.nextCommit) throw 53;
@@ -251,8 +280,26 @@ export class FakeTable implements TableReader, TxSender {
     this.commitOf.set(id, commit);
     this.nextGame = id + 1n;
     this.open.push(id);
-    this.games.set(id, { id, player, stake, clientSeed, link: commit, deadline: BigInt(this.height) + this.limits_.revealBlocks, postId: 0n, phase: Phase.Deal, table: false, dealt: 0, playerCards: [], dealerCards: [], playerTotal: 0, dealerTotal: 0 });
+    this.games.set(id, { id, player, stake, clientSeed: null, seedHash: fakeSeedHash(player, clientSeed), link: commit, deadline: BigInt(this.height) + this.limits_.seedBlocks, postId: 0n, phase: Phase.Seed, table: false, dealt: 0, playerCards: [], dealerCards: [], playerTotal: 0, dealerTotal: 0 });
     return id;
+  }
+
+  /** A bet's second transaction: `by` reveals the seed. Throws the program's abort code when it's refused. */
+  revealSeed(id: bigint, by: string, clientSeed: string): void {
+    const g = this.games.get(id);
+    if (!g) throw 54;
+    if (by !== g.player) throw 55;
+    if (g.phase !== Phase.Seed) throw 70;
+    this.height++;
+    if (BigInt(this.height) > g.deadline) {
+      this.height--;
+      throw 72;
+    }
+    if (fakeSeedHash(g.player, clientSeed) !== g.seedHash) {
+      this.height--;
+      throw 71;
+    }
+    this.games.set(id, { ...g, clientSeed, seedHash: null, phase: Phase.Deal, deadline: BigInt(this.height) + this.limits_.revealBlocks });
   }
 
   /** The player's move on an open hand. */

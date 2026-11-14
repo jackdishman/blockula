@@ -15,25 +15,37 @@
 //!
 //! **Fairness.** For each future game `k` the dealer draws a secret, hashes it down
 //! [`CHAIN_LEN`] times and commits the last hash, `c_k` (`commit_batch`). A bet takes the next
-//! unused commitment in order and fixes the player's `client_seed`; the game's id is `k`. Card
-//! `j` is dealt by revealing the chain's link `s_j` (`reveal`), which must hash to the link before
-//! it, and is `BLAKE3(s_j ‖ client_seed ‖ k ‖ j) mod 52` (`bj_core::card`). The dealer's hole card
-//! is the link after the player's last card: nobody can read it before the player stands. Anyone
-//! may submit a link (knowing it is the authorization); only the dealer knows them. A relayed
-//! bet's seed isn't the relayer's to pick: it is `BLAKE3("blockula/blackjack/relay" ‖ player ‖
-//! post id)`.
+//! unused commitment in order; the game's id is `k`. Card `j` is dealt by revealing the chain's
+//! link `s_j` (`reveal`), which must hash to the link before it, and is
+//! `BLAKE3(s_j ‖ client_seed ‖ k ‖ j) mod 52` (`bj_core::card`). The dealer's hole card is the
+//! link after the player's last card: nobody can read it before the player stands. Anyone may
+//! submit a link (knowing it is the authorization); only the dealer knows them.
 //!
-//! What this doesn't rule out (docs/BLACKJACK.md, section 2): a bet's seed is public while its
-//! transaction waits, and commitments are taken in order, so a house that wins races for block
-//! space can put a bet of its own in front of one it would lose. A two-transaction bet (commit
-//! to the seed's hash, then reveal it) closes that; rules v1 keep the bet to one transaction.
+//! **A bet is two transactions.** `bet` carries the stake and `seed_hash =
+//! BLAKE3("blockula/blackjack/seed" ‖ player ‖ client_seed)` (`bj_core::seed_hash`), never the
+//! seed. It takes the commitment, reserves the exposure and counts against every limit. Once it
+//! is final the player sends `reveal_seed` with the seed, the program checks it against the hash,
+//! and only then does the dealer owe the deal. So when the seed becomes public the hand already
+//! holds its commitment: nobody who sees a seed (in the mempool, or after) can put another bet in
+//! front of it, drop the commitment it would have met, or pick a different one. The hash binds
+//! the player's account, so a hash copied into someone else's bet can't be opened by them. A
+//! player who never reveals has `seed_blocks`; past that anyone calls `timeout` and the stake is
+//! the house's (outcome 8). That is the right end: no link of the chain is public before the
+//! seed is, so the player knows no card and gains nothing by withholding, and a hand that could
+//! be abandoned for free would let anyone burn the dealer's commitments and hold seats at no
+//! cost.
 //!
-//! **Deadlines.** Whenever the dealer owes a card it has `reveal_blocks` to reveal it, counted
-//! from the bet, the hit or the stand (a partial reveal doesn't extend it). Past that anyone calls
-//! `timeout` and **the player wins**: 3:2 if a natural was still possible or held, else 1:1,
-//! which is the most the hand could still have paid, so the dealer never gains by holding back a
-//! card it has seen. A player who doesn't move for `idle_blocks` stands by `timeout`, and the
-//! dealer finishes the hand.
+//! A relayed bet stays one transaction. Its seed isn't revealed by anyone: it is
+//! `BLAKE3("blockula/blackjack/relay" ‖ player ‖ post id)`. The relayer chooses when to send it
+//! and which post id to give, so relayed play trusts the relayer (docs/BLACKJACK.md, section 2).
+//!
+//! **Deadlines.** A player has `seed_blocks` from the bet to reveal the seed; a seed that arrives
+//! later is refused. Whenever the dealer owes a card it has `reveal_blocks` to reveal it, counted
+//! from the seed's reveal (a relayed bet: the bet), the hit or the stand (a partial reveal doesn't
+//! extend it). Past that anyone calls `timeout` and **the player wins**: 3:2 if a natural was
+//! still possible or held, else 1:1, which is the most the hand could still have paid, so the
+//! dealer never gains by holding back a card it has seen. A player who doesn't move for
+//! `idle_blocks` stands by `timeout`, and the dealer finishes the hand.
 //!
 //! **The money.** Every drop the program holds is in exactly one of four counters:
 //!
@@ -51,19 +63,22 @@
 //! **Storage** (all integers little-endian):
 //! - `b"H"` → the house (114 bytes): owner 32 ‖ dealer 32 ‖ bankroll 8 ‖ reserved 8 ‖ stakes 8 ‖
 //!   table 8 ‖ next commitment 8 ‖ next game 8 ‖ paused 1 ‖ open hands 1.
-//! - `b"C"` → the limits (96 bytes): twelve `u64`s, in `set_limits`' order.
+//! - `b"C"` → the limits (104 bytes): thirteen `u64`s, in `set_limits`' order.
 //! - `b"O"` → the open hands' ids (256 bytes): 32 slots of 8, the first `open hands` in use.
 //! - `b"c" ‖ k (8)` → commitment `c_k` (32 bytes), removed when a bet takes it.
-//! - `b"g" ‖ id (8)` → a hand (157 bytes): player 32 ‖ stake 8 ‖ client seed 32 ‖ newest link 32
-//!   ‖ deadline 8 ‖ post id 8 ‖ phase 1 ‖ flags 1 (bit 0: played from the table balance) ‖ cards
-//!   dealt 1 ‖ player's cards 1 ‖ dealer's cards 1 ‖ the player's cards 20 ‖ the dealer's 12.
-//!   Removed when the hand settles, so its deposit goes back to whoever placed the bet.
+//! - `b"g" ‖ id (8)` → a hand (157 bytes): player 32 ‖ stake 8 ‖ client seed 32 (the seed's hash
+//!   while the phase is 0) ‖ newest link 32 ‖ deadline 8 ‖ post id 8 ‖ phase 1 (0 the player owes
+//!   the seed, 1 the deal, 2 the player's move, 3 a hit's card, 4 the dealer's hand) ‖ flags 1
+//!   (bit 0: played from the table balance) ‖ cards dealt 1 ‖ player's cards 1 ‖ dealer's cards 1
+//!   ‖ the player's cards 20 ‖ the dealer's 12. Removed when the hand settles, so its deposit goes
+//!   back to whoever placed the bet.
 //! - `b"p" ‖ account (32)` → a player (195 bytes): table balance 8 ‖ day 8 ‖ wagered that day 8 ‖
 //!   open hand's id + 1 (0: none) 8 ‖ relayer 32 (zeros: none) ‖ grant: most per bet 8 ‖ most per
 //!   day 8 ‖ expires at 8 ‖ day 8 ‖ wagered that day 8 ‖ the last settled hand: id 8 ‖ outcome 1
 //!   ‖ cards dealt 1 ‖ player's cards 1 ‖ stake 8 ‖ payout 8 ‖ client seed 32 ‖ newest link 32.
 //!   The last hand is enough to recompute every one of its cards (each earlier link is the hash
-//!   of the next).
+//!   of the next). For outcome 8 the seed is the hash that was never opened, and the link the
+//!   commitment.
 //! - `b"r" ‖ account (32)` → `[1]` for a relayer the owner approved.
 //!
 //! **Methods.** Inputs are Borsh for the interface's types (`tests/programs/blackjack.iface.json`):
@@ -75,7 +90,7 @@
 //! | `init` (init) | dealer 32 | the creator, once | sets the owner, the dealer and the default limits | none |
 //! | `fund` (payable) | — | anyone | adds the value to the bankroll | `fund`: from 32 ‖ amount 8 ‖ bankroll 8 |
 //! | `defund` | amount 8 | the owner | pays free bankroll to the owner | `defund`: amount 8 ‖ bankroll 8 |
-//! | `set_limits` | 12 × 8 | the owner | min bet, max bet, daily cap, day blocks, max open hands, bankroll divisor, max exposure, reveal blocks, idle blocks, deposit cap, relayed max bet, grant max blocks | `limits`: the 96 bytes |
+//! | `set_limits` | 13 × 8 | the owner | min bet, max bet, daily cap, day blocks, max open hands, bankroll divisor, max exposure, reveal blocks, idle blocks, deposit cap, relayed max bet, grant max blocks, seed blocks | `limits`: the 104 bytes |
 //! | `pause` | on 1 | the owner | stops (or allows) new bets; nothing else | `paused`: on 1 |
 //! | `set_dealer` | dealer 32 | the owner | names the account that commits | `dealer`: 32 |
 //! | `approve_relayer` | relayer 32 ‖ on 1 | the owner | lets players grant this relayer, or ends every grant to it | `relayer`: 32 ‖ on 1 |
@@ -85,23 +100,31 @@
 //! | `withdraw` | amount 8 | a player | pays their table balance back to them; never refused for a pause | `withdraw`: player 32 ‖ amount 8 ‖ balance 8 |
 //! | `set_relayer` | relayer 32 ‖ max bet 8 ‖ daily cap 8 ‖ expires at 8 | a player | grants an approved relayer their table balance, within limits, until a block | `grant`: player 32 ‖ relayer 32 ‖ max bet 8 ‖ daily cap 8 ‖ expires at 8 |
 //! | `revoke` | — | a player | ends their grant | `revoke`: player 32 ‖ relayer 32 |
-//! | `bet` (payable) | client seed 32 | a player | stakes the value on a new hand; returns its id | `bet` (below) |
-//! | `relay_bet` | player 32 ‖ amount 8 ‖ post id 8 | the player's relayer | the same from the table balance; returns the id | `bet`, `relayed` |
+//! | `bet` (payable) | seed hash 32 | a player | stakes the value on a new hand and commits to a seed; returns its id | `bet` (below) |
+//! | `reveal_seed` | game 8 ‖ client seed 32 | the hand's player, within `seed_blocks` of the bet | opens the commitment: the dealer now owes the deal | `seed`: game 8 ‖ player 32 ‖ client seed 32 ‖ deadline 8 |
+//! | `relay_bet` | player 32 ‖ amount 8 ‖ post id 8 | the player's relayer | a bet from the table balance, its seed derived (no reveal); returns the id | `bet`, `relayed` |
 //! | `hit`, `stand` | game 8 | the hand's player | moves | `hit` / `stand`: game 8 ‖ player 32 ‖ deadline 8 (‖ how 1 for `stand`: 0 the player, 1 idle) |
 //! | `relay_hit`, `relay_stand` | game 8 ‖ post id 8 | the player's relayer, on a table hand | the same | the move's, `relayed` |
 //! | `relay_withdraw` | player 32 ‖ post id 8 | the player's relayer | pays the player's whole table balance to the player | `withdraw`, `relayed` |
-//! | `reveal` | game 8 ‖ n 4 ‖ n × 32 | anyone who knows the links | deals the next `n` cards; returns phase 1 ‖ outcome 1 | `cards`, `settled` |
-//! | `timeout` | game 8 | anyone, past the deadline | stands an idle player, or pays the player when the dealer missed a reveal; returns phase 1 ‖ outcome 1 | `stand` or `settled` |
+//! | `reveal` | game 8 ‖ n 4 ‖ n × 32 | anyone who knows the links | deals the next cards: the links in order, passing over any the hand already holds (a call someone got ahead of still deals the rest; one with nothing new changes nothing); returns phase 1 ‖ outcome 1 | `cards` (its `n` counts the links this call revealed), `settled` |
+//! | `timeout` | game 8 | anyone, past the deadline | stands an idle player, pays the player when the dealer missed a reveal, or ends a hand whose seed never came (the stake is the house's); returns phase 1 ‖ outcome 1 | `stand` or `settled` |
 //! | `game` (view) | game 8 | | the hand's record ‖ player's total 1 ‖ dealer's total 1 | |
 //! | `player` (view) | account 32 | | the player's record (zeros if none) ‖ the height 8 | |
 //! | `house` (view) | — | | the house's record ‖ the program's balance 8 ‖ the height 8 | |
-//! | `limits` (view) | — | | the 96 bytes | |
+//! | `limits` (view) | — | | the 104 bytes | |
 //! | `open_games` (view) | — | | a `vec<u64>` of the open hands' ids | |
 //! | `commitment` (view) | k 8 | | commitment `c_k`, while no bet has taken it | |
 //!
+//! **Limits the owner can't set.** Besides amounts within the supply and block counts from 1 to
+//! 2^40: `idle_blocks` and `seed_blocks` are at least 20 and `reveal_blocks` at most 86,400. The
+//! owner sets the limits while hands are open and the dealer knows their cards, so a player is
+//! never given too little time to move or to reveal a seed, and the dealer never so much that a
+//! stall has no end.
+//!
 //! **Events of a hand.**
-//! - `bet`: game 8 ‖ player 32 ‖ stake 8 ‖ client seed 32 ‖ commitment 32 ‖ deadline 8 ‖ flags 1
-//!   ‖ post id 8 (129).
+//! - `bet`: game 8 ‖ player 32 ‖ stake 8 ‖ seed hash 32 (a relayed bet: its client seed) ‖
+//!   commitment 32 ‖ deadline 8 ‖ flags 1 ‖ post id 8 (129).
+//! - `seed`: game 8 ‖ player 32 ‖ client seed 32 ‖ deadline 8 (80).
 //! - `cards`: game 8 ‖ player 32 ‖ first card's index 1 ‖ n 1 ‖ n × (link 32 ‖ card 1) ‖ phase 1 ‖
 //!   player's total 1 ‖ dealer's total 1 ‖ deadline 8.
 //! - `settled`: game 8 ‖ player 32 ‖ outcome 1 ‖ stake 8 ‖ payout 8 ‖ paid to 1 (0 the account,
@@ -118,7 +141,8 @@
 //! player's turn, 57 the dealer owes no card, 58 the link isn't the chain's next, 59 more links
 //! than the hand takes, 60 not past the deadline, 61 bad batch, 62 past the deposit cap,
 //! 63 balance short, 64 not the relayer, 65 the grant expired, 66 past the grant's limits,
-//! 67 bad grant, 68 not a table hand, 69 past the max exposure.
+//! 67 bad grant, 68 not a table hand, 69 past the max exposure, 70 the hand isn't waiting for a
+//! seed, 71 not the seed the bet committed to, 72 past the seed's deadline.
 //!
 //! **Paying out.** Effects come before transfers. A hand bet from an account pays that account;
 //! if that transfer fails (an account that can't receive), the payout is credited to the
@@ -130,7 +154,7 @@
 use core::mem::MaybeUninit;
 
 use abi::{Address, OK, abort, addr_at, block_height, caller, code, emit, get, input, input_into, nonpayable, pay, put, remove, ret, self_balance, transfer, u64_at, value};
-use bj_core::{CHAIN_LEN, Hand, MAX_DEALER_CARDS, MAX_PLAYER_CARDS, Outcome, Phase, Step, card, exposure, payout, prev_link, total};
+use bj_core::{CHAIN_LEN, Hand, MAX_DEALER_CARDS, MAX_PLAYER_CARDS, Outcome, Phase, Step, card, exposure, payout, prev_link, seed_hash, total};
 
 // Abort codes.
 const ALREADY_INITIALIZED: u32 = 40;
@@ -163,12 +187,24 @@ const GRANT_LIMIT: u32 = 66;
 const BAD_GRANT: u32 = 67;
 const NOT_TABLE_GAME: u32 = 68;
 const MAX_EXPOSURE: u32 = 69;
+const NO_SEED_OWED: u32 = 70;
+const BAD_SEED: u32 = 71;
+const SEED_LATE: u32 = 72;
 
 const FANG: u64 = 1_000_000_000;
 /// The chain's supply cap: no amount is larger, so sums of a few never overflow.
 const MAX_SUPPLY: u64 = 1_000_000_000 * FANG;
 /// The most blocks any limit counts: heights plus it stay far inside a `u64`.
 const MAX_BLOCKS: u64 = 1 << 40;
+/// The fewest blocks a player may be given to reveal a seed or to move. The owner sets the
+/// limits and the dealer knows every card, so without a floor an owner could give a player one
+/// block to move (and stand them by `timeout` before a hit it didn't like) or one block to
+/// reveal a seed (and keep the stake).
+const MIN_PLAYER_BLOCKS: u64 = 20;
+/// The most blocks the dealer may be given to reveal a card. A hand waits that long before its
+/// player can claim it, so without a ceiling an owner could turn a stall into a hand that never
+/// ends.
+const MAX_DEALER_BLOCKS: u64 = 86_400;
 
 // The house record.
 const HOUSE_KEY: &[u8] = b"H";
@@ -186,7 +222,7 @@ const H_OPEN: usize = 113;
 
 // The limits, each a u64.
 const LIMITS_KEY: &[u8] = b"C";
-const LIMITS: usize = 96;
+const LIMITS: usize = 104;
 const L_MIN_BET: usize = 0;
 const L_MAX_BET: usize = 8;
 const L_DAILY_CAP: usize = 16;
@@ -199,12 +235,13 @@ const L_IDLE_BLOCKS: usize = 64;
 const L_DEPOSIT_CAP: usize = 72;
 const L_RELAY_MAX_BET: usize = 80;
 const L_GRANT_BLOCKS: usize = 88;
+const L_SEED_BLOCKS: usize = 96;
 
 /// The defaults `init` writes: 1 to 50 FANG a bet, 500 FANG a day (43,200 blocks: a day of
 /// 2-second blocks), 10 open hands, a bet at most a twentieth of the free bankroll, 750 FANG of
 /// exposure in all, 150 blocks to reveal, 1,800 to move, 200 FANG of table balance, 25 FANG a
-/// relayed bet, grants of at most 43,200 blocks.
-const DEFAULT_LIMITS: [u64; 12] = [FANG, 50 * FANG, 500 * FANG, 43_200, 10, 20, 750 * FANG, 150, 1_800, 200 * FANG, 25 * FANG, 43_200];
+/// relayed bet, grants of at most 43,200 blocks, 300 blocks to reveal a bet's seed.
+const DEFAULT_LIMITS: [u64; 13] = [FANG, 50 * FANG, 500 * FANG, 43_200, 10, 20, 750 * FANG, 150, 1_800, 200 * FANG, 25 * FANG, 43_200, 300];
 
 // The open hands' ids.
 const OPEN_KEY: &[u8] = b"O";
@@ -439,8 +476,12 @@ pub extern "C" fn bk_set_limits() {
     owners_house();
     let at = |i: usize| u64_at(&l, i);
     let amounts_ok = [L_MIN_BET, L_MAX_BET, L_DAILY_CAP, L_MAX_EXPOSURE, L_DEPOSIT_CAP, L_RELAY_MAX_BET].iter().all(|i| at(*i) <= MAX_SUPPLY);
-    let blocks_ok = [L_DAY_BLOCKS, L_REVEAL_BLOCKS, L_IDLE_BLOCKS, L_GRANT_BLOCKS].iter().all(|i| (1..=MAX_BLOCKS).contains(&at(*i)));
-    let ok = amounts_ok && blocks_ok && at(L_MIN_BET) >= 1 && at(L_MIN_BET) <= at(L_MAX_BET) && (1..=MAX_OPEN as u64).contains(&at(L_MAX_OPEN)) && (1..=MAX_SUPPLY).contains(&at(L_DIVISOR));
+    let blocks_ok = [L_DAY_BLOCKS, L_REVEAL_BLOCKS, L_IDLE_BLOCKS, L_GRANT_BLOCKS, L_SEED_BLOCKS].iter().all(|i| (1..=MAX_BLOCKS).contains(&at(*i)));
+    // What a player is given is never under the floor, what the dealer is given never over the
+    // ceiling: the owner can't use the limits to take a move or a seed's reveal from a player,
+    // or to leave a hand waiting for the dealer for good.
+    let turns_ok = at(L_IDLE_BLOCKS) >= MIN_PLAYER_BLOCKS && at(L_SEED_BLOCKS) >= MIN_PLAYER_BLOCKS && at(L_REVEAL_BLOCKS) <= MAX_DEALER_BLOCKS;
+    let ok = amounts_ok && blocks_ok && turns_ok && at(L_MIN_BET) >= 1 && at(L_MIN_BET) <= at(L_MAX_BET) && (1..=MAX_OPEN as u64).contains(&at(L_MAX_OPEN)) && (1..=MAX_SUPPLY).contains(&at(L_DIVISOR));
     if !ok {
         abort(BAD_LIMITS, b"bad limits");
     }
@@ -683,9 +724,11 @@ pub extern "C" fn bk_relay_withdraw() {
 
 /// Opens a hand of `stake` drops for `player`, whose record is `p`: every limit, the next
 /// commitment, the reserve. The stake is already counted in the balance (a bet's value) or was
-/// just taken from the table balance (`flags`). Returns the hand's id.
+/// just taken from the table balance (`flags`). `seed` is the client seed when `start` is
+/// [`Phase::Deal`] (a relayed bet: the dealer owes the deal), and the seed's hash when it is
+/// [`Phase::Seed`] (a bet from an account: the player owes the seed). Returns the hand's id.
 #[allow(clippy::too_many_arguments)]
-fn open_hand(h: &mut [u8; HOUSE], l: &[u8; LIMITS], player: &Address, p: &mut [u8; PLAYER], stake: u64, seed: &[u8; 32], flags: u8, post: u64) -> u64 {
+fn open_hand(h: &mut [u8; HOUSE], l: &[u8; LIMITS], player: &Address, p: &mut [u8; PLAYER], stake: u64, seed: &[u8; 32], start: Phase, flags: u8, post: u64) -> u64 {
     if h[H_PAUSED] != 0 {
         abort(PAUSED, b"new bets are paused");
     }
@@ -741,7 +784,8 @@ fn open_hand(h: &mut [u8; HOUSE], l: &[u8; LIMITS], player: &Address, p: &mut [u
     set(p, P_OPEN, id + 1);
     put_player(player, p);
 
-    let deadline = now + u64_at(l, L_REVEAL_BLOCKS);
+    let (hand, blocks) = if start == Phase::Seed { (Hand::committed(), L_SEED_BLOCKS) } else { (Hand::new(), L_REVEAL_BLOCKS) };
+    let deadline = now + u64_at(l, blocks);
     let mut g = [0u8; GAME];
     g[G_PLAYER..G_PLAYER + 32].copy_from_slice(player);
     set(&mut g, G_STAKE, stake);
@@ -750,7 +794,7 @@ fn open_hand(h: &mut [u8; HOUSE], l: &[u8; LIMITS], player: &Address, p: &mut [u
     set(&mut g, G_DEADLINE, deadline);
     set(&mut g, G_POST, post);
     g[G_FLAGS] = flags;
-    store_hand(&mut g, &Hand::new());
+    store_hand(&mut g, &hand);
     put(&key8(b'g', id), &g);
 
     let mut ev = [0u8; 129];
@@ -768,7 +812,9 @@ fn open_hand(h: &mut [u8; HOUSE], l: &[u8; LIMITS], player: &Address, p: &mut [u
 
 #[unsafe(no_mangle)]
 pub extern "C" fn bk_bet() {
-    let seed = input::<32>();
+    // The hash of the player's seed (`bj_core::seed_hash`), never the seed: it stays private
+    // until this hand holds its commitment.
+    let hash = input::<32>();
     let stake = value();
     if stake == 0 {
         abort(NO_VALUE, b"no value");
@@ -777,8 +823,48 @@ pub extern "C" fn bk_bet() {
     let l = limits();
     let player = caller();
     let mut p = player_record(&player);
-    let id = open_hand(&mut h, &l, &player, &mut p, stake, &seed, 0, 0);
+    let id = open_hand(&mut h, &l, &player, &mut p, stake, &hash, Phase::Seed, 0, 0);
     ret(&id.to_le_bytes());
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bk_reveal_seed() {
+    nonpayable();
+    let inp = input::<40>();
+    let id = u64_at(&inp, 0);
+    let seed: [u8; 32] = addr_at(&inp, 8);
+    let l = limits();
+    let mut g = game_record(id);
+    let player = addr_at(&g, G_PLAYER);
+    if caller() != player {
+        abort(NOT_PLAYER, b"not this hand's player");
+    }
+    let mut hand = hand_of(&g);
+    if !hand.seeded() {
+        abort(NO_SEED_OWED, b"the hand isn't waiting for a seed");
+    }
+    // Past the deadline the hand is the house's, whoever gets there first: a late seed is public
+    // in the mempool, and whoever saw it there could otherwise choose between letting it in and
+    // calling `timeout`.
+    let now = block_height();
+    if now > u64_at(&g, G_DEADLINE) {
+        abort(SEED_LATE, b"past the seed's deadline");
+    }
+    if seed_hash(&player, &seed) != g[G_SEED..G_SEED + 32] {
+        abort(BAD_SEED, b"not the seed the bet committed to");
+    }
+    let deadline = now + u64_at(&l, L_REVEAL_BLOCKS);
+    g[G_SEED..G_SEED + 32].copy_from_slice(&seed);
+    store_hand(&mut g, &hand);
+    set(&mut g, G_DEADLINE, deadline);
+    put(&key8(b'g', id), &g);
+
+    let mut ev = [0u8; 80];
+    set(&mut ev, 0, id);
+    ev[8..40].copy_from_slice(&player);
+    ev[40..72].copy_from_slice(&seed);
+    set(&mut ev, 72, deadline);
+    emit(b"seed", &ev);
 }
 
 #[unsafe(no_mangle)]
@@ -815,7 +901,7 @@ pub extern "C" fn bk_relay_bet() {
     pre[24..56].copy_from_slice(&player);
     set(&mut pre, 56, post);
     let seed = bj_core::blake3(&pre);
-    let id = open_hand(&mut h, &l, &player, &mut p, stake, &seed, FLAG_TABLE, post);
+    let id = open_hand(&mut h, &l, &player, &mut p, stake, &seed, Phase::Deal, FLAG_TABLE, post);
     emit_relayed(&player, &relayer, post, ACT_BET, id);
     ret(&id.to_le_bytes());
 }
@@ -970,6 +1056,21 @@ fn settle(id: u64, g: &[u8; GAME], hand: &Hand, outcome: Outcome) {
     emit(b"settled", &ev);
 }
 
+/// Whether `link` is one the hand already revealed: the last one, or one before it (never the
+/// commitment). The record keeps only the last link, and each earlier one is its hash.
+fn revealed(link: &[u8; 32], g: &[u8], dealt: u8) -> bool {
+    let mut at: [u8; 32] = addr_at(g, G_LINK);
+    for back in 0..dealt {
+        if at == *link {
+            return true;
+        }
+        if back + 1 < dealt {
+            at = prev_link(&at);
+        }
+    }
+    false
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn bk_reveal() {
     nonpayable();
@@ -979,26 +1080,33 @@ pub extern "C" fn bk_reveal() {
     let l = limits();
     let mut g = game_record(id);
     let mut hand = hand_of(&g);
-    if !hand.phase.dealers() {
-        abort(NOT_DEALERS_TURN, b"the dealer owes no card");
-    }
     let seed: [u8; 32] = addr_at(&g, G_SEED);
-    let n = links.len() / 32;
     let mut ev = [0u8; 42 + 33 * MAX_REVEAL + 11];
     set(&mut ev, 0, id);
     ev[8..40].copy_from_slice(&g[G_PLAYER..G_PLAYER + 32]);
     ev[40] = hand.dealt + 1;
-    ev[41] = n as u8;
     let mut settled = None;
-    for i in 0..n {
-        let link: [u8; 32] = addr_at(links, 32 * i);
-        // A link past the hand's last card: the hand is the player's to move, or over.
+    // Links this call revealed. One the hand already holds is passed over, so a call that
+    // someone got ahead of (with its first link, or all of them) still deals the rest.
+    let mut n = 0;
+    for at in 0..links.len() / 32 {
+        let link: [u8; 32] = addr_at(links, 32 * at);
+        let next = prev_link(&link) == g[G_LINK..G_LINK + 32];
+        if !next && revealed(&link, &g, hand.dealt) {
+            continue;
+        }
         if !hand.phase.dealers() {
+            if n == 0 {
+                abort(NOT_DEALERS_TURN, b"the dealer owes no card");
+            }
+            // A link past the hand's last card: the hand is the player's to move, or over.
             abort(TOO_MANY_LINKS, b"more links than the hand takes");
         }
-        if prev_link(&link) != g[G_LINK..G_LINK + 32] {
+        if !next {
             abort(BAD_LINK, b"not the chain's next link");
         }
+        let i = n;
+        n += 1;
         let j = hand.dealt + 1;
         if j as usize > CHAIN_LEN {
             abort(code::BAD_STORED, b"past the chain");
@@ -1011,6 +1119,12 @@ pub extern "C" fn bk_reveal() {
             settled = Some(outcome);
         }
     }
+    // Every link was one the hand already held: nothing changes, and no deadline moves.
+    if n == 0 {
+        ret(&[hand.phase as u8, 0]);
+        return;
+    }
+    ev[41] = n as u8;
     store_hand(&mut g, &hand);
     // The dealer's deadline runs from the bet, the hit or the stand, whatever it revealed since;
     // the player's turn starts its own.
@@ -1046,7 +1160,11 @@ pub extern "C" fn bk_timeout() {
     if now <= u64_at(&g, G_DEADLINE) {
         abort(NOT_YET, b"not past the deadline");
     }
-    if hand.stand() {
+    if hand.phase == Phase::Seed {
+        // The seed never came: the stake is the house's, the reserve is free again.
+        settle(id, &g, &hand, Outcome::NoSeed);
+        ret(&[Phase::Done as u8, Outcome::NoSeed as u8]);
+    } else if hand.stand() {
         // An idle player stands; the dealer finishes the hand.
         let deadline = now + u64_at(&l, L_REVEAL_BLOCKS);
         store_hand(&mut g, &hand);

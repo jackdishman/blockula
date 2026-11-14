@@ -99,7 +99,7 @@ fn guests() -> Vec<(&'static str, Interface)> {
             Interface {
                 methods: vec![
                     method("approve_relayer", Call, false, &[("relayer", Address), ("on", Bool)], None),
-                    method("bet", Call, true, &[("client_seed", Hash32)], Some(U64)),
+                    method("bet", Call, true, &[("seed_hash", Hash32)], Some(U64)),
                     method("commit_batch", Call, false, &[("first", U64), ("commitments", links(64))], None),
                     method("commitment", View, false, &[("index", U64)], Some(Hash32)),
                     method("defund", Call, false, &[("amount", Fang)], None),
@@ -114,7 +114,7 @@ fn guests() -> Vec<(&'static str, Interface)> {
                         View,
                         false,
                         &[],
-                        bytes(96),
+                        bytes(104),
                     ),
                     method("open_games", View, false, &[], Some(Type::Vec { of: Box::new(U64), max: 32 })),
                     method("pause", Call, false, &[("on", Bool)], None),
@@ -124,6 +124,7 @@ fn guests() -> Vec<(&'static str, Interface)> {
                     method("relay_stand", Call, false, &[("game", U64), ("post_id", U64)], None),
                     method("relay_withdraw", Call, false, &[("player", Address), ("post_id", U64)], None),
                     method("reveal", Call, false, &[("game", U64), ("links", links(12))], Some(U16)),
+                    method("reveal_seed", Call, false, &[("game", U64), ("client_seed", Hash32)], None),
                     method("revoke", Call, false, &[], None),
                     method("set_dealer", Call, false, &[("dealer", Address)], None),
                     method(
@@ -143,6 +144,7 @@ fn guests() -> Vec<(&'static str, Interface)> {
                             ("deposit_cap", Fang),
                             ("relay_max_bet", Fang),
                             ("grant_max_blocks", U64),
+                            ("seed_blocks", U64),
                         ],
                         None,
                     ),

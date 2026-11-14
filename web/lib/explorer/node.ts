@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { RPC } from "../config";
+import { NETWORK, RPC } from "../config";
+import { firstAccepted } from "./broadcast";
 
 /** An error the node answered with (404 for "no such block", 400 for bad input…). */
 export class NodeError extends Error {
@@ -51,11 +52,33 @@ export function nodeGet<T>(path: string): Promise<T> {
  * Submit a signed transaction and return its id, straight from the node's answer. (Reading the
  * transaction back is the receipt page's job: if that read failed here, a retry would send twice.)
  */
-export async function submitTx(tx: unknown): Promise<string> {
-  const res = await fetch(`${RPC}/api/tx`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(tx) });
+export const submitTx = (tx: unknown): Promise<string> => postTx(RPC, tx);
+
+async function postTx(node: string, tx: unknown): Promise<string> {
+  const res = await fetch(`${node}/api/tx`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(tx) });
   const json = (await res.json().catch(() => ({}))) as { id?: string; error?: string };
   if (!res.ok || !json.id) throw new NodeError(res.status, json.error ?? `node error ${res.status}`, json);
   return json.id;
+}
+
+/**
+ * The other nodes a transaction can be sent through: the network's witnesses (independent nodes
+ * of the same chain, lib/config.ts). None for a custom node or the wallet a node serves, which
+ * know only the one node.
+ */
+export const OTHER_NODES: readonly string[] = (NETWORK.witnesses ?? []).map((w) => w.replace(/\/+$/, "")).filter((w) => w !== RPC);
+
+/** A 4xx: the node refused the transaction at admission, so through that node it never ran. */
+export const refusedByNode = (e: unknown): boolean => e instanceof NodeError && e.status >= 400 && e.status < 500;
+
+/**
+ * Submit one signed transaction through the selected node and every other node this wallet knows
+ * (`OTHER_NODES`), all at once: one acceptance is enough, and the rest are still tried. It is the
+ * same transaction everywhere, so it runs (and is charged) once. Resolves once a node took it; the
+ * caller keeps the id it computed itself, never one a node answered with.
+ */
+export async function submitTxEverywhere(tx: unknown): Promise<void> {
+  await firstAccepted([RPC, ...OTHER_NODES], (node) => postTx(node, tx), refusedByNode);
 }
 
 export const cached = <T,>(path: string) => cache.get(path) as T | undefined;

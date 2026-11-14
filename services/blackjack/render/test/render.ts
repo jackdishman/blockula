@@ -40,7 +40,12 @@ const poster = renderPoster();
 assert.equal(poster.svg, posterSvg({ fonts: RENDER_FONTS }));
 assert.equal(poster.alt, POSTER_ALT);
 // The gallery covers every stage the brief names.
-for (const name of ["waiting", "deal", "player-turn", "blackjack", "win", "push", "dealer-wins", "bust", "timeout-dealer", "timeout-deal", "long-hand"]) assert.ok(name in GALLERY, name);
+for (const name of ["seed-wait", "no-seed", "waiting", "deal", "player-turn", "blackjack", "win", "push", "dealer-wins", "bust", "timeout-dealer", "timeout-deal", "long-hand"]) assert.ok(name in GALLERY, name);
+
+// A bet waiting for its seed, and one whose seed never came: an empty table, said in words and stamped.
+assert.ok(pictures.find(([n]) => n === "seed-wait")![1].alt.includes("Waiting for the player's seed."));
+assert.ok(pictures.find(([n]) => n === "no-seed")![1].svg.includes("No seed"));
+assert.ok(pictures.find(([n]) => n === "no-seed")![1].alt.includes("Nothing came back."));
 
 // ---- fonts: each family comes from its shipped file, and from nowhere else ----
 assert.equal(FONT_FILES.length, 5);

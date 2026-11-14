@@ -102,6 +102,17 @@ assert.equal(hand.stand(), false);
 assert.deepEqual(hand.deal(5), { kind: "settled", outcome: Outcome.Win }, "19 against a soft 17: the dealer stands");
 assert.equal(hand.deal(5), null);
 
+// A hand whose seed isn't revealed yet: no move, no card, until the seed.
+const committed = Hand.committed();
+assert.equal(committed.phase, Phase.Seed);
+assert.equal(committed.hit() || committed.stand(), false);
+assert.equal(committed.deal(3), null, "no card before the seed");
+assert.equal(committed.seeded(), true);
+assert.equal(committed.phase, Phase.Deal);
+assert.equal(committed.seeded(), false, "once");
+assert.equal(payout(5n, Outcome.NoSeed), 0n);
+assert.ok(isOutcome(8) && !isOutcome(9) && !isOutcome(0));
+
 assert.equal(prevLink("00".repeat(32)), "2ada83c1819a5372dae1238fc1ded123c8104fdaa15862aaee69428a1820fcda");
 assert.equal(cardLabel(0), "A♠");
 assert.equal(cardLabel(51), "K♣");

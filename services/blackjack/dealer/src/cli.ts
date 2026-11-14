@@ -137,7 +137,7 @@ function statusText(cfg: DealerConfig, address: string, balance: bigint, h: Heal
     `balance          ${fang(balance)} FANG${balance < drops(cfg.lowBalance) ? `   ⚠ under ${cfg.lowBalance}: it pays every reveal's fee and bonds a deposit for every commitment` : ""}`,
     `commitments      ${h.unused} unused (games ${h.nextGame}–${h.nextCommit - 1n}), ${h.servable} this store can deal; tops up under ${cfg.lowWater} to ${cfg.target}`,
     `open hands       ${h.open.length}`,
-    ...h.open.map((g) => `  game ${g.id}: ${g.dealers ? "the dealer's move" : "the player's move"}, deadline block ${g.deadline}${g.dealers && !g.hasSecret ? "   ⚠ no secret for it in the store" : ""}`),
+    ...h.open.map((g) => `  game ${g.id}: ${g.dealers ? "the dealer's move" : g.waitsForSeed ? "waiting for the player's seed" : "the player's move"}, deadline block ${g.deadline}${g.dealers && !g.hasSecret ? "   ⚠ no secret for it in the store" : ""}`),
     `store            ${cfg.storePath}: ${h.stored} secrets (${h.uncommitted} not committed yet)`,
     `backup           ${cfg.backupPath}: ${backupCurrent ? "same as the store" : "⚠ missing or behind the store (the next change rewrites it)"}`,
   ];

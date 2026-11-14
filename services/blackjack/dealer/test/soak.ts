@@ -1,8 +1,9 @@
 // The blackjack soak: scripts/blackjack-e2e.sh starts a local chain of validators and runs this
 // against it. It creates a table, runs the dealer daemon as a child process, plays HANDS hands
-// from five accounts at once (three signing for themselves, two through a relayer), and checks
-// what the script's header lists: every hand verified, the money invariant at every block, the
-// daemon killed and restarted, a dealer that stalls, the caps, a pause, and a clean end.
+// from five accounts at once (three signing for themselves, each bet in two transactions: the
+// seed's hash, then the seed; two through a relayer), and checks what the script's header lists:
+// every hand verified, the money invariant at every block, the daemon killed and restarted, a
+// dealer that stalls, bets whose seed never comes, the caps, a pause, and a clean end.
 //
 //   BLOCKULA_RPC   the first validator (127.0.0.1:38200–38399 only)
 //   BJ_RPCS        every validator's URL, comma-separated (for the agreement check)
@@ -40,8 +41,10 @@ mkdirSync(dir, { recursive: true });
  *   left idle on purpose are stood by the daemon.
  * - depositCap 200 FANG, relayMaxBet 5 FANG, grantMaxBlocks 43,200: the relayed seats deposit
  *   100 FANG each and grant the relayer 5 FANG a bet for the whole run.
+ * - seedBlocks 30: 12 seconds to reveal a bet's seed. The seats reveal in the next block or two,
+ *   so only the bets whose seed is withheld on purpose are ended by the daemon.
  */
-const SOAK_LIMITS: Limits = { ...DEFAULT_LIMITS, minBet: FANG, maxBet: 5n * FANG, dailyCap: 1_000_000n * FANG, dayBlocks: 50n, maxOpenGames: 8n, bankrollDivisor: 20n, maxExposure: 100n * FANG, revealBlocks: 60n, idleBlocks: 40n, depositCap: 200n * FANG, relayMaxBet: 5n * FANG, grantMaxBlocks: 43_200n };
+const SOAK_LIMITS: Limits = { ...DEFAULT_LIMITS, minBet: FANG, maxBet: 5n * FANG, dailyCap: 1_000_000n * FANG, dayBlocks: 50n, maxOpenGames: 8n, bankrollDivisor: 20n, maxExposure: 100n * FANG, revealBlocks: 60n, idleBlocks: 40n, depositCap: 200n * FANG, relayMaxBet: 5n * FANG, grantMaxBlocks: 43_200n, seedBlocks: 30n };
 const BANKROLL = 400n * FANG;
 
 let daemon: Daemon | undefined;
@@ -105,6 +108,7 @@ try {
 
   // ------------------------------------------------------------------ 3–6. the soak
   let done = 0;
+  let noSeed = 0;
   let gate: Promise<void> | null = null;
   let busy = 0;
   let lastProgress = Date.now();
@@ -125,7 +129,7 @@ try {
         assert.equal(h.settled.by, dealerAddress, `game ${h.id} was settled by the daemon's reveal`);
         // The player's record keeps the hand the event described.
         const rec = await table.player(seat.wallet.address);
-        if (rec.last?.game === h.id) assert.deepEqual(rec.last, { game: h.id, outcome: h.settled.outcome, dealt: h.settled.dealt, nPlayer: h.settled.nPlayer, stake, payout: h.settled.payout, clientSeed: h.bet.clientSeed, link: h.settled.link });
+        if (rec.last?.game === h.id) assert.deepEqual(rec.last, { game: h.id, outcome: h.settled.outcome, dealt: h.settled.dealt, nPlayer: h.settled.nPlayer, stake, payout: h.settled.payout, clientSeed: h.settled.clientSeed, seedHash: null, link: h.settled.link });
         // A relayed hand moves the table balance by exactly the payout less the stake.
         if (seat.relayer) assert.equal(rec.balance, before - stake + h.settled.payout, `${seat.name}'s table balance after game ${h.id}`);
         done++;
@@ -170,7 +174,8 @@ try {
     const h1 = await table.house();
     assert.deepEqual([h1.bankroll, h1.reserved, h1.stakes], [h0.bankroll - exposure(stake), exposure(stake), stake], "the bet set its exposure aside");
     const g = await table.game(stalled.id);
-    assert.ok(g && g.phase === Phase.Deal);
+    // Both of the bet's transactions landed: the seed is on the chain and the deal is owed.
+    assert.ok(g && g.phase === Phase.Deal && g.clientSeed === stalled.seed);
     await refused(stranger, call.timeout(stalled.id), 60, "a timeout before the deadline");
     await waitPast(client, g.deadline);
     assert.equal((await table.game(stalled.id))?.phase, Phase.Deal, "nobody dealt it");
@@ -203,6 +208,39 @@ try {
       step(`✓ 6b. an idle player on game ${idle.id} was stood by the daemon's timeout after block ${now.deadline}, and the hand was dealt to its end at block ${settled.height}`);
       break;
     }
+
+    // 6c. bets whose seed never comes: the daemon deals nothing, and ends each at the seed's deadline.
+    {
+      const h3 = await table.house();
+      const quiet = [
+        { seat: aliceSeat, stake: FANG },
+        { seat: bobSeat, stake: 2n * FANG + 1n },
+        { seat: carolSeat, stake: 3n * FANG },
+      ];
+      const bets = [];
+      for (const q of quiet) bets.push({ ...q, ...(await placeBet(play, q.seat, q.stake, { reveal: false })) });
+      const total = quiet.reduce((n, q) => n + q.stake, 0n);
+      const reserve = quiet.reduce((n, q) => n + exposure(q.stake), 0n);
+      const h4 = await table.house();
+      assert.deepEqual([h4.bankroll, h4.reserved, h4.stakes, h4.open], [h3.bankroll - reserve, reserve, total, 3], "each bet set its exposure aside and took a seat");
+      for (const b of bets) {
+        const g = await table.game(b.id);
+        assert.ok(g && g.phase === Phase.Seed && g.clientSeed === null && g.dealt === 0, "the hand waits for its seed, with no card");
+      }
+      // (Only the newest: the first one's deadline is a few seconds off by now.)
+      await refused(stranger, call.timeout(bets[2].id), 60, "a timeout before the seed's deadline");
+      for (const b of bets) {
+        const settled = await w.settledEvent(b.id);
+        assert.deepEqual([settled.outcome, settled.payout, settled.dealt, settled.by], [Outcome.NoSeed, 0n, 0, dealerAddress], `game ${b.id} was ended by the daemon's own timeout`);
+        assert.ok(settled.height > Number(b.bet.deadline), "past the seed's deadline, not before");
+        await refused(b.seat.wallet, call.revealSeed(b.id, b.seed), 54, "a seed for a hand that's over");
+        noSeed++;
+      }
+      await until("the three seats to be free", async () => (await table.house()).open === 0);
+      const h5 = await table.house();
+      assert.deepEqual([h5.bankroll, h5.reserved, h5.stakes], [h3.bankroll + total, 0n, 0n], "the stakes are the bankroll's and the reserves are free");
+      step(`✓ 6c. three bets (games ${bets.map((b) => b.id).join(", ")}) never revealed their seed: the daemon dealt none of them and its timeouts ended each after its deadline; ${fang(total)} FANG of stakes went to the bankroll`);
+    }
     resume();
 
     // 5b. SIGKILL again, this time down for three seconds while the seats keep betting and moving.
@@ -227,8 +265,11 @@ try {
   await until("no open hands", async () => (await table.openGames()).length === 0);
   await w.caughtUp();
   w.check();
-  const forfeits = [...w.settled.values()].filter((s) => s.outcome > Outcome.Bust);
+  const forfeits = [...w.settled.values()].filter((s) => s.outcome === Outcome.Forfeit || s.outcome === Outcome.ForfeitDeal);
   assert.equal(forfeits.length, 1, "the only forfeited hand is the one the stall test made");
+  const unrevealed = [...w.settled.values()].filter((s) => s.outcome === Outcome.NoSeed);
+  assert.equal(unrevealed.length, noSeed, "the only bets that ended without a seed are the ones that withheld it on purpose");
+  assert.equal(noSeed, 3);
   step(`✓ 3–6. ${done} hands played by 5 seats (3 signing their own, 2 relayed), every one verified from its settled event to its bet's commitment; ${restarts} restarts, no hand forfeited by them`);
 
   // ------------------------------------------------------------------ 7. the caps
@@ -354,7 +395,7 @@ try {
   const hashes = await Promise.all(RPCS.map(async (rpc) => ((await (await fetch(`${rpc}/api/block/${at}`)).json()) as { hash: string }).hash));
   assert.equal(new Set(hashes).size, 1, `the validators disagree about block ${at}`);
 
-  const names: Record<number, string> = { 1: "blackjack", 2: "win", 3: "push", 4: "lose", 5: "bust", 6: "forfeit", 7: "forfeit at the deal" };
+  const names: Record<number, string> = { 1: "blackjack", 2: "win", 3: "push", 4: "lose", 5: "bust", 6: "forfeit", 7: "forfeit at the deal", 8: "seed never revealed" };
   const histogram = [...w.outcomes].sort((a, b) => a[0] - b[0]).map(([k, n]) => `${names[k]} ${n}`).join(", ");
   const fuel = [...w.fuel].sort((a, b) => a[0].localeCompare(b[0])).map(([m, f]) => `  ${m.padEnd(16)} max ${f.max.toString().padStart(7)}   mean ${(f.total / BigInt(f.calls)).toString().padStart(7)}   (${f.calls} calls)`).join("\n");
   const count = (action: string) => lines.filter((l) => l.action === action).length;
@@ -365,6 +406,7 @@ try {
       `hands settled      ${w.settled.size} (${done} in the soak, the rest in the tests around it), every one verified`,
       `outcomes           ${histogram}`,
       `forfeited          ${forfeits.length} (the stall test's game ${forfeits[0].game}); none from a restart`,
+      `seed never came    ${unrevealed.length} (games ${unrevealed.map((s) => s.game).join(", ")}), each ended by the daemon's timeout, the stake to the bankroll`,
       `daemon             ${d.starts} starts: ${restarts - 1} after SIGKILL, 1 after the stall; ${count("reveal")} reveals, ${count("commit")} commits, ${count("timeout")} timeouts, ${count("pruned")} prunes, ${lines.filter((l) => l.level === "warn").length} warnings, 0 errors`,
       `daemon's account   ${fang(100n * FANG - BigInt(final.balance))} FANG spent on fees and deposits; ${final.stored} secrets left in its store`,
       `heights            blocks ${w.firstHeight}–${w.lastHeight}: the invariant held at ${w.heightsChecked} of them (${w.heightsSkipped} passed between two reads, ${w.skewRetries} reads retried for straddling a block)`,

@@ -1,6 +1,7 @@
 // A blackjack table on the mock node (e2e/mock-node.ts): the program's record, its storage entries
 // in the program's own layout (node/vm/guests/blackjack), its calls run the way the program runs
-// them (the same checks, abort codes and events), and a dealer the tests drive. The rules, the
+// them (the same checks, abort codes and events: a bet that carries its seed's hash, the seed's
+// reveal, the timeout that ends a hand whose seed never came), and a dealer the tests drive. The rules, the
 // hash chains and the cards are `@blockula/blackjack`'s, so every link revealed here is a real
 // chain's and the page's own check (`verifyHand`) holds for every hand.
 import {
@@ -17,6 +18,7 @@ import {
   natural,
   owedLinks,
   payout,
+  seedHash,
   storageKey,
   toHex,
   total,
@@ -70,8 +72,15 @@ export class MockTable {
   /** Every chain the dealer made, by its hand's id: `chain[0]` is the commitment. */
   chains = new Map<bigint, string[]>();
   relayers = new Set<string>([RELAYER]);
-  /** What the next hand's first cards must be (the dealer picks a chain that deals them once it sees the seed). */
+  /**
+   * What the next hand's first cards must be. A real dealer commits before it could know the
+   * seed; this one is told the seed ahead (`knownSeeds`: the spec reads it from the page's own
+   * storage) so a test can ask for a hand, and commits to a chain that deals it. A bet whose seed
+   * it wasn't told takes the chain committed ahead, as on a real table.
+   */
   script: Script | null = null;
+  /** Seeds the dealer was told before their bets (see `script`). */
+  knownSeeds: string[] = [];
   /** The digest every call must bind. */
   readonly digest: string;
 
@@ -125,14 +134,14 @@ export class MockTable {
     out.set(storageKey.open, Array.from({ length: 32 }, (_, i) => le8(open[i] ?? 0n)).join(""));
     for (let k = h.nextGame; k < h.nextCommit; k++) out.set(storageKey.commitment(k), (this.chains.get(k) as string[])[0]);
     for (const g of this.games.values())
-      out.set(storageKey.game(g.id), addr(g.player) + le8(g.stake) + g.clientSeed + g.link + le8(g.deadline) + le8(g.postId) + u8(g.phase) + u8(g.table ? 1 : 0) + u8(g.dealt) + u8(g.playerCards.length) + u8(g.dealerCards.length) + padded(g.playerCards, 20) + padded(g.dealerCards, 12));
+      out.set(storageKey.game(g.id), addr(g.player) + le8(g.stake) + (g.clientSeed ?? g.seedHash ?? ZERO32) + g.link + le8(g.deadline) + le8(g.postId) + u8(g.phase) + u8(g.table ? 1 : 0) + u8(g.dealt) + u8(g.playerCards.length) + u8(g.dealerCards.length) + padded(g.playerCards, 20) + padded(g.dealerCards, 12));
     for (const [a, p] of this.players) {
       const g = p.grant;
       const l = p.last;
       out.set(
         storageKey.player(a),
         le8(p.balance) + le8(p.day) + le8(p.wagered) + le8(p.openGame === null ? 0n : p.openGame + 1n) + (g ? addr(g.relayer) + le8(g.maxBet) + le8(g.dailyCap) + le8(g.expiresAt) + le8(g.day) + le8(g.wagered) : ZERO32 + le8(0n).repeat(5)) +
-          (l ? le8(l.game) + u8(l.outcome) + u8(l.dealt) + u8(l.nPlayer) + le8(l.stake) + le8(l.payout) + l.clientSeed + l.link : le8(0n) + u8(0).repeat(3) + le8(0n).repeat(2) + ZERO32.repeat(2)),
+          (l ? le8(l.game) + u8(l.outcome) + u8(l.dealt) + u8(l.nPlayer) + le8(l.stake) + le8(l.payout) + (l.clientSeed ?? l.seedHash ?? ZERO32) + l.link : le8(0n) + u8(0).repeat(3) + le8(0n).repeat(2) + ZERO32.repeat(2)),
       );
     }
     for (const r of this.relayers) out.set(storageKey.relayer(r), "01");
@@ -143,10 +152,11 @@ export class MockTable {
     return { ok: false, outcome: { ok: false, number: 2, code: "aborted", program: this.address, abort_code: code, untrusted_message: message } };
   }
 
-  /** A chain for hand `id` whose first cards, with the player's seed, are what the script asks for. */
-  private chainFor(id: bigint, seed: string): string[] {
+  /** A chain for hand `id` whose first cards, with the seed `from`'s bet committed to with `hash`, are what the script asks for. */
+  private chainFor(id: bigint, from: string, hash: string): string[] {
     const script = this.script;
-    if (!script) return this.chains.get(id) as string[];
+    const seed = this.knownSeeds.find((s) => seedHash(from, s) === hash);
+    if (!script || !seed) return this.chains.get(id) as string[];
     for (let tries = 0; tries < 200_000; tries++) {
       const chain = chainFromTop(toHex(randomBytes(32)));
       if (script(Array.from({ length: 8 }, (_, i) => card(chain[i + 1], seed, id, i + 1)))) return chain;
@@ -179,9 +189,10 @@ export class MockTable {
         if (wagered > l.dailyCap) return this.abort(50, "past the daily cap");
         const id = h.nextGame;
         if (id >= h.nextCommit) return this.abort(53, "the dealer has no commitment ready");
-        const chain = this.chainFor(id, c.input);
-        const deadline = now + l.revealBlocks;
-        const game: Game = { id, player: from, stake, clientSeed: c.input, link: chain[0], deadline, postId: 0n, phase: Phase.Deal, table: false, dealt: 0, playerCards: [], dealerCards: [], playerTotal: 0, dealerTotal: 0 };
+        // The input is the seed's hash: the hand waits for the seed, and the dealer owes nothing yet.
+        const chain = this.chainFor(id, from, c.input);
+        const deadline = now + l.seedBlocks;
+        const game: Game = { id, player: from, stake, clientSeed: null, seedHash: c.input, link: chain[0], deadline, postId: 0n, phase: Phase.Seed, table: false, dealt: 0, playerCards: [], dealerCards: [], playerTotal: 0, dealerTotal: 0 };
         return {
           ok: true,
           data: le8(id),
@@ -198,6 +209,18 @@ export class MockTable {
           },
         };
       }
+      case "reveal_seed": {
+        if (c.input.length !== 80) return this.abort(1, "bad input");
+        const g = gameOf(c.input.slice(0, 16));
+        const seed = c.input.slice(16);
+        if (!g) return this.abort(54, "no such hand");
+        if (g.player !== from) return this.abort(55, "not this hand's player");
+        if (g.phase !== Phase.Seed) return this.abort(70, "the hand isn't waiting for a seed");
+        if (now > g.deadline) return this.abort(72, "past the seed's deadline");
+        if (seedHash(from, seed) !== g.seedHash) return this.abort(71, "not the seed the bet committed to");
+        const deadline = now + l.revealBlocks;
+        return { ok: true, events: [{ untrusted_name: "seed", data: le8(g.id) + addr(g.player) + seed + le8(deadline) }], apply: () => Object.assign(g, { clientSeed: seed, seedHash: null, phase: Phase.Deal, deadline }) };
+      }
       case "hit":
       case "stand": {
         const g = gameOf(c.input);
@@ -212,6 +235,8 @@ export class MockTable {
         const g = gameOf(c.input);
         if (!g) return this.abort(54, "no such hand");
         if (now <= g.deadline) return this.abort(60, "not past the deadline");
+        // The seed never came: the stake is the house's.
+        if (g.phase === Phase.Seed) return { ok: true, data: u8(Phase.Done) + u8(Outcome.NoSeed), events: [this.settledEvent(g, Outcome.NoSeed)], apply: () => this.settle(g, Outcome.NoSeed) };
         if (g.phase === Phase.Player) {
           const deadline = now + l.revealBlocks;
           return { ok: true, data: u8(Phase.Dealer) + u8(0), events: [{ untrusted_name: "stand", data: le8(g.id) + addr(g.player) + le8(deadline) + u8(1) }], apply: () => Object.assign(g, { phase: Phase.Dealer, deadline }) };
@@ -260,7 +285,7 @@ export class MockTable {
   }
 
   private settledEvent(g: Game, outcome: Outcome) {
-    return { untrusted_name: "settled", data: le8(g.id) + addr(g.player) + u8(outcome) + le8(g.stake) + le8(payout(g.stake, outcome)) + u8(g.table ? 1 : 0) + u8(g.dealt) + u8(g.playerCards.length) + g.clientSeed + g.link + u8(total(g.playerCards).total) + u8(total(g.dealerCards).total) };
+    return { untrusted_name: "settled", data: le8(g.id) + addr(g.player) + u8(outcome) + le8(g.stake) + le8(payout(g.stake, outcome)) + u8(g.table ? 1 : 0) + u8(g.dealt) + u8(g.playerCards.length) + (g.clientSeed ?? g.seedHash ?? ZERO32) + g.link + u8(total(g.playerCards).total) + u8(total(g.dealerCards).total) };
   }
 
   /** Ends a hand: frees its reserve, removes its record, keeps it as the player's last hand and pays what it pays. */
@@ -273,7 +298,7 @@ export class MockTable {
     h.open -= 1;
     this.games.delete(g.id);
     const p = this.seat(g.player);
-    const last: LastHand = { game: g.id, outcome, dealt: g.dealt, nPlayer: g.playerCards.length, stake: g.stake, payout: paid, clientSeed: g.clientSeed, link: g.link };
+    const last: LastHand = { game: g.id, outcome, dealt: g.dealt, nPlayer: g.playerCards.length, stake: g.stake, payout: paid, clientSeed: g.clientSeed, seedHash: g.clientSeed === null ? g.seedHash : null, link: g.link };
     p.openGame = null;
     p.last = last;
     this.node.acct(g.player).balance += paid;
@@ -295,7 +320,7 @@ export class MockTable {
     const hand = handOf(g);
     let outcome: Outcome | null = null;
     for (const link of links) {
-      const step = hand.deal(card(link, g.clientSeed, id, hand.dealt + 1));
+      const step = hand.deal(card(link, g.clientSeed as string, id, hand.dealt + 1));
       if (step?.kind === "settled") outcome = step.outcome;
     }
     Object.assign(g, { link: links[links.length - 1], dealt: hand.dealt, phase: hand.phase, playerCards: [...hand.player], dealerCards: [...hand.dealer], playerTotal: total(hand.player).total, dealerTotal: total(hand.dealer).total });
@@ -305,13 +330,21 @@ export class MockTable {
     return outcome;
   }
 
-  /** A bet by `account` that no page made (another player at the table): the hand's id. */
-  place(account: string, stake: bigint, seed = toHex(randomBytes(32))): bigint {
-    const run = this.run({ method: "bet", input: seed, value: stake }, account);
+  /** A bet by `account` that no page made (another player at the table), both transactions: the hand's id. `reveal: false` leaves it waiting for its seed. */
+  place(account: string, stake: bigint, seed = toHex(randomBytes(32)), reveal = true): bigint {
+    this.knownSeeds.push(seed);
+    const run = this.run({ method: "bet", input: seedHash(account, seed), value: stake }, account);
     if (!run.ok) throw new Error(`the table refused the bet: ${JSON.stringify(run.outcome)}`);
     this.node.height += 1;
     run.apply?.();
-    return this.seat(account).openGame as bigint;
+    const id = this.seat(account).openGame as bigint;
+    if (reveal) {
+      const opened = this.run({ method: "reveal_seed", input: le8(id) + seed, value: 0n }, account);
+      if (!opened.ok) throw new Error(`the table refused the seed: ${JSON.stringify(opened.outcome)}`);
+      this.node.height += 1;
+      opened.apply?.();
+    }
+    return id;
   }
 
   /** The one open hand of `account`, as the table has it. */

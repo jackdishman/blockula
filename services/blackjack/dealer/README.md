@@ -2,9 +2,11 @@
 
 Blackjack on Blockula is a game played with FANG ([docs/BLACKJACK.md](../../../docs/BLACKJACK.md)). The table is a program; the dealer is this daemon. For one table it:
 
-- **commits ahead of the bets.** For each future game it draws a secret, hashes it down into a chain and posts the last hash (`commit_batch`). A bet takes the next unused commitment, so the cards were fixed before the player chose their seed.
-- **deals.** It reads the table and reveals each open hand's next links, in order (`reveal`). The program turns links into cards.
-- **stands idle players.** A player who lets their deadline pass is stood (`timeout`), and the hand is dealt to its end.
+- **commits ahead of the bets.** For each future game it draws a secret, hashes it down into a chain and posts the last hash (`commit_batch`). A bet takes the next unused commitment, so the cards were fixed before the player's seed was known.
+- **waits for the seed.** A bet from an account is two transactions: `bet`, with the stake and the hash of the player's seed, then `reveal_seed`, with the seed. Until the seed is on the chain the daemon owes nothing and sends nothing for that hand: no card can be known without the seed, and the program refuses a link before it.
+- **deals.** Once a hand's seed is revealed (a relayed hand: from its bet), it reads the table and reveals the hand's next links, in order (`reveal`). The program turns links into cards.
+- **ends a bet whose seed never comes.** A player has the table's `seed_blocks` to reveal. Past that the daemon calls `timeout`: the hand ends with no cards (outcome 8, `no_seed`), its stake goes to the bankroll, and its seat and its reserve are free again.
+- **stands idle players.** A player who lets their deadline to move pass is stood (`timeout`), and the hand is dealt to its end.
 
 If the dealer misses a reveal deadline, anyone may call `timeout` and the player is paid as if they had won. So the daemon is built to be restarted at any moment: everything it does is decided from the chain and from its seed store, and nothing else.
 
@@ -21,20 +23,20 @@ FANG has no value. This is a game.
 
 ```bash
 # 1. Make the dealer's key and the store's secret (both mode 0600), and print the address.
-npx tsx services/blackjack/dealer/src/cli.ts init --dir ~/.blockula/blackjack-dealer --rpc http://127.0.0.1:7070
+npx tsx services/blackjack/dealer/src/cli.ts init --dir ~/.blockula/blackjack-dealer --rpc http://127.0.0.1:18080
 
 # 2. The table's owner names that address as the dealer: when the table is created
 #    (`createTable(owner, wasm, iface, dealerAddress)`), or later with `set_dealer`.
 #    Send the address some FANG.
 
 # 3. See what it would do, without sending anything.
-npx tsx services/blackjack/dealer/src/cli.ts run --dry-run --rpc http://127.0.0.1:7070 --table boo1…
+npx tsx services/blackjack/dealer/src/cli.ts run --dry-run --rpc http://127.0.0.1:18080 --table boo1…
 
 # 4. Run it.
-npx tsx services/blackjack/dealer/src/cli.ts run --rpc http://127.0.0.1:7070 --table boo1…
+npx tsx services/blackjack/dealer/src/cli.ts run --rpc http://127.0.0.1:18080 --table boo1…
 
 # At any time:
-npx tsx services/blackjack/dealer/src/cli.ts status --rpc http://127.0.0.1:7070 --table boo1…
+npx tsx services/blackjack/dealer/src/cli.ts status --rpc http://127.0.0.1:18080 --table boo1…
 ```
 
 After `npm run build -w @blockula/blackjack-dealer` the same commands are `node services/blackjack/dealer/dist/cli.js …` (the package's bin, `blackjack-dealer`).
@@ -144,22 +146,27 @@ One JSON object a line on standard output: `time`, `level`, `action`, and what i
 | `would_commit`, `would_reveal`, `would_timeout` | A dry run's plan. |
 | `…_unconfirmed` | The call was submitted and its fate isn't known yet. It is followed by its id, not sent again. |
 | `…_lost` | That transaction never reached the node, or can't run any more: the call is planned again from the chain. |
-| `…_refused` | The program refused it. With `moved: true` the table had moved on (someone's call got there first: aborts 54, 57, 58, 59, 60, 61), which is harmless. |
+| `…_refused` | The program refused it. With `moved: true` the table had moved on (someone's call got there first: aborts 54, 57, 58, 59, 60, 61), which is harmless. A reveal that someone got ahead of with some of its links isn't refused: the program passes over the links the hand already holds and deals the rest. |
 | `…_not_sent` | Nothing was submitted (the node refused it, or couldn't be reached). Tried again after a short wait. |
 | `…_out_of_fuel` | A call ran out of the fuel it reserved; it is sent again at once with the chain's maximum. |
+| `timeout` with `turn: "seed"`, `outcome: "no_seed"` | A bet's seed never came and the daemon ended the hand at the seed's deadline. This is the player's doing, not a fault: nothing to fix. Many of them from many accounts is someone holding seats; each costs them a stake. |
+| `timeout` with `turn: "player"`, `stood: "idle"` | A player let their time to move pass; the hand was stood and is dealt to its end. |
 | `past_deadline` (warn) | A hand the dealer owes cards on is past its deadline. It is still dealt if nobody has called `timeout` yet. Find out why the daemon was late. |
 | `low_balance` (warn) | Send the dealer FANG. |
 | `tick_failed`, `start_failed` (warn) | The node didn't answer. Retried, with a wait of at most 5 seconds. |
 | `lost_secrets`, `hand_without_secret`, `secrets_mismatch` (error) | The store lacks secrets the table holds commitments for: see "If the store is lost for good". |
+| `hand_without_seed` (error) | A hand the dealer owes cards on shows no seed. The program never stores one that way: the node's answer is wrong. Nothing is revealed for it. |
 | `not_the_dealer` (error) | The key isn't the table's dealer: the owner calls `set_dealer`. |
 | `store_write_failed` (error) | The store or its backup couldn't be written. Nothing was committed. Check the disks. |
 
 ## How it stays safe to restart
 
 - **The chain is the state.** Each look reads the house, the open hands and each hand's record, and plans from those. Nothing in memory is needed after a restart.
-- **Every call can be repeated.** The program takes a link only as its chain's next (abort 58), a batch only where the last one ended (61), and a timeout only past the deadline (60).
+- **Every call can be repeated.** The program takes a link only as its chain's next (abort 58; a link the hand already holds is passed over), a batch only where the last one ended (61), and a timeout only past the deadline (60).
 - **A transaction of unknown fate is followed by its id** until it is final, failed or expired. Only one the node has never heard of is planned again.
-- **A timeout is only ever sent for a hand in the player's phase**, and it is valid for half of `reveal_blocks` at most, so a copy that lands late can't find the hand in the dealer's phase with a deadline already behind it.
+- **A hand waiting for its seed is left alone.** The daemon doesn't touch its store for it and reveals nothing, before or after a restart. When the seed lands, the next look deals the hand.
+- **A timeout is only ever sent for a hand that waits for its player** (for the seed, or for a move), and it is valid for half of `reveal_blocks` at most, so a copy that lands late can't find the hand in the dealer's phase with a deadline already behind it. One that meets a seed that arrived just in time is refused (abort 60), pays nobody, and the hand is dealt.
+- **Outcomes to watch.** A `settled` event with outcome 6 or 7 means the dealer missed a deadline and the player was paid for it: find out why. Outcome 8 means a player never revealed a seed: that is theirs, and expected now and then.
 - **Fuel.** A call pays for the fuel it reserves, and a block carries only so much of it: at the chain's maximum for every call, three calls fill a block. The daemon reserves what its calls were measured to use, with a wide margin.
 
 ## Before a launch: the dealer's part of the checklist
@@ -170,7 +177,7 @@ One JSON object a line on standard output: `time`, `level`, `action`, and what i
 - [ ] The chain is pinned (`chainId`, `genesisHash`), and `rpc` is a node on this machine that you run.
 - [ ] `pollMs` is under the block time; the table's `reveal_blocks` leaves room for a restart (a restart takes a few seconds; the default 150 blocks is minutes).
 - [ ] The daemon runs under a supervisor that restarts it (launchd, systemd), with its output kept. One daemon a table.
-- [ ] Something watches the log for `level: "error"`, `past_deadline` and `low_balance`, and the process for restarts.
+- [ ] Something watches the log for `level: "error"`, `past_deadline` and `low_balance`, the process for restarts, and the table's `settled` events for outcomes 6 and 7 (the dealer missed a deadline). Outcome 8 (a seed that never came) is no alarm.
 - [ ] The owner knows the lost-store steps above (`pause`, `skip_commits`).
 - [ ] A dry run (`run --dry-run`) against the launch table logged the plan you expect.
 
@@ -178,6 +185,6 @@ One JSON object a line on standard output: `time`, `level`, `action`, and what i
 
 ```bash
 npm test -w @blockula/blackjack-dealer          # offline: the store, the configuration, the dealer against a table in memory
-TEST=live scripts/blackjack-e2e.sh              # the daemon as a child process on a local chain: 30 hands, SIGKILL mid-hand
+TEST=live scripts/blackjack-e2e.sh              # the daemon as a child process on a local chain: 30 hands, SIGKILL mid-hand, a seed that never comes
 HANDS=60 scripts/blackjack-e2e.sh               # the soak on 4 local validators (1,000 hands by default)
 ```

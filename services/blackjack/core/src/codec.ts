@@ -7,7 +7,7 @@
  */
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bech32m } from "@scure/base";
-import { Outcome, Phase, hexBytes, isOutcome, toHex, total } from "./rules.js";
+import { Outcome, Phase, hexBytes, isOutcome, seedHashOf, toHex, total } from "./rules.js";
 
 export const DROPS_PER_FANG = 1_000_000_000n;
 export const MAX_REVEAL_LINKS = 12;
@@ -140,9 +140,16 @@ export interface Limits {
   relayMaxBet: bigint;
   /** The longest a relayer grant may last, in blocks. */
   grantMaxBlocks: bigint;
+  /** Blocks a player has, from the bet, to reveal the seed it committed to. */
+  seedBlocks: bigint;
 }
 
-const LIMIT_KEYS = ["minBet", "maxBet", "dailyCap", "dayBlocks", "maxOpenGames", "bankrollDivisor", "maxExposure", "revealBlocks", "idleBlocks", "depositCap", "relayMaxBet", "grantMaxBlocks"] as const;
+/** The fewest blocks the program lets an owner give a player to move or to reveal a seed. */
+export const MIN_PLAYER_BLOCKS = 20n;
+/** The most blocks the program lets an owner give the dealer to reveal a card. */
+export const MAX_DEALER_BLOCKS = 86_400n;
+
+const LIMIT_KEYS = ["minBet", "maxBet", "dailyCap", "dayBlocks", "maxOpenGames", "bankrollDivisor", "maxExposure", "revealBlocks", "idleBlocks", "depositCap", "relayMaxBet", "grantMaxBlocks", "seedBlocks"] as const;
 
 /** The limits `init` writes. */
 export const DEFAULT_LIMITS: Limits = Object.freeze({
@@ -158,6 +165,7 @@ export const DEFAULT_LIMITS: Limits = Object.freeze({
   depositCap: 200n * DROPS_PER_FANG,
   relayMaxBet: 25n * DROPS_PER_FANG,
   grantMaxBlocks: 43_200n,
+  seedBlocks: 300n,
 });
 
 function counted(head: Writer, items: readonly string[], max: number, what: string): string {
@@ -182,7 +190,9 @@ export const input = {
   withdraw: (amount: bigint) => new Writer().u64(amount).hex(),
   setRelayer: (relayer: string, maxBet: bigint, dailyCap: bigint, expiresAt: bigint) => new Writer().address(relayer).u64(maxBet).u64(dailyCap).u64(expiresAt).hex(),
   revoke: () => "",
-  bet: (clientSeed: string) => new Writer().hash(clientSeed).hex(),
+  /** A bet carries the seed's hash (`seedHash`), never the seed. */
+  bet: (seedHash: string) => new Writer().hash(seedHash).hex(),
+  revealSeed: (game: bigint, clientSeed: string) => new Writer().u64(game).hash(clientSeed).hex(),
   relayBet: (player: string, amount: bigint, postId: bigint) => new Writer().address(player).u64(amount).u64(postId).hex(),
   hit: (game: bigint) => new Writer().u64(game).hex(),
   stand: (game: bigint) => new Writer().u64(game).hex(),
@@ -196,6 +206,14 @@ export const input = {
   player: (account: string) => new Writer().address(account).hex(),
   commitment: (index: bigint) => new Writer().u64(index).hex(),
 } as const;
+
+/**
+ * What `account`'s bet commits to for `clientSeed`: BLAKE3("blockula/blackjack/seed" ‖ account ‖
+ * seed). The bet carries this; the seed itself follows in `reveal_seed`, once the bet is final.
+ */
+export function seedHash(account: string, clientSeed: string): string {
+  return seedHashOf(toHex(addressBytes(account)), clientSeed);
+}
 
 /** The client seed the program gives a relayed bet: BLAKE3("blockula/blackjack/relay" ‖ player ‖ post id). */
 export function relaySeed(player: string, postId: bigint): string {
@@ -246,7 +264,7 @@ export interface House {
 }
 
 export const HOUSE_BYTES = 114;
-export const LIMITS_BYTES = 96;
+export const LIMITS_BYTES = 104;
 export const GAME_BYTES = 157;
 export const PLAYER_BYTES = 195;
 
@@ -267,10 +285,13 @@ export interface Game {
   id: bigint;
   player: string;
   stake: bigint;
-  clientSeed: string;
+  /** The player's seed, once revealed (a relayed hand: from the bet). `null` while the hand waits for it. */
+  clientSeed: string | null;
+  /** What the bet committed to, while the seed isn't revealed (`Phase.Seed`); `null` after. */
+  seedHash: string | null;
   /** The newest link revealed (the commitment before any is). */
   link: string;
-  /** The block after which `timeout` works: the dealer's deadline, or the player's. */
+  /** The block after which `timeout` works: the player's deadline (the seed, a move) or the dealer's. */
   deadline: bigint;
   /** The X post a relayed bet came from; 0 for a bet from an account. */
   postId: bigint;
@@ -286,7 +307,7 @@ export interface Game {
 }
 
 function phase(n: number): Phase {
-  if (!Number.isInteger(n) || n < 1 || n > 5) throw new Error(`${n} isn't a hand's phase`);
+  if (!Number.isInteger(n) || n < 0 || n > 5) throw new Error(`${n} isn't a hand's phase`);
   return n as Phase;
 }
 
@@ -294,11 +315,14 @@ export function decodeGame(id: bigint, hex: string, prefix: string): Game {
   const r = new Reader(hexBytes(hex, GAME_BYTES), "a hand's record");
   const player = r.address(prefix);
   const stake = r.u64();
-  const clientSeed = r.hash();
+  const seedField = r.hash();
   const link = r.hash();
   const deadline = r.u64();
   const postId = r.u64();
   const ph = phase(r.u8());
+  // The same 32 bytes hold the seed's hash until the seed is revealed, and the seed after.
+  const clientSeed = ph === Phase.Seed ? null : seedField;
+  const seedHash = ph === Phase.Seed ? seedField : null;
   const flags = r.u8();
   const dealt = r.u8();
   const nPlayer = r.u8();
@@ -307,7 +331,7 @@ export function decodeGame(id: bigint, hex: string, prefix: string): Game {
   const playerCards = Array.from(r.raw(20).slice(0, nPlayer));
   const dealerCards = Array.from(r.raw(12).slice(0, nDealer));
   r.end();
-  return { id, player, stake, clientSeed, link, deadline, postId, phase: ph, table: (flags & 1) !== 0, dealt, playerCards, dealerCards, playerTotal: total(playerCards).total, dealerTotal: total(dealerCards).total };
+  return { id, player, stake, clientSeed, seedHash, link, deadline, postId, phase: ph, table: (flags & 1) !== 0, dealt, playerCards, dealerCards, playerTotal: total(playerCards).total, dealerTotal: total(dealerCards).total };
 }
 
 /** A player's last settled hand: enough to recompute every card (`verifyHand`). */
@@ -320,9 +344,17 @@ export interface LastHand {
   nPlayer: number;
   stake: bigint;
   payout: bigint;
-  clientSeed: string;
-  /** The last link revealed. */
+  /** The player's seed. `null` for a hand whose seed was never revealed (`Outcome.NoSeed`). */
+  clientSeed: string | null;
+  /** For `Outcome.NoSeed`: what the bet committed to. `null` otherwise. */
+  seedHash: string | null;
+  /** The last link revealed (the commitment, when none was). */
   link: string;
+}
+
+/** The seed field of a settled hand, by its outcome: the seed, or for a hand whose seed never came the hash it committed to. */
+function settledSeed(outcome: number, field: string): { clientSeed: string | null; seedHash: string | null } {
+  return outcome === Outcome.NoSeed ? { clientSeed: null, seedHash: field } : { clientSeed: field, seedHash: null };
 }
 
 export interface Grant {
@@ -361,7 +393,7 @@ export function decodePlayer(hex: string, prefix: string): PlayerRecord {
   const nPlayer = r.u8();
   const stake = r.u64();
   const payout = r.u64();
-  const clientSeed = r.hash();
+  const seedField = r.hash();
   const link = r.hash();
   r.end();
   const hasRelayer = relayerBytes.some((b) => b !== 0);
@@ -372,7 +404,7 @@ export function decodePlayer(hex: string, prefix: string): PlayerRecord {
     wagered,
     openGame: open === 0n ? null : open - 1n,
     grant: hasRelayer ? { relayer: bytesAddress(relayerBytes, prefix), ...grant } : null,
-    last: outcome === 0 ? null : { game, outcome: outcome as Outcome, dealt, nPlayer, stake, payout, clientSeed, link },
+    last: outcome === 0 ? null : { game, outcome: outcome as Outcome, dealt, nPlayer, stake, payout, ...settledSeed(outcome, seedField), link },
   };
 }
 
@@ -398,11 +430,14 @@ export function viewBytes(hex: string): string {
 // ---------------------------------------------------------------------------------- events
 
 export type TableEvent =
-  | { name: "bet"; game: bigint; player: string; stake: bigint; clientSeed: string; commit: string; deadline: bigint; table: boolean; postId: bigint }
+  /** A bet from an account carries `seedHash` (the seed follows in a `seed` event); a relayed one (`table`) its `clientSeed`. */
+  | { name: "bet"; game: bigint; player: string; stake: bigint; seedHash: string | null; clientSeed: string | null; commit: string; deadline: bigint; table: boolean; postId: bigint }
+  /** The player revealed the seed their bet committed to: the dealer owes the deal by `deadline`. */
+  | { name: "seed"; game: bigint; player: string; clientSeed: string; deadline: bigint }
   | { name: "cards"; game: bigint; player: string; first: number; cards: { link: string; card: number }[]; phase: Phase; playerTotal: number; dealerTotal: number; deadline: bigint }
   | { name: "hit"; game: bigint; player: string; deadline: bigint }
   | { name: "stand"; game: bigint; player: string; deadline: bigint; idle: boolean }
-  | { name: "settled"; game: bigint; player: string; outcome: Outcome; stake: bigint; payout: bigint; toTable: boolean; dealt: number; nPlayer: number; clientSeed: string; link: string; playerTotal: number; dealerTotal: number }
+  | { name: "settled"; game: bigint; player: string; outcome: Outcome; stake: bigint; payout: bigint; toTable: boolean; dealt: number; nPlayer: number; clientSeed: string | null; seedHash: string | null; link: string; playerTotal: number; dealerTotal: number }
   | { name: "relayed"; player: string; relayer: string; postId: bigint; action: "bet" | "hit" | "stand" | "withdraw"; game: bigint }
   | { name: "fund"; from: string; amount: bigint; bankroll: bigint }
   | { name: "defund"; amount: bigint; bankroll: bigint }
@@ -430,8 +465,19 @@ export function decodeEvent(name: string, dataHex: string, prefix: string): Tabl
     return e;
   };
   switch (name) {
-    case "bet":
-      return done({ name, game: r.u64(), player: r.address(prefix), stake: r.u64(), clientSeed: r.hash(), commit: r.hash(), deadline: r.u64(), table: (r.u8() & 1) !== 0, postId: r.u64() });
+    case "bet": {
+      const game = r.u64();
+      const player = r.address(prefix);
+      const stake = r.u64();
+      const seedField = r.hash();
+      const commit = r.hash();
+      const deadline = r.u64();
+      const table = (r.u8() & 1) !== 0;
+      // A relayed bet's seed is derived and known at once; a bet from an account shows only its hash.
+      return done({ name, game, player, stake, seedHash: table ? null : seedField, clientSeed: table ? seedField : null, commit, deadline, table, postId: r.u64() });
+    }
+    case "seed":
+      return done({ name, game: r.u64(), player: r.address(prefix), clientSeed: r.hash(), deadline: r.u64() });
     case "cards": {
       const game = r.u64();
       const player = r.address(prefix);
@@ -449,7 +495,13 @@ export function decodeEvent(name: string, dataHex: string, prefix: string): Tabl
       const player = r.address(prefix);
       const outcome = r.u8();
       if (!isOutcome(outcome)) throw new Error(`${outcome} isn't an outcome`);
-      return done({ name, game, player, outcome, stake: r.u64(), payout: r.u64(), toTable: r.u8() === 1, dealt: r.u8(), nPlayer: r.u8(), clientSeed: r.hash(), link: r.hash(), playerTotal: r.u8(), dealerTotal: r.u8() });
+      const stake = r.u64();
+      const payout = r.u64();
+      const toTable = r.u8() === 1;
+      const dealt = r.u8();
+      const nPlayer = r.u8();
+      const seed = settledSeed(outcome, r.hash());
+      return done({ name, game, player, outcome, stake, payout, toTable, dealt, nPlayer, ...seed, link: r.hash(), playerTotal: r.u8(), dealerTotal: r.u8() });
     }
     case "relayed": {
       const player = r.address(prefix);
@@ -541,6 +593,9 @@ export const ABORTS: Readonly<Record<number, string>> = Object.freeze({
   67: "That grant doesn't fit the table's limits.",
   68: "That hand wasn't bet from a table balance.",
   69: "The house has too much at stake on open hands right now.",
+  70: "That hand isn't waiting for a seed.",
+  71: "That isn't the seed the bet was placed with.",
+  72: "The time to reveal that bet's seed has passed.",
 });
 
 /** What an abort code means, in the table's words. */

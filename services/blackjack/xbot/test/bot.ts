@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { altText } from "@blockula/blackjack";
+import { Outcome, Phase, altText } from "@blockula/blackjack";
 import { Bot, DirSink, MemoryStore, NOTE, keyPath, loadSettings, pinStore, readKey, runPosts, writeKey, type Post } from "../src/index.js";
 import { World, type PlayerSetup } from "./world.js";
 
@@ -96,6 +96,36 @@ async function withHand() {
   }
   assert.equal((await say("Mina_H", "@BlockulaChain stand", deal.post.id)).result, "ok");
   assert.ok(w.table.maxOpenPerPlayer === 1 && w.table.invariant());
+}
+
+// ---- a hand bet from the player's own account (two transactions: the seed's hash, then the seed) isn't the bot's ----
+{
+  const w = new World("bot-direct", { dealerDelay: 0, players: [player("mina", "Mina_H")] });
+  const say = async (text: string, to: string | null = null) => {
+    w.clock.advance(120_000);
+    return w.bot.handle(mk("Mina_H", text, to));
+  };
+  const rec = w.table.players.get(w.table.account("mina"))!;
+  // Open on the chain, waiting for its seed (phase 0), bet on the table page: the bot never opened it.
+  rec.openGame = 99n;
+  const refused = await say("@BlockulaChain deal 5");
+  assert.equal(refused.result, "refused:hand_open");
+  assert.ok(refused.replies[0].text.includes("Finish it on the table page first."), refused.replies[0].text);
+  assert.equal((await say("@BlockulaChain hit", refused.replies[0].id)).result, "refused:no_hand", "no move on a hand the bot didn't open");
+  assert.equal((await say("@BlockulaChain stop")).result, "refused:finish_first");
+  await w.bot.tick();
+  assert.equal(w.table.relayed.length, 0, "nothing was relayed, and no timeout was sent, for a hand that isn't a table hand");
+  assert.equal(w.store.state.hands.mina_h, undefined);
+  // Its seed never came (outcome 8, nothing dealt, the hash where a seed would be): the seat is
+  // free, and the bot deals a hand of its own without mistaking the old one for it.
+  rec.openGame = null;
+  rec.last = { game: 99n, outcome: Outcome.NoSeed, dealt: 0, nPlayer: 0, stake: 5n * F, payout: 0n, clientSeed: null, seedHash: "ab".repeat(32), link: "cd".repeat(32) };
+  const deal = await say("@BlockulaChain deal 5");
+  assert.equal(deal.result, "ok");
+  assert.equal(deal.replies[0].meta.gameId, "0");
+  assert.deepEqual(w.table.relayed.map((e) => e.action), ["bet"]);
+  // A relayed hand's seed is known from the bet: it never waits for one.
+  for (const g of w.table.games.values()) assert.ok(g.phase !== Phase.Seed && g.clientSeed !== null && g.seedHash === null);
 }
 
 // ---- stop: the balance goes to the player's own account, and the bot goes quiet until a deal goes through ----

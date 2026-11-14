@@ -134,7 +134,10 @@ export const call = {
   withdraw: (amount: bigint): TableCall => ({ method: "withdraw", input: input.withdraw(amount) }),
   setRelayer: (relayer: string, maxBet: bigint, dailyCap: bigint, expiresAt: bigint): TableCall => ({ method: "set_relayer", input: input.setRelayer(relayer, maxBet, dailyCap, expiresAt), storageLimit: BOND }),
   revoke: (): TableCall => ({ method: "revoke", input: input.revoke() }),
-  bet: (stake: bigint, clientSeed: string): TableCall => ({ method: "bet", input: input.bet(clientSeed), value: stake, storageLimit: BOND }),
+  /** A bet's first transaction: the stake and the seed's hash (`seedHash(account, clientSeed)`). Keep the seed: `revealSeed` needs it. */
+  bet: (stake: bigint, seedHash: string): TableCall => ({ method: "bet", input: input.bet(seedHash), value: stake, storageLimit: BOND }),
+  /** A bet's second transaction, sent once the first is final: the seed itself. Only then does the dealer deal. */
+  revealSeed: (game: bigint, clientSeed: string): TableCall => ({ method: "reveal_seed", input: input.revealSeed(game, clientSeed) }),
   relayBet: (player: string, amount: bigint, postId: bigint): TableCall => ({ method: "relay_bet", input: input.relayBet(player, amount, postId), storageLimit: BOND }),
   hit: (game: bigint): TableCall => ({ method: "hit", input: input.hit(game) }),
   stand: (game: bigint): TableCall => ({ method: "stand", input: input.stand(game) }),

@@ -7,7 +7,7 @@ import { randomBytes } from "node:crypto";
 import { closeSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Outcome, Phase, Table, call, decodeGame, decodeGameId, decodeHouse, decodeOpenList, eventNamed, eventsOf, exposure, payout, relaySeed, send, storageKey, verifyHand, type Game, type TableCall, type TableEvent } from "@blockula/blackjack";
+import { Outcome, Phase, Table, call, decodeGame, decodeGameId, decodeHouse, decodeOpenList, eventNamed, eventsOf, exposure, payout, relaySeed, seedHash, send, storageKey, verifyHand, type Game, type TableCall, type TableEvent } from "@blockula/blackjack";
 import { ApiError, Client, ProgramFailedError, TxFailedError, TxPendingError, checkReceipt, type ProgramReceipt, type Wallet } from "@blockula/sdk";
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -139,6 +139,8 @@ export interface FuelSeen {
  */
 export class Watcher {
   readonly bets = new Map<bigint, BetEvent>();
+  /** The seed each bet from an account revealed (its `seed` event). */
+  readonly seeds = new Map<bigint, string>();
   readonly settled = new Map<bigint, SettledEvent & { height: number; tx: string; by: string }>();
   readonly fuel = new Map<string, FuelSeen>();
   /** Every link the chain has published (the `cards` events'): none may be in the daemon's log. */
@@ -236,7 +238,13 @@ export class Watcher {
 
   private event(e: TableEvent, height: number, tx: string, by: string, receipt: ProgramReceipt): void {
     if (e.name === "bet") this.bets.set(e.game, e);
-    else if (e.name === "cards") for (const c of e.cards) this.links.add(c.link);
+    else if (e.name === "seed") {
+      const bet = this.bets.get(e.game);
+      assert.ok(bet && !bet.table && bet.seedHash !== null, `VIOLATION: game ${e.game}'s seed came without a bet that committed to one`);
+      assert.equal(seedHash(e.player, e.clientSeed), bet.seedHash, `VIOLATION: game ${e.game}'s seed isn't the one its bet committed to`);
+      assert.ok(!this.seeds.has(e.game), `VIOLATION: game ${e.game}'s seed was revealed twice`);
+      this.seeds.set(e.game, e.clientSeed);
+    } else if (e.name === "cards") for (const c of e.cards) this.links.add(c.link);
     else if (e.name === "fund") this.expectedBankroll += e.amount;
     else if (e.name === "defund") this.expectedBankroll -= e.amount;
     else if (e.name === "stand" && e.idle) this.idleStands.set(e.game, by);
@@ -244,9 +252,18 @@ export class Watcher {
       const bet = this.bets.get(e.game);
       assert.ok(bet, `VIOLATION: game ${e.game} settled without a bet event before it`);
       // Every card recomputed from the settled event, down to the commitment the bet took.
-      const proof = verifyHand({ ...e, commit: bet.commit });
+      // And the seed is the one the bet committed to (a bet from an account), or the post's (a relayed one).
+      const proof = verifyHand({ ...e, commit: bet.commit, seedHash: bet.seedHash });
       assert.equal(e.stake, bet.stake, `VIOLATION: game ${e.game}'s stake`);
-      assert.equal(e.clientSeed, bet.clientSeed, `VIOLATION: game ${e.game}'s client seed`);
+      if (bet.table) assert.equal(e.clientSeed, bet.clientSeed, `VIOLATION: game ${e.game}'s client seed`);
+      else if (e.outcome === Outcome.NoSeed) {
+        assert.ok(proof.unrevealed && !this.seeds.has(e.game), `VIOLATION: game ${e.game} ended without a seed, but one was revealed`);
+        assert.equal(e.seedHash, bet.seedHash, `VIOLATION: game ${e.game}'s seed hash`);
+        assert.equal(e.dealt, 0, `VIOLATION: game ${e.game} was dealt cards before its seed`);
+      } else {
+        assert.equal(proof.seedChecked, true, `VIOLATION: game ${e.game}'s seed wasn't checked against its bet`);
+        assert.equal(e.clientSeed, this.seeds.get(e.game), `VIOLATION: game ${e.game}'s client seed isn't the one revealed`);
+      }
       assert.equal(e.payout, payout(e.stake, e.outcome), `VIOLATION: game ${e.game}'s payout`);
       assert.equal(e.toTable, bet.table && e.payout > 0n, `VIOLATION: game ${e.game} paid to the wrong place`);
       assert.equal(proof.forfeited, e.outcome === Outcome.Forfeit || e.outcome === Outcome.ForfeitDeal);
@@ -398,16 +415,30 @@ export interface Play {
   onPlayerTurn?: (g: Game) => Promise<void>;
 }
 
-/** Places a bet for `seat`. Returns the hand's id and its bet event. Throws `ProgramFailedError` when the table refuses it. */
-export async function placeBet(p: Play, seat: Seat, stake: bigint): Promise<{ id: bigint; bet: BetEvent; height: number }> {
+/**
+ * Places a bet for `seat`. A seat that signs for itself bets in two transactions, as a wallet
+ * does: the stake with the seed's hash, then (once that is final) the seed; `reveal: false`
+ * leaves the second one out, and the seed comes back for the caller to reveal or withhold. A
+ * relayed bet is one transaction. Returns the hand's id and its bet event. Throws
+ * `ProgramFailedError` when the table refuses it.
+ */
+export async function placeBet(p: Play, seat: Seat, stake: bigint, opts: { reveal?: boolean } = {}): Promise<{ id: bigint; bet: BetEvent; height: number; seed: string }> {
   const seed = randomBytes(32).toString("hex");
   const post = nextPost();
-  const r = seat.relayer ? await sure(p.client, p.program, seat.relayer, call.relayBet(seat.wallet.address, stake, post)) : await sure(p.client, p.program, seat.wallet, call.bet(stake, seed));
+  const r = seat.relayer ? await sure(p.client, p.program, seat.relayer, call.relayBet(seat.wallet.address, stake, post)) : await sure(p.client, p.program, seat.wallet, call.bet(stake, seedHash(seat.wallet.address, seed)));
   const id = decodeGameId(r.receipt.claims.return_data[0].data);
   const bet = eventNamed(r.events, "bet")!;
   assert.deepEqual([bet.game, bet.player, bet.stake, bet.table], [id, seat.wallet.address, stake, seat.relayer !== undefined]);
-  assert.equal(bet.clientSeed, seat.relayer ? relaySeed(seat.wallet.address, post) : seed, "the client seed is the player's (or the post's)");
-  return { id, bet, height: r.height };
+  if (seat.relayer) {
+    assert.deepEqual([bet.clientSeed, bet.seedHash], [relaySeed(seat.wallet.address, post), null], "a relayed bet's seed is the post's");
+    return { id, bet, height: r.height, seed: bet.clientSeed! };
+  }
+  assert.deepEqual([bet.clientSeed, bet.seedHash], [null, seedHash(seat.wallet.address, seed)], "the bet shows the seed's hash, never the seed");
+  if (opts.reveal !== false) {
+    const opened = await sure(p.client, p.program, seat.wallet, call.revealSeed(id, seed));
+    assert.equal(eventNamed(opened.events, "seed")?.clientSeed, seed);
+  }
+  return { id, bet, height: r.height, seed };
 }
 
 /** The player's move on an open hand: its own, or its relayer's. Returns false when the hand had moved on (the idle timeout got there first). */

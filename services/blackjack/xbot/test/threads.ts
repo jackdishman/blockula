@@ -131,7 +131,10 @@ for (const [i, thread] of threads.entries()) {
 // ---- the fixture covers what it's meant to ----
 for (const result of ["ok", "ignored:not a command", "ignored:duplicate", "ignored:not the hand's player", "ignored:stopped", "ignored:rate", "refused:no_link", "refused:unverified", "refused:conflict", "refused:no_grant", "refused:expired", "refused:paused", "refused:hand_open", "refused:limits", "refused:daily", "refused:balance", "refused:no_hand", "refused:thread", "refused:waiting", "refused:finish_first"]) assert.ok((seen.results.get(result) ?? 0) >= 3, `the fixture has posts that end ${result}`);
 for (const action of ["deal", "hit", "stand", "balance", "stop", "update", "timeout", "settled"]) assert.ok((seen.actions.get(action) ?? 0) >= 3, `the fixture has ${action} replies`);
-for (const o of Object.values(Outcome)) assert.ok(seen.outcomes.has(o), `the fixture has a hand that ended with outcome ${o}`);
+// Every outcome a relayed hand can have: a seed that never came (outcome 8) ends only a bet from
+// an account, which the bot never places.
+assert.ok(!seen.outcomes.has(Outcome.NoSeed), "no relayed hand waits for a seed");
+for (const o of Object.values(Outcome).filter((x) => x !== Outcome.NoSeed)) assert.ok(seen.outcomes.has(o), `the fixture has a hand that ended with outcome ${o}`);
 assert.ok(seen.posts >= 1_000 && seen.hands >= 150);
 
 console.log(`✓ threads: 100 threads, ${seen.posts} posts, ${seen.replies} replies matched exactly, ${seen.hands} hands settled and verified`);

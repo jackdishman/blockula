@@ -12,9 +12,9 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_LIMITS, DROPS_PER_FANG, Phase, Table, call, createTable, dealers } from "@blockula/blackjack";
+import { DEFAULT_LIMITS, DROPS_PER_FANG, Outcome, Phase, Table, call, createTable, dealers } from "@blockula/blackjack";
 import { Client, Wallet } from "@blockula/sdk";
-import { Daemon, Watcher, cli, guest, localRpc, placeBet, playHand, playOut, sleep, sure, until, waitPast, type Play, type Played, type Seat } from "./harness.js";
+import { Daemon, Watcher, abortOf, cli, guest, localRpc, placeBet, playHand, playOut, sleep, sure, until, waitPast, type Play, type Played, type Seat } from "./harness.js";
 
 if (!process.env.BLOCKULA_RPC) {
   console.log("- BLOCKULA_RPC isn't set: the dealer's live test is skipped (see the file's header)");
@@ -51,8 +51,8 @@ try {
   // The watcher reads every block from here on: the funding, every bet, every settlement.
   watcher = new Watcher(client, table, program);
   watcher.start(Number((await client.status()).height));
-  // 40 blocks to reveal: a killed daemon is back within a few seconds, far inside it. 25 to move.
-  const limits = { ...DEFAULT_LIMITS, revealBlocks: 40n, idleBlocks: 25n };
+  // 40 blocks to reveal: a killed daemon is back within a few seconds, far inside it. 25 to move, 25 to reveal a bet's seed.
+  const limits = { ...DEFAULT_LIMITS, revealBlocks: 40n, idleBlocks: 25n, seedBlocks: 25n };
   await sure(client, program, owner, call.setLimits(limits));
   await sure(client, program, owner, call.fund(300n * FANG));
 
@@ -147,6 +147,27 @@ try {
   }
   assert.ok(idle !== undefined);
 
+  // ---- a bet whose seed never comes: the daemon deals nothing, then ends the hand at the seed's deadline
+  const before = await table.house();
+  const unopened = await placeBet(play, seats[2], 2n * FANG, { reveal: false });
+  const waiting = await table.game(unopened.id);
+  assert.ok(waiting && waiting.phase === Phase.Seed && waiting.clientSeed === null);
+  await sleep(2000);
+  assert.equal((await table.game(unopened.id))?.dealt, 0, "nothing is dealt before the seed");
+  await waitPast(client, waiting.deadline);
+  const ended = await watcher.settledEvent(unopened.id);
+  assert.deepEqual([ended.outcome, ended.payout, ended.by, ended.dealt], [Outcome.NoSeed, 0n, dealerAddress, 0]);
+  assert.equal((await table.house()).bankroll, before.bankroll + 2n * FANG, "the stake is the bankroll's");
+  await assert.rejects(sure(client, program, carol, call.revealSeed(unopened.id, unopened.seed)), (e) => abortOf(e) === 54, "a seed for a hand that's over");
+  console.log(`✓ game ${unopened.id}'s seed never came: the daemon dealt nothing and ended it at block ${ended.height} (deadline ${waiting.deadline}); the stake went to the bankroll`);
+  // A seed that takes its time (but arrives in time) is dealt as soon as it lands.
+  const slow = await placeBet(play, seats[2], FANG, { reveal: false });
+  await sleep(1500);
+  await sure(client, program, carol, call.revealSeed(slow.id, slow.seed));
+  const dealt = await playOut(play, seats[2], slow.id);
+  assert.ok(dealt.outcome <= Outcome.Bust && dealt.by === dealerAddress);
+  console.log(`✓ game ${slow.id} waited for its seed, then was dealt to its end`);
+
   // ---- the end: nothing forfeited, everything verified, nothing secret in the log
   await until("no open hands", async () => (await table.openGames()).length === 0);
   await watcher.caughtUp();
@@ -158,7 +179,8 @@ try {
     assert.ok(s.outcome >= 1 && s.outcome <= 5, `game ${h.id} ended by its cards (outcome ${s.outcome}), not a missed deadline`);
     assert.equal(s.by, dealerAddress, "the daemon's reveal settled it");
   }
-  assert.equal([...watcher.settled.values()].filter((s) => s.outcome > 5).length, 0, "no hand was forfeited");
+  assert.equal([...watcher.settled.values()].filter((s) => s.outcome === Outcome.Forfeit || s.outcome === Outcome.ForfeitDeal).length, 0, "no hand was forfeited by the dealer");
+  assert.equal([...watcher.settled.values()].filter((s) => s.outcome === Outcome.NoSeed).length, 1, "one bet's seed never came");
   assert.equal(await daemon.stop(), 0);
   const lines = daemon.log();
   assert.ok(lines.filter((l) => l.action === "started").length >= 3, "the daemon started three times");

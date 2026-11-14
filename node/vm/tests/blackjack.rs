@@ -2,8 +2,12 @@
 //! interface's kinds and payability, on every engine (`EngineKind::ALL`), each call run twice:
 //!
 //! * **Protocol v2.** The module uploads under v2 and imports none of v3's host functions.
-//! * **Every transition** of a hand (bet, deal, hit, stand, the dealer's play, each outcome) with
-//!   the cards recomputed here from the chain with the `blake3` crate.
+//! * **Every transition** of a hand (bet, the seed's reveal, deal, hit, stand, the dealer's play,
+//!   each outcome) with the cards recomputed here from the chain with the `blake3` crate.
+//! * **A bet in two transactions**: the bet commits to the seed's hash and takes the commitment,
+//!   the seed follows; a wrong seed, someone else's, a second one and a late one are refused, a
+//!   seed that never comes forfeits the stake, and nobody who sees a bet or a seed in the mempool
+//!   can steer the hand's cards.
 //! * **Every abort**, cap and limit; the pause, which stops new bets and nothing else.
 //! * **Timeouts**: a dealer that misses a reveal pays the player; an idle player stands.
 //! * **Table balances and relayers**: a relayer plays a player's balance within the grant and can
@@ -108,6 +112,13 @@ fn card(link: &[u8; 32], seed: &[u8; 32], id: u64, j: usize) -> u8 {
     (u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap()) % 52) as u8
 }
 
+/// What `who`'s bet commits to for `seed`, from the documented preimage with the `blake3` crate.
+fn seed_hash(who: &str, seed: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"blockula/blackjack/seed").update(&addr(who)).update(seed);
+    *h.finalize().as_bytes()
+}
+
 /// The cards game `id` would deal under `seed`, all 32 of them.
 fn deck(id: u64, seed: &[u8; 32]) -> Vec<u8> {
     let links = chain_of(id);
@@ -157,8 +168,8 @@ fn below_17(hand: &Hand) -> bool {
 struct Table {
     host: MemHost,
     kinds: BTreeMap<String, MethodKind>,
-    /// The storage limit player and owner calls run under; the dealer's reveals and anyone's
-    /// timeouts always run under 0.
+    /// The storage limit player and owner calls run under; the dealer's reveals, a seed's reveal
+    /// and anyone's timeouts always run under 0.
     storage_limit: u64,
 }
 
@@ -195,7 +206,7 @@ impl Table {
     /// A successful one is applied, and the invariant checked.
     fn tx(&mut self, signer: &str, method: &str, input: Vec<u8>, value: u64) -> Receipt {
         let kind = *self.kinds.get(method).unwrap_or_else(|| panic!("no method {method}"));
-        let storage_limit = if matches!(method, "reveal" | "timeout") { 0 } else { self.storage_limit };
+        let storage_limit = if matches!(method, "reveal" | "timeout" | "reveal_seed") { 0 } else { self.storage_limit };
         let limits = TxLimits { fuel_limit: MAX_TX_FUEL, storage_limit };
         let call = self.host.bind(Call { program: addr(PROGRAM), version_digest: [0; 32], method: method.into(), input, value, kind });
         let h = &self.host;
@@ -298,7 +309,7 @@ impl Table {
                     let player: Address = entry.value[..32].try_into().unwrap();
                     let p = self.host.storage(&addr(PROGRAM), &[&b"p"[..], &player].concat()).unwrap().value;
                     assert_eq!(u64_at(&p, 24), id + 1, "the player's open hand");
-                    assert!((1..=4).contains(&entry.value[120]), "an open hand's phase");
+                    assert!((0..=4).contains(&entry.value[120]), "an open hand's phase");
                 }
                 b'p' => {
                     assert_eq!(entry.value.len(), PLAYER);
@@ -332,11 +343,25 @@ impl Table {
         assert!(r.ok(), "{:?}", r.fail);
     }
 
-    /// Bets `stake` from `who`'s account; the game's id.
+    /// The bet's first transaction: `stake` from `who`'s account and the hash of `seed`.
+    fn commit_bet(&mut self, who: &str, stake: u64, seed: &[u8; 32]) -> Receipt {
+        self.tx(who, "bet", seed_hash(who, seed).to_vec(), stake)
+    }
+
+    /// The bet's second transaction: `who` reveals `seed` for hand `id`.
+    fn reveal_seed(&mut self, who: &str, id: u64, seed: &[u8; 32]) -> Receipt {
+        self.tx(who, "reveal_seed", [&le(id)[..], seed].concat(), 0)
+    }
+
+    /// Bets `stake` from `who`'s account, both transactions; the game's id. The dealer owes the
+    /// deal.
     fn bet(&mut self, who: &str, stake: u64, seed: &[u8; 32]) -> u64 {
-        let r = self.tx(who, "bet", seed.to_vec(), stake);
+        let r = self.commit_bet(who, stake, seed);
         assert!(r.ok(), "bet: {:?}", r.fail);
-        u64_at(&r.returns[0], 0)
+        let id = u64_at(&r.returns[0], 0);
+        let r = self.reveal_seed(who, id, seed);
+        assert!(r.ok(), "reveal_seed: {:?}", r.fail);
+        id
     }
 
     /// Reveals links `from..from + n` of game `id`'s chain.
@@ -414,7 +439,7 @@ fn reveal_input(id: u64, links: &[[u8; 32]]) -> Vec<u8> {
 
 /// `set_limits`' input: the defaults with `changes` (index, value) applied.
 fn limits_input(changes: &[(usize, u64)]) -> Vec<u8> {
-    let mut l = [FANG, 50 * FANG, 500 * FANG, 43_200, 10, 20, 750 * FANG, 150, 1_800, 200 * FANG, 25 * FANG, 43_200];
+    let mut l = [FANG, 50 * FANG, 500 * FANG, 43_200, 10, 20, 750 * FANG, 150, 1_800, 200 * FANG, 25 * FANG, 43_200, 300];
     for (i, v) in changes {
         l[*i] = *v;
     }
@@ -435,6 +460,7 @@ const DEPOSIT_CAP: usize = 9;
 #[allow(dead_code)]
 const RELAY_MAX_BET: usize = 10;
 const GRANT_BLOCKS: usize = 11;
+const SEED_BLOCKS: usize = 12;
 
 // ---------------------------------------------------------------------------------- protocol v2
 
@@ -515,7 +541,8 @@ fn the_bankroll_is_funded_by_anyone_and_taken_out_by_the_owner_only() {
 fn limits_are_the_owners_and_checked() {
     let mut t = Table::bare();
     assert_eq!(abort_code(&t.tx("alice", "set_limits", limits_input(&[]), 0)), Some(42));
-    assert_eq!(abort_code(&t.tx("house", "set_limits", vec![0; 95], 0)), Some(1));
+    assert_eq!(abort_code(&t.tx("house", "set_limits", vec![0; 103], 0)), Some(1));
+    assert_eq!(abort_code(&t.tx("house", "set_limits", vec![0; 96], 0)), Some(1), "the twelve limits of before");
     let new = limits_input(&[(MIN_BET, 2 * FANG), (MAX_BET, 10 * FANG), (MAX_OPEN, 32), (REVEAL_BLOCKS, 20)]);
     let r = t.tx("house", "set_limits", new.clone(), 0);
     assert_eq!(event(&r, "limits"), new);
@@ -533,11 +560,20 @@ fn limits_are_the_owners_and_checked() {
         (vec![(IDLE_BLOCKS, 0)], "no time to move"),
         (vec![(IDLE_BLOCKS, u64::MAX)], "a deadline that overflows"),
         (vec![(GRANT_BLOCKS, 0)], "grants of no blocks"),
+        (vec![(SEED_BLOCKS, 0)], "no time to reveal a seed"),
+        (vec![(SEED_BLOCKS, 19)], "a seed's reveal the player can't make in time"),
+        (vec![(SEED_BLOCKS, u64::MAX)], "a deadline that overflows"),
+        (vec![(IDLE_BLOCKS, 19)], "a move the player can't make in time"),
+        (vec![(REVEAL_BLOCKS, 86_401)], "a dealer that may stall for good"),
+        (vec![(REVEAL_BLOCKS, 1 << 40)], "a dealer that may stall for good"),
         (vec![(DEPOSIT_CAP, u64::MAX)], "an amount past the supply"),
     ] {
         assert_eq!(abort_code(&t.tx("house", "set_limits", limits_input(&bad), 0)), Some(45), "{why}");
     }
     assert_eq!(t.view_bytes("limits", vec![]), new, "a refused change changes nothing");
+    // The bounds themselves are allowed.
+    assert!(t.tx("house", "set_limits", limits_input(&[(SEED_BLOCKS, 20), (IDLE_BLOCKS, 20), (REVEAL_BLOCKS, 86_400)]), 0).ok());
+    assert!(t.tx("house", "set_limits", new.clone(), 0).ok());
 
     // The dealer and the relayers are the owner's to name.
     assert_eq!(abort_code(&t.tx("dealer", "set_dealer", addr("bob").to_vec(), 0)), Some(42));
@@ -614,15 +650,34 @@ fn a_hand_from_bet_to_settlement() {
     let stake = 4 * FANG;
     let (alice, program) = (t.balance("alice"), t.balance(PROGRAM));
 
-    t.host.height = 100;
-    let r = t.tx("alice", "bet", seed.to_vec(), stake);
+    // The bet: the stake and the seed's hash. It takes the commitment and the reserve, and the
+    // player has `seed_blocks` to reveal the seed. The seed itself is nowhere yet.
+    t.host.height = 98;
+    let hash = seed_hash("alice", &seed);
+    let r = t.commit_bet("alice", stake, &seed);
     assert_eq!(r.returns[0], le(0));
-    assert_eq!(event(&r, "bet"), [&le(0)[..], &addr("alice"), &le(stake), &seed, &links[0], &le(250), &[0], &le(0)].concat());
+    assert_eq!(event_names(&r), ["bet"]);
+    assert_eq!(event(&r, "bet"), [&le(0)[..], &addr("alice"), &le(stake), &hash, &links[0], &le(398), &[0], &le(0)].concat());
     assert_eq!(t.balance("alice"), alice - stake);
     assert_eq!(t.house(), House { bankroll: 1_994 * FANG, reserved: 6 * FANG, stakes: stake, table: 0, next_commit: 16, next_game: 1, paused: 0, open: 1 });
     let g = t.game(0).unwrap();
-    assert_eq!(g[..125], [&addr("alice")[..], &le(stake), &seed, &links[0], &le(250), &le(0), &[1, 0, 0, 0, 0]].concat());
+    assert_eq!(g[..125], [&addr("alice")[..], &le(stake), &hash, &links[0], &le(398), &le(0), &[0, 0, 0, 0, 0]].concat());
+    assert!(!g.windows(32).any(|w| w == seed), "the seed isn't stored before it's revealed");
     assert_eq!(t.view("open_games", vec![]), [&1u32.to_le_bytes()[..], &le(0)].concat());
+    // Until the seed is known the dealer owes nothing, and there is no move.
+    assert_eq!(abort_code(&t.reveal(0, 1, 3)), Some(57));
+    assert_eq!(abort_code(&t.tx("alice", "hit", le(0), 0)), Some(56));
+
+    // The seed: the dealer owes the deal, within `reveal_blocks` of it.
+    t.host.height = 100;
+    let r = t.reveal_seed("alice", 0, &seed);
+    assert!(r.ok(), "{:?}", r.fail);
+    assert_eq!(event_names(&r), ["seed"]);
+    assert_eq!(event(&r, "seed"), [&le(0)[..], &addr("alice"), &seed, &le(250)].concat());
+    assert!(r.returns[0].is_empty());
+    let g = t.game(0).unwrap();
+    assert_eq!(g[..125], [&addr("alice")[..], &le(stake), &seed, &links[0], &le(250), &le(0), &[1, 0, 0, 0, 0]].concat());
+    assert_eq!(t.house(), House { bankroll: 1_994 * FANG, reserved: 6 * FANG, stakes: stake, table: 0, next_commit: 16, next_game: 1, paused: 0, open: 1 }, "the seed moves no FANG");
 
     // The deal: three links, three cards, the player's turn with its own deadline.
     t.host.height = 103;
@@ -681,7 +736,7 @@ fn a_hand_from_bet_to_settlement() {
     }
     assert_eq!(link, links[0]);
     // It's over: no more moves, reveals or timeouts.
-    for (who, method, input) in [("alice", "hit", le(0)), ("alice", "stand", le(0)), ("dealer", "timeout", le(0)), ("stranger", "game", le(0))] {
+    for (who, method, input) in [("alice", "hit", le(0)), ("alice", "stand", le(0)), ("dealer", "timeout", le(0)), ("stranger", "game", le(0)), ("alice", "reveal_seed", [&le(0)[..], &seed].concat())] {
         assert_eq!(abort_code(&t.tx(who, method, input, 0)), Some(54), "{method} on a settled hand");
     }
     assert_eq!(abort_code(&t.reveal(0, used + 1, 1)), Some(54));
@@ -751,10 +806,38 @@ fn reveals_are_the_chains_next_links_and_no_more() {
     let r = t.reveal(id, 1, 2);
     assert_eq!(r.returns[0], [Phase::Deal as u8, 0]);
     assert_eq!(u64_at(&t.game(id).unwrap(), 104), deadline, "a partial reveal doesn't extend the deadline");
-    assert_eq!(abort_code(&t.reveal(id, 1, 1)), Some(58), "a link already revealed");
-    // Anyone who knows the link may reveal it.
-    let r = t.tx("stranger", "reveal", reveal_input(id, &links[3..4]), 0);
+    // Links the hand already holds are passed over (BJ-08): a call with nothing new succeeds,
+    // deals nothing, emits nothing and moves no deadline.
+    let before = t.game(id).unwrap();
+    for held in [&links[1..2], &links[2..3], &links[1..3], &links[2..2 + 1]] {
+        let r = t.tx("dealer", "reveal", reveal_input(id, held), 0);
+        assert!(r.ok());
+        assert_eq!(r.returns[0], [Phase::Deal as u8, 0]);
+        assert!(r.events.is_empty(), "no event for a reveal with nothing new");
+        assert_eq!(t.game(id).unwrap(), before);
+    }
+    // The commitment is no link, and a held link doesn't excuse a wrong one after it.
+    assert_eq!(abort_code(&t.tx("dealer", "reveal", reveal_input(id, &[links[0]]), 0)), Some(58));
+    assert_eq!(abort_code(&t.tx("dealer", "reveal", reveal_input(id, &[links[1], links[4]]), 0)), Some(58));
+    assert_eq!(abort_code(&t.tx("dealer", "reveal", reveal_input(id, &[links[2], chain_of(1)[3]]), 0)), Some(58));
+    assert_eq!(t.game(id).unwrap(), before);
+    // Anyone who knows the link may reveal it. The dealer's whole deal, sent after someone got
+    // ahead of it with the first two links, deals the third: the `cards` event counts that one.
+    let r = t.tx("dealer", "reveal", reveal_input(id, &links[1..4]), 0);
     assert_eq!(r.returns[0], [Phase::Player as u8, 0]);
+    let ev = event(&r, "cards");
+    assert_eq!((ev[40], ev[41]), (3, 1), "the third card, one link");
+    assert_eq!(ev[42..74], links[3]);
+    assert_eq!(ev.len(), 42 + 33 + 11);
+    // On the player's turn a call with only held links changes nothing: the deadline stays.
+    let before = t.game(id).unwrap();
+    t.host.height += 3;
+    let r = t.tx("stranger", "reveal", reveal_input(id, &links[1..4]), 0);
+    assert!(r.ok() && r.events.is_empty());
+    assert_eq!(r.returns[0], [Phase::Player as u8, 0]);
+    assert_eq!(t.game(id).unwrap(), before, "a reveal with nothing new doesn't extend the player's deadline");
+    // Held links, then one the hand doesn't take yet: the dealer owes no card.
+    assert_eq!(abort_code(&t.tx("dealer", "reveal", reveal_input(id, &links[2..5]), 0)), Some(57));
     // On the player's turn the dealer owes nothing.
     assert_eq!(abort_code(&t.reveal(id, 4, 1)), Some(57));
     // A hit takes one card and no more.
@@ -780,8 +863,13 @@ fn reveals_are_the_chains_next_links_and_no_more() {
 fn moves_are_the_players_on_their_turn() {
     let mut t = Table::new();
     let seed = seed_for(0, never, |_, h| !bj_core::natural(h.player_cards()));
-    let id = t.bet("alice", FANG, &seed);
-    // Before the deal there's no move.
+    let r = t.commit_bet("alice", FANG, &seed);
+    let id = u64_at(&r.returns[0], 0);
+    // Before the seed, and before the deal, there's no move.
+    for method in ["hit", "stand"] {
+        assert_eq!(abort_code(&t.tx("alice", method, le(id), 0)), Some(56), "{method} before the seed");
+    }
+    assert!(t.reveal_seed("alice", id, &seed).ok());
     for method in ["hit", "stand"] {
         assert_eq!(abort_code(&t.tx("alice", method, le(id), 0)), Some(56), "{method} before the deal");
     }
@@ -798,6 +886,212 @@ fn moves_are_the_players_on_their_turn() {
     for method in ["hit", "stand"] {
         assert_eq!(abort_code(&t.tx("alice", method, le(id), 0)), Some(56), "{method} after standing");
     }
+}
+
+// ---------------------------------------------------------------------------------- a bet in two transactions
+
+#[test]
+fn a_seed_opens_the_bet_it_was_committed_to_and_nothing_else_does() {
+    let mut t = Table::new();
+    approve(&mut t, "bot", true);
+    let seed = seed_for(0, never, |_, h| !bj_core::natural(h.player_cards()));
+    t.host.height = 1_000;
+    let r = t.commit_bet("alice", 3 * FANG, &seed);
+    let id = u64_at(&r.returns[0], 0);
+    let committed = t.game(id).unwrap();
+
+    // A seed that isn't the committed one: another seed, the hash itself, the seed with a bit
+    // flipped, the seed hashed for another account.
+    let mut flipped = seed;
+    flipped[31] ^= 1;
+    for wrong in [[7; 32], seed_hash("alice", &seed), flipped, seed_hash("bob", &seed), [0; 32]] {
+        assert_eq!(abort_code(&t.reveal_seed("alice", id, &wrong)), Some(71));
+    }
+    // The right seed from anyone but the player: knowing a seed isn't the right to reveal it.
+    for who in ["bob", "dealer", "house", "bot", "stranger"] {
+        assert_eq!(abort_code(&t.reveal_seed(who, id, &seed)), Some(55), "{who}");
+    }
+    // No such hand, a short input, FANG sent along.
+    assert_eq!(abort_code(&t.reveal_seed("alice", id + 1, &seed)), Some(54));
+    assert_eq!(abort_code(&t.tx("alice", "reveal_seed", [&le(id)[..], &seed[..31]].concat(), 0)), Some(1));
+    assert_eq!(abort_code(&t.tx("alice", "reveal_seed", seed.to_vec(), 0)), Some(1), "the seed without its hand");
+    assert_eq!(trap(&t.tx("alice", "reveal_seed", [&le(id)[..], &seed].concat(), 1)), Some(TrapKind::NotPayable));
+    assert_eq!(t.game(id).unwrap(), committed, "a refused seed changes nothing");
+
+    // On the deadline's own block the seed is still in time.
+    let deadline = u64_at(&committed, 104);
+    assert_eq!(deadline, 1_000 + 300);
+    t.host.height = deadline;
+    assert_eq!(abort_code(&t.tx("stranger", "timeout", le(id), 0)), Some(60), "not past the seed's deadline");
+    let r = t.reveal_seed("alice", id, &seed);
+    assert!(r.ok(), "{:?}", r.fail);
+    assert_eq!(event(&r, "seed"), [&le(id)[..], &addr("alice"), &seed, &le(deadline + 150)].concat());
+    assert_eq!(t.game(id).unwrap()[120], Phase::Deal as u8);
+    // Once: a second seed, the same or another, is refused.
+    assert_eq!(abort_code(&t.reveal_seed("alice", id, &seed)), Some(70));
+    assert_eq!(abort_code(&t.reveal_seed("alice", id, &[7; 32])), Some(70));
+    // The dealer's deadline started at the seed, not at the bet.
+    assert_eq!(abort_code(&t.tx("stranger", "timeout", le(id), 0)), Some(60));
+    let r = t.play_out("alice", id, &seed, never);
+    assert_eq!(r.returns[0][0], Phase::Done as u8);
+    // The settled hand carries the seed, and its cards are the chain's under it.
+    assert_eq!(event(&r, "settled")[60..92], seed);
+    assert_eq!(t.player("alice")[131..163], seed);
+
+    // Past the deadline the right seed is refused, whoever is first: the hand is the house's.
+    let seed = [9; 32];
+    let r = t.commit_bet("alice", FANG, &seed);
+    let id = u64_at(&r.returns[0], 0);
+    t.host.height += 301;
+    assert_eq!(abort_code(&t.reveal_seed("alice", id, &seed)), Some(72));
+    assert_eq!(abort_code(&t.reveal_seed("alice", id, &[1; 32])), Some(72), "late comes before wrong");
+    assert_eq!(t.tx("stranger", "timeout", le(id), 0).returns[0], [Phase::Done as u8, Outcome::NoSeed as u8]);
+    assert_eq!(abort_code(&t.reveal_seed("alice", id, &seed)), Some(54), "and then it is gone");
+
+    // A relayed hand has no seed to reveal: its seed is the post's.
+    assert!(t.tx("bob", "deposit", vec![], 20 * FANG).ok());
+    assert!(t.tx("bob", "set_relayer", grant_input("bot", 5 * FANG, 10 * FANG, t.host.height + 100), 0).ok());
+    let r = relay_bet(&mut t, "bot", "bob", FANG, 42);
+    let id = u64_at(&r.returns[0], 0);
+    assert_eq!(t.game(id).unwrap()[120], Phase::Deal as u8);
+    for who in ["bob", "bot"] {
+        assert_eq!(abort_code(&t.reveal_seed(who, id, &relay_seed("bob", 42))), Some(if who == "bob" { 70 } else { 55 }));
+    }
+}
+
+#[test]
+fn a_seed_that_never_comes_forfeits_the_stake_to_the_house() {
+    let mut t = Table::new();
+    assert!(t.tx("house", "set_limits", limits_input(&[(MAX_OPEN, 1), (SEED_BLOCKS, 40)]), 0).ok());
+    let stake = 7 * FANG + 1;
+    let seed = [3; 32];
+    t.host.height = 500;
+    let (alice, house) = (t.balance("alice"), t.house());
+    let r = t.commit_bet("alice", stake, &seed);
+    let id = u64_at(&r.returns[0], 0);
+    assert_eq!(u64_at(event(&r, "bet"), 112), 540, "`seed_blocks` from the bet");
+    assert_eq!(t.house(), House { bankroll: house.bankroll - exposure(stake), reserved: exposure(stake), stakes: stake, next_game: 1, open: 1, ..house });
+    // It holds its seat and its commitment while it waits.
+    assert_eq!(abort_code(&t.tx("bob", "bet", vec![1; 32], FANG)), Some(51));
+    assert_eq!(abort_code(&t.tx("alice", "bet", vec![1; 32], FANG)), Some(51));
+    // A pause stops neither the seed nor the forfeit.
+    assert!(t.tx("house", "pause", vec![1], 0).ok());
+    t.host.height = 540;
+    assert_eq!(abort_code(&t.tx("house", "timeout", le(id), 0)), Some(60), "the deadline's own block");
+    t.host.height = 541;
+    let r = t.tx("stranger", "timeout", le(id), 0);
+    assert_eq!(r.returns[0], [Phase::Done as u8, Outcome::NoSeed as u8]);
+    assert_eq!(event_names(&r), ["settled"]);
+    // Outcome 8, nothing paid, no cards; the seed field is the hash that was never opened and the
+    // link is the commitment.
+    assert_eq!(
+        event(&r, "settled"),
+        [&le(id)[..], &addr("alice"), &[8], &le(stake), &le(0), &[0, 0, 0], &seed_hash("alice", &seed), &chain_of(id)[0], &[0, 0]].concat()
+    );
+    assert_eq!(t.balance("alice"), alice - stake, "the stake is gone");
+    assert_eq!(t.house(), House { bankroll: house.bankroll + stake, next_game: 1, paused: 1, ..house }, "the stake is the bankroll's, the reserve is free, the seat is free");
+    assert_eq!(t.game(id), None);
+    let p = t.player("alice");
+    assert_eq!(u64_at(&p, 24), 0, "no open hand");
+    assert_eq!(p[104..PLAYER], [&le(id)[..], &[8, 0, 0], &le(stake), &le(0), &seed_hash("alice", &seed), &chain_of(id)[0]].concat());
+    assert_eq!(u64_at(&p, 16), stake, "it counted toward the day's wagers");
+    assert_eq!(abort_code(&t.tx("stranger", "timeout", le(id), 0)), Some(54), "once");
+    // The commitment was consumed: the next bet takes the one after.
+    assert!(t.tx("house", "pause", vec![0], 0).ok());
+    let r = t.commit_bet("alice", FANG, &seed);
+    assert_eq!(r.returns[0], le(id + 1));
+    assert_eq!(event(&r, "bet")[80..112], chain_of(id + 1)[0]);
+    // While paused, a waiting hand's seed still opens it.
+    assert!(t.tx("house", "pause", vec![1], 0).ok());
+    assert!(t.reveal_seed("alice", id + 1, &seed).ok());
+}
+
+/// The gap a one-transaction bet left (docs/BLACKJACK_REVIEW.md, BJ-01): whoever saw a bet's seed
+/// in the mempool knew what the next commitment would deal it, and could change which commitment
+/// the bet met (a bet of their own in front, or the owner's `skip_commits`). Now the seed is
+/// public only once its hand holds its commitment.
+#[test]
+fn nobody_who_sees_a_bet_or_its_seed_can_steer_the_hand() {
+    // A seed that wins on game 0's chain and loses on game 1's: under the old bet, a house that
+    // saw it waiting would have moved it from the first to the second.
+    let seed = (0u32..)
+        .map(|n| *blake3::hash(&[&b"steer"[..], &n.to_le_bytes()].concat()).as_bytes())
+        .find(|seed| {
+            let (_, o0, h0) = play(&deck(0, seed), never);
+            let (_, o1, _) = play(&deck(1, seed), never);
+            o0 == Outcome::Win && !bj_core::natural(h0.player_cards()) && matches!(o1, Outcome::Lose)
+        })
+        .unwrap();
+
+    // 1. The front-runner sees the *seed* (alice's `reveal_seed` waiting in the mempool) and
+    //    acts first, with every key the house has.
+    let mut t = Table::new();
+    let stake = 10 * FANG;
+    let alice = t.balance("alice");
+    let r = t.commit_bet("alice", stake, &seed);
+    assert_eq!(r.returns[0], le(0));
+    let before = t.game(0).unwrap();
+    // The owner drops commitments: only unused ones go, never the one a hand holds.
+    let r = t.tx("house", "skip_commits", 2u32.to_le_bytes().to_vec(), 0);
+    assert_eq!(event(&r, "skipped"), [&le(1)[..], &2u32.to_le_bytes()].concat());
+    // The house bets in front: it takes a later commitment, not alice's.
+    let r = t.commit_bet("house", FANG, &[1; 32]);
+    assert_eq!(r.returns[0], le(3));
+    // It can't reveal for her (a seed of its choosing, or hers), deal early, end the hand, or
+    // change who deals it into another chain.
+    assert_eq!(abort_code(&t.reveal_seed("house", 0, &[1; 32])), Some(55));
+    assert_eq!(abort_code(&t.reveal_seed("dealer", 0, &seed)), Some(55));
+    assert_eq!(abort_code(&t.reveal(0, 1, 3)), Some(57));
+    assert_eq!(abort_code(&t.tx("house", "timeout", le(0), 0)), Some(60));
+    assert!(t.tx("house", "set_dealer", addr("house").to_vec(), 0).ok());
+    assert_eq!(t.game(0).unwrap(), before, "the hand is as the bet left it: its commitment is game 0's");
+    assert_eq!(before[72..104], chain_of(0)[0]);
+    // Her seed lands after all of that, and the hand is dealt from game 0's chain: she wins.
+    assert!(t.reveal_seed("alice", 0, &seed).ok());
+    assert_eq!(abort_code(&t.tx("dealer", "reveal", reveal_input(0, &chain_of(1)[1..4]), 0)), Some(58), "another chain's links");
+    let r = t.play_out("alice", 0, &seed, never);
+    assert_eq!(r.returns[0], [Phase::Done as u8, Outcome::Win as u8]);
+    let (used, _, hand) = play(&deck(0, &seed), never);
+    let settled = event(&r, "settled");
+    assert_eq!(settled[58..60], [used as u8, hand.n_player]);
+    assert_eq!(settled[92..124], chain_of(0)[used], "the newest link is game 0's chain's");
+    assert_eq!(t.balance("alice"), alice + stake);
+
+    // 2. The front-runner sees the *bet* (the hash, the stake) and copies it in front. It takes
+    //    game 0's commitment, so alice's hand is game 1's. But it chose blind: the hash says
+    //    nothing about what either chain would deal, and its own copy can never be opened.
+    let mut t = Table::new();
+    let hash = seed_hash("alice", &seed);
+    let house = t.balance("house");
+    let r = t.tx("house", "bet", hash.to_vec(), stake);
+    assert_eq!(r.returns[0], le(0));
+    let r = t.commit_bet("alice", stake, &seed);
+    assert_eq!(r.returns[0], le(1));
+    assert_eq!(event(&r, "bet")[48..80], hash, "the same hash, on two hands");
+    assert!(t.reveal_seed("alice", 1, &seed).ok());
+    // Now the seed is public. The copy binds the house's account, so alice's seed doesn't open
+    // it, and no seed the house can find does.
+    assert_eq!(abort_code(&t.reveal_seed("house", 0, &seed)), Some(71));
+    assert_eq!(abort_code(&t.reveal_seed("alice", 0, &seed)), Some(55));
+    // The copy costs its stake.
+    t.host.height += 301;
+    assert_eq!(t.tx("stranger", "timeout", le(0), 0).returns[0], [Phase::Done as u8, Outcome::NoSeed as u8]);
+    assert_eq!(t.balance("house"), house - stake);
+    // Alice's hand is dealt from the chain it took, under her seed: every card checks.
+    let r = t.reveal(1, 1, 3);
+    assert_eq!(r.returns[0], [Phase::Player as u8, 0], "{:?}", r.fail);
+    let cards = event(&r, "cards");
+    for j in 0..3 {
+        assert_eq!(cards[42 + 33 * j + 32], card(&chain_of(1)[j + 1], &seed, 1, j + 1));
+    }
+
+    // 3. And a dealer that stalls once it has seen the seed pays the most the hand could have.
+    let mut t = Table::new();
+    let alice = t.balance("alice");
+    let id = t.bet("alice", stake, &seed);
+    t.host.height += 151;
+    assert_eq!(t.tx("alice", "timeout", le(id), 0).returns[0], [Phase::Done as u8, Outcome::ForfeitDeal as u8]);
+    assert_eq!(t.balance("alice"), alice + stake + stake / 2);
 }
 
 // ---------------------------------------------------------------------------------- caps
@@ -844,8 +1138,8 @@ fn bets_keep_every_cap() {
     // The table's open hands.
     let mut t = Table::new();
     assert!(t.tx("house", "set_limits", limits_input(&[(MAX_OPEN, 2)]), 0).ok());
-    assert!(t.tx("alice", "bet", seed.to_vec(), FANG).ok());
-    assert!(t.tx("bob", "bet", seed.to_vec(), FANG).ok());
+    t.bet("alice", FANG, &seed);
+    assert!(t.tx("bob", "bet", seed.to_vec(), FANG).ok(), "a hand whose seed isn't revealed holds a seat too");
     assert_eq!(abort_code(&t.tx("carol", "bet", seed.to_vec(), FANG)), Some(51));
     // A settled hand frees its seat.
     t.play_out("alice", 0, &seed, never);
@@ -1283,6 +1577,15 @@ fn deposits_are_bonded_by_the_bettor_and_come_back_when_the_hand_settles() {
     let id = t.bet("alice", 2 * FANG, &seed);
     t.play_out_as_dealer(id, &seed);
     assert_eq!(t.balance("alice"), before);
+    // A hand that ends because its seed never came gives its deposit back too. (The seed's
+    // reveal bonds nothing: like the dealer's reveals it runs here with a storage limit of 0.)
+    let before = t.balance("alice");
+    let r = t.commit_bet("alice", 2 * FANG, &seed);
+    let id = u64_at(&r.returns[0], 0);
+    assert!(t.balance("alice") < before - 2 * FANG, "the hand's record is bonded at the bet");
+    t.host.height += 301;
+    assert!(t.tx("stranger", "timeout", le(id), 0).ok());
+    assert_eq!(t.balance("alice"), before - 2 * FANG, "all of the deposit is back; the stake isn't");
     // A bet whose signer consents to no storage fails whole.
     t.storage_limit = 0;
     assert_eq!(trap(&t.tx("bob", "bet", [3; 32].to_vec(), FANG)), Some(TrapKind::StorageLimit));
@@ -1368,7 +1671,23 @@ fn a_soak_keeps_the_invariant_and_every_drop() {
             (u64_at(&r.returns[0], 0), relay_seed(who, post))
         } else {
             let seed = *blake3::hash(&n.to_le_bytes()).as_bytes();
-            (t.bet(who, stake, &seed), seed)
+            let r = t.commit_bet(who, stake, &seed);
+            assert!(r.ok(), "hand {n}: {:?}", r.fail);
+            let id = u64_at(&r.returns[0], 0);
+            if rng.below(25) == 0 {
+                // A player who never reveals the seed: the stake is the house's.
+                wagered += stake as u128;
+                t.host.height += 301;
+                let r = t.tx("dealer", "timeout", le(id), 0);
+                assert_eq!(r.returns[0], [Phase::Done as u8, Outcome::NoSeed as u8], "{:?}", r.fail);
+                *outcomes.entry(Outcome::NoSeed as u8).or_default() += 1;
+                assert_eq!(t.player(who)[112], Outcome::NoSeed as u8);
+                assert_eq!(t.house().open, 0);
+                continue;
+            }
+            t.host.height += rng.below(3);
+            assert!(t.reveal_seed(who, id, &seed).ok());
+            (id, seed)
         };
         wagered += stake as u128;
         let deck = deck(id, &seed);
@@ -1453,7 +1772,7 @@ fn a_soak_keeps_the_invariant_and_every_drop() {
     assert!(t.tx("house", "defund", le(h.bankroll), 0).ok());
     assert_eq!(t.balance(PROGRAM), 0);
     assert_eq!(t.host.total(), everyone, "no FANG made or lost");
-    assert!((1..=7).all(|o| outcomes.contains_key(&o)), "every outcome happened: {outcomes:?}");
+    assert!((1..=8).all(|o| outcomes.contains_key(&o)), "every outcome happened: {outcomes:?}");
     println!("outcomes over 400 hands: {outcomes:?}; wagered {} FANG, paid {} FANG", wagered / u128::from(FANG), paid / u128::from(FANG));
 }
 

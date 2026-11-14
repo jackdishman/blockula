@@ -32,7 +32,7 @@ picture.alt; // alt text: every card, both totals, the bet, where the hand stand
 ## The pictures
 
 ```sh
-# A gallery: the poster, a table waiting for its deal, a fresh deal, the player's turn,
+# A gallery: the poster, a bet waiting for its seed, a table waiting for its deal, a fresh deal, the player's turn,
 # each way a hand ends, and the longest hand the rules allow. Each as .png, .svg and .alt.txt.
 npx tsx services/blackjack/render/src/cli.ts /tmp/blackjack-gallery
 

@@ -120,6 +120,10 @@ export class MockNode {
   beforeAccountRead: ((id: string) => void) | null = null;
   /** Every signed tx accepted, in order. */
   submitted: Tx[] = [];
+  /** A node that takes a transaction and keeps it out of its blocks: `POST /api/tx` answers with its id, and `/api/tx/{id}` says it's pending, until `release()`. */
+  holdTx: ((tx: Tx) => boolean) | null = null;
+  /** Every transaction held back, in the order it arrived (the same one twice when it was sent twice). */
+  held: Tx[] = [];
   /** Every request body the wallet sent to the node, to prove secrets never leave the page. */
   bodies: string[] = [];
   /** Protocol v1 modules: off, the node answers 404 like a node without them. */
@@ -460,6 +464,16 @@ export class MockNode {
       accounts.unshift({ account: this.label(own), role: { type: "owner" }, label: "original key" });
     }
     return { key_id: keyId, accounts };
+  }
+
+  /** The held transactions reach a block at last: each one once, in the order they arrived. */
+  release(): string[] {
+    const ids = new Set<string>();
+    const txs = this.held.filter((t) => !ids.has(txId(t)) && ids.add(txId(t)));
+    this.held = [];
+    this.holdTx = null;
+    for (const t of txs) this.submit(t);
+    return [...ids];
   }
 
   private submit(tx: Tx) {
@@ -876,6 +890,7 @@ export class MockNode {
       }
       if (req.method() === "GET" && (m = path.match(/^\/tx\/([0-9a-f]{64})$/))) {
         if (this.txAnswers.has(m[1])) return reply(200, this.txAnswers.get(m[1]));
+        if (this.held.some((t) => txId(t) === m![1])) return reply(200, { id: m[1], status: "pending", summary: "" });
         const r = this.txs.get(m[1]);
         if (r) return reply(200, this.txView(r));
         // node/src/api.rs `tx`: a failure remembered without its transaction.
@@ -1005,7 +1020,14 @@ export class MockNode {
         this.credit(to, "100");
         return reply(200, { id: this.record({ tx: null, kind: "transfer", from: FAUCET, to, amount: parseFang("100"), fee: 0n, memo: "faucet", summary: `faucet sent 100 FANG to ${this.label(to).short}` }) });
       }
-      if (req.method() === "POST" && path === "/tx") return reply(200, { id: this.submit(JSON.parse(body ?? "{}") as Tx) });
+      if (req.method() === "POST" && path === "/tx") {
+        const tx = JSON.parse(body ?? "{}") as Tx;
+        if (this.holdTx?.(tx)) {
+          this.held.push(tx);
+          return reply(200, { id: txId(tx) });
+        }
+        return reply(200, { id: this.submit(tx) });
+      }
       if (req.method() === "GET" && path === "/validators") return reply(200, this.validators());
       if (req.method() === "GET" && this.staking && (m = path.match(/^\/staking\/(.+)$/))) return reply(200, this.stakingOf(this.resolve(m[1])));
       if (req.method() === "GET" && this.governance && path.startsWith("/proposals")) return reply(200, { count: this.proposals.length, next_id: this.proposals.length, council_active: true, spending_open: false, params: { supermajority_bps: 6667, voting_blocks: 604_800, timelock_blocks: 172_800, lock_period_blocks: 604_800 }, proposals: this.proposals.map((p) => this.proposalView(p)) });
