@@ -208,6 +208,7 @@ fly volumes create data -a blockula-blackjack-dealer -r iad -s 1
 
 # 3. Deploy, from the repository's root. One machine: --ha=false.
 fly deploy . -c deploy/blackjack-dealer/fly.toml \
+  --dockerfile deploy/blackjack-dealer/Dockerfile \
   --ignorefile deploy/blackjack-dealer/Dockerfile.dockerignore --ha=false
 fly logs -a blockula-blackjack-dealer        # "waiting for /data/ready"
 
