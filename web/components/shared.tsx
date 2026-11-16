@@ -11,6 +11,7 @@ import { decodeKeyGrant, describeAction, encodeKeyGrant, isAddress, type Action,
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { ActionForm } from "@/components/explorer/ActionForm";
+import { Party, ReviewCard, ReviewDetails } from "@/components/explorer/Review";
 import { Copy, ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { explorer, MAINNET_PREFIX, walletUrl } from "@/lib/config";
 import { multisigRule, multisigShape } from "@/lib/creators";
@@ -639,51 +640,55 @@ export function ReviewProposal({ account, id, linkedDigest }: { account: string;
   return (
     <>
       {!acting && <OtherAccount target={account} what="This proposal belongs to the shared account" />}
-      <section className="card stack" data-testid="review">
-        <div className="row-between">
-          <span className="eyebrow">Read it twice</span>
-          <span className={`pill ${review.expired || review.superseded ? "dim" : "pending"}`} data-testid="review-approvals">{review.approvals} of {review.threshold} approvals</span>
-        </div>
-        <p className="headline" data-testid="review-does">{review.does}</p>
+      <ReviewCard
+        testid="review"
+        className="card stack"
+        reveal={false}
+        aside={<span className={`pill ${review.expired || review.superseded ? "dim" : "pending"}`} data-testid="review-approvals">{review.approvals} of {review.threshold} approvals</span>}
+        action={review.does}
+        actionTestid="review-does"
+        rows={[
+          // The address leads: a name here is only the node's word for it.
+          { k: "Account", v: <Party address={account} />, hint: `${multisigShape(ms.threshold, ms.owners.length)}${ms.account.name ? ` · your node calls it ${ms.account.name}` : ""}` },
+          {
+            k: "Approved by",
+            testid: "review-by",
+            v: review.approvedBy.length ? review.approvedBy.map((k) => (k === wallet.keyId ? `${labels.get(k)} (this device)` : labels.get(k))).join(", ") : "nobody yet",
+          },
+          { k: "Expires", v: <>block #{review.expiresAt.toLocaleString("en-US")} {!review.expired && left != null && left > 0 && <span className="dim small">({aboutWhen(left, status?.block_time_ms)})</span>}</> },
+        ]}
+        details={
+          <ReviewDetails
+            rows={[
+              { k: "Account", v: <span className="mono small break">{account}</span> },
+              { k: "Proposal", v: `#${review.id}` },
+              review.strayApprovals.length > 0 && { k: "Not counted", v: `${review.strayApprovals.length} from a key that isn't an owner any more` },
+              { k: "Digest", v: <span className="mono small break" data-testid="review-digest">{review.digest ?? "can't be computed"}</span>, hint: "This wallet rendered the action above from the action itself. Your approval signs this digest, so it can't count for any other action." },
+              { k: "Fee", v: "Paid from the shared account." },
+            ]}
+          />
+        }
+        raw={
+          <details className="raw">
+            <summary>The exact action an approval binds</summary>
+            <pre>{JSON.stringify(p.action, null, 2)}</pre>
+          </details>
+        }
+      >
         {check === "mismatch" && (
           <p className="error" role="alert" data-testid="review-mismatch">
             This isn&apos;t the action the link was made for. Whoever sent the link saw an action with another digest, so the node is showing something else now, or the link was changed. Don&apos;t approve it; ask them what they proposed.
           </p>
         )}
         {check === "match" && <p className="ok small m0" data-testid="review-match">✓ The same action the link&apos;s sender saw (its digest matches the link&apos;s).</p>}
-        <dl className="kv">
-          <dt>Account</dt>
-          <dd>
-            <span className="mono small break">{account}</span>
-            <div className="dim small">{multisigShape(ms.threshold, ms.owners.length)}{ms.account.name ? ` · your node calls it ${ms.account.name}` : ""}</div>
-          </dd>
-          <dt>Proposal</dt>
-          <dd>#{review.id}</dd>
-          <dt>Approved by</dt>
-          <dd data-testid="review-by">
-            {review.approvedBy.length ? review.approvedBy.map((k) => (k === wallet.keyId ? `${labels.get(k)} (this device)` : labels.get(k))).join(", ") : "nobody yet"}
-            {review.strayApprovals.length > 0 && <div className="dim small">not counted: {review.strayApprovals.length} from a key that isn&apos;t an owner any more</div>}
-          </dd>
-          <dt>Expires</dt>
-          <dd>
-            block #{review.expiresAt.toLocaleString("en-US")} {!review.expired && left != null && left > 0 && <span className="dim small">({aboutWhen(left, status?.block_time_ms)})</span>}
-          </dd>
-          <dt>Digest</dt>
-          <dd className="mono small break" data-testid="review-digest">{review.digest ?? "can't be computed"}</dd>
-        </dl>
         {review.superseded && <p className="dim small m0 wrap-any">The node says: {review.superseded}</p>}
-        <details className="raw">
-          <summary>The exact action an approval binds</summary>
-          <pre>{JSON.stringify(p.action, null, 2)}</pre>
-        </details>
         {review.why && <p className="warn m0" data-testid="review-why">{review.why}</p>}
         {canSign && (
           <>
             <p className="small m0" data-testid="review-effect">
               {review.wouldRun
                 ? `Yours is approval ${review.approvals + 1} of ${review.threshold}: the chain runs the action at once, as the account. If the action fails, so does your approval, and the proposal stays open.`
-                : `Yours is approval ${review.approvals + 1} of ${review.threshold}: it then waits for ${review.threshold - review.approvals - 1} more.`}{" "}
-              The fee is paid from the shared account.
+                : `Yours is approval ${review.approvals + 1} of ${review.threshold}: it then waits for ${review.threshold - review.approvals - 1} more.`}
             </p>
             <button className="btn primary" disabled={busy} onClick={approve}>
               {busy ? <Spinner>Waiting for your passkey…</Spinner> : review.wouldRun ? "Approve and run it" : "Approve"}
@@ -695,8 +700,7 @@ export function ReviewProposal({ account, id, linkedDigest }: { account: string;
           <Copy text={cosignLink(walletUrl(), account, review.id, review.digest, chain)} label="Copy co-sign link" />
           <Link className="small" href={sharedHref(account)}>All of this account&apos;s proposals →</Link>
         </div>
-        <Tip>What you read above was rendered by this wallet from the action itself. Your approval signs that action&apos;s digest, so it can&apos;t count for any other action.</Tip>
-      </section>
+      </ReviewCard>
     </>
   );
 }

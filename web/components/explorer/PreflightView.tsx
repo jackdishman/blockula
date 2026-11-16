@@ -12,12 +12,12 @@ import { Amount, Term, Who } from "./kit";
  * agent budget after it, and whether the chain will refuse it. A forecast from the chain's
  * state now (lib/explorer/preflight.ts); the node's answer is final.
  */
-export function PreflightView({ p, me, blockMs = 1000 }: { p: Preflight; me?: string | null; blockMs?: number }) {
+export function PreflightView({ p, me, blockMs = 1000, part = "all" }: { p: Preflight; me?: string | null; blockMs?: number; /** A review shows the `alerts` (the balance after, notes, refusals) in view and folds the `changes` into its Details. */ part?: "all" | "alerts" | "changes" }) {
   const fx = p.effects;
   // Refused, nothing changes: show what it asks for, not a balance it won't leave.
   const refused = p.refusals.length > 0;
-  return (
-    <div className="preflight" data-testid="preflight">
+  const changes = (
+    <>
       <span className="eyebrow">{refused ? "What it would change" : "What will change"}</span>
       <div className="changes">
         {fx.changes.map((c) => (
@@ -39,6 +39,12 @@ export function PreflightView({ p, me, blockMs = 1000 }: { p: Preflight; me?: st
           </div>
         )}
       </div>
+    </>
+  );
+  if (part === "changes") return <div className="preflight" data-testid="preflight-changes">{changes}</div>;
+  return (
+    <div className={`preflight ${part === "alerts" ? "alerts" : ""}`} data-testid="preflight">
+      {part === "all" && changes}
       {fx.unseen && <p className="card-note">{fx.unseen}</p>}
       {fx.note && <p className="card-note">{fx.note}</p>}
 

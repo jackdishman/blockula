@@ -21,7 +21,7 @@ export default function NamePage() {
         <section className="card">
           <NameClaim onName={setTyped} onClaimed={() => router.push("/")} />
         </section>
-        <Tip>A name is recorded on-chain and points to your address, so anyone, anywhere, can send to it. Your first name becomes how you show up in everyone&apos;s activity.</Tip>
+        <Tip>A name points to your address, so anyone can send to it. Your first name is how you show up in activity.</Tip>
       </main>
     </RequireWallet>
   );

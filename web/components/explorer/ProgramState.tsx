@@ -11,9 +11,10 @@ import { Bars, Meter } from "./charts";
 import { Fang, plural, Section, Stat, StatusPill, Term, useMe, Who } from "./kit";
 
 /** Live state for one program, as its page shows it. */
-export function ProgramState({ id }: { id: string }) {
+/** `brief` leaves out the pool's "How it pays" list, for a page that shows the flow as a diagram (app/contribute). */
+export function ProgramState({ id, brief }: { id: string; brief?: boolean }) {
   if (id === "hunts") return <HuntsState />;
-  if (id === "pool") return <PoolState />;
+  if (id === "pool") return <PoolState brief={brief} />;
   if (id === "validators") return <ValidatorsState />;
   if (id === "names") return <NamesState />;
   return <AccountsState />;
@@ -72,7 +73,7 @@ export function claimPill(c: ClaimView) {
   return <StatusPill status={["rejected", "spam"].includes(c.status) ? "failed" : c.status === "scored" ? "finalized" : "pending"}>{c.status.replace(/_/g, " ")}</StatusPill>;
 }
 
-function PoolState() {
+function PoolState({ brief }: { brief?: boolean }) {
   const me = useMe();
   const c = useNode<ContributionsView>("/contributions", { every: 10_000 });
   const claims = useNode<{ claims: ClaimView[] }>("/claims?limit=12", { every: 10_000 });
@@ -136,14 +137,16 @@ function PoolState() {
           <Bars rows={souls.data.souls.map((x) => ({ key: x.account.address, label: <Who who={x.account} me={me?.address} />, value: Number(x.soul.display) || x.soul.points / 1000 }))} />
         </Section>
       )}
-      <Section title="How it pays">
-        <ol className="steps">
-          <li>Link GitHub and get a PR merged into a pool repo{d.repos.length ? ` (${d.repos.map((r) => r.repo).join(", ")})` : ""}.</li>
-          <li>Claim it with a refundable bond ({String(d.rules.claim_bond_display)}). Validators check GitHub that it&apos;s merged and yours.</li>
-          <li>A Séance of up to {String(d.rules.jury_size)} human jurors compares claims in pairs, sealing then revealing their votes.</li>
-          <li>Each Séance pays up to {String(d.rules.pool_share_per_seance)} of the pool, square-rooted per boo, vesting over {Number(d.rules.vesting_blocks).toLocaleString("en-US")} blocks.</li>
-        </ol>
-      </Section>
+      {!brief && (
+        <Section title="How it pays">
+          <ol className="steps">
+            <li>Link GitHub and get a PR merged into a pool repo{d.repos.length ? ` (${d.repos.map((r) => r.repo).join(", ")})` : ""}.</li>
+            <li>Claim it with a refundable bond ({String(d.rules.claim_bond_display)}). Validators check GitHub that it&apos;s merged and yours.</li>
+            <li>A Séance of up to {String(d.rules.jury_size)} human jurors compares claims in pairs, sealing then revealing their votes.</li>
+            <li>Each Séance pays up to {String(d.rules.pool_share_per_seance)} of the pool, square-rooted per boo, vesting over {Number(d.rules.vesting_blocks).toLocaleString("en-US")} blocks.</li>
+          </ol>
+        </Section>
+      )}
     </>
   );
 }

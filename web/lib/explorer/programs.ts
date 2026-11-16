@@ -149,7 +149,7 @@ export const PROGRAMS: NativeProgram[] = [
       {
         kind: "transfer",
         title: "Send FANG",
-        blurb: "Pay a .boo name or an address. A name is signed as the name unless your network's witnesses prove its owner: the chain then pays whoever owns it when the transaction runs, so no node can send it elsewhere.",
+        blurb: "Pay a .boo name or an address. The preview shows exactly what gets signed.",
         who: "any key on the account, agents within their limit",
         ownerOnly: false,
         params: [
@@ -199,7 +199,7 @@ export const PROGRAMS: NativeProgram[] = [
       {
         kind: "renew_name",
         title: "Renew a name",
-        blurb: "Extend a name you own, a year at a time, at the chain's renewal price (paid to the treasury). An expired name can be renewed by its owner until its grace period ends; after that anyone can register it.",
+        blurb: "Extend a name you own, a year at a time. An expired name can be renewed until its grace period ends.",
         who: "the name's owner",
         ownerOnly: true,
         params: [
@@ -212,7 +212,7 @@ export const PROGRAMS: NativeProgram[] = [
       {
         kind: "transfer_name",
         title: "Offer a name",
-        blurb: "Offer a name you own to another account. It stays yours until they accept it, so nobody is given a name without saying yes. Offering it again replaces the offer.",
+        blurb: "Offer a name you own to another account. It stays yours until they accept it.",
         who: "the name's owner",
         ownerOnly: true,
         params: [
@@ -272,7 +272,7 @@ export const PROGRAMS: NativeProgram[] = [
       {
         kind: "create_hunt",
         title: "Put up a hunt",
-        blurb: "Escrow a bounty on an issue. You award it for a merged PR. Once it expires you can cancel it, refunding every funder exactly what they put in; before that, only a governance refund (RefundHunt) can.",
+        blurb: "Escrow a bounty on an issue and award it for a merged PR. Once it expires you can cancel it and refund every funder.",
         who: "owner keys",
         ownerOnly: true,
         params: [
@@ -288,7 +288,7 @@ export const PROGRAMS: NativeProgram[] = [
       {
         kind: "fund_hunt",
         title: "Add to a bounty",
-        blurb: "Grow an open hunt's bounty. It's held until the creator awards it; if the creator cancels it after it expires (or governance refunds it), you get back exactly what you put in.",
+        blurb: "Grow an open hunt's bounty. If it's cancelled or refunded, you get back exactly what you put in.",
         who: "owner keys",
         ownerOnly: true,
         params: [
@@ -315,7 +315,7 @@ export const PROGRAMS: NativeProgram[] = [
       {
         kind: "cancel_hunt",
         title: "Cancel a hunt",
-        blurb: "After it expires, close it and refund every funder exactly what they put in. Before then the chain refuses (a governance RefundHunt can still refund it).",
+        blurb: "After it expires, close it and refund every funder exactly what they put in.",
         who: "the hunt's creator, after it expires (admins of dev and test chains any time)",
         ownerOnly: true,
         params: [{ key: "hunt_id", label: "Hunt", type: "int" }],
@@ -415,7 +415,7 @@ export const PROGRAMS: NativeProgram[] = [
       {
         kind: "delegate",
         title: "Stake with a validator",
-        blurb: "Delegate FANG to a validator's pool. It earns a share of issuance and is slashed with the pool; taking it out takes the unbonding period (21 days on mainnet).",
+        blurb: "Delegate FANG to a validator's pool. It can be slashed with the pool, and taking it out takes the unbonding period.",
         who: "owner keys",
         ownerOnly: true,
         params: [
@@ -428,7 +428,7 @@ export const PROGRAMS: NativeProgram[] = [
       {
         kind: "undelegate",
         title: "Unstake",
-        blurb: "Start unbonding an amount of your stake in a pool (a validator's owner unbonds its self-bond this way too). It's signed as an amount, and the chain turns it into pool shares at its own price when it runs, so no node's report of your stake decides how much unbonds. It stops earning now; withdraw it once the unbonding period is over. To unstake all of it, use the Stake page (/stake).",
+        blurb: "Start unbonding an amount of your stake in a pool. It stops earning now; withdraw it once the unbonding period is over. To unstake all of it, use the Stake page (/stake).",
         who: "owner keys of the staking account",
         ownerOnly: true,
         params: [

@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { blockWhen, bondInput, bondToPost, displayToDrops, JOIN_JURY, joinBlockers, jurorStatus, juryRules, LEAVE_JURY, leaveBlockers, seanceTiming, soulPoints } from "./explorer/jury.ts";
+import { blockWhen, bondInput, bondToPost, displayToDrops, JOIN_JURY, joinBlockers, joinJurySpec, jurorStatus, juryRules, LEAVE_JURY, leaveBlockers, seanceTiming, soulPoints } from "./explorer/jury.ts";
 import { isExplorerPath, to } from "./explorer/routes.ts";
 
 const F = 10n ** 9n;
@@ -32,6 +32,20 @@ test("joining and leaving the jury are the pool's specs, each for owner keys onl
   assert.deepEqual(LEAVE_JURY.build({}, { height: 1, account: "boo1me" }), { type: "leave_jury" });
   assert.match(LEAVE_JURY.describe({}), /take your bond back/);
   assert.match(LEAVE_JURY.blurb, /bond back/);
+});
+
+test("the generic join form names no Soul minimum or bond of its own: both come from the chain's rules", () => {
+  assert.doesNotMatch(JOIN_JURY.who, /\d/);
+  assert.equal(JOIN_JURY.params[0].initial, undefined);
+  const spec = joinJurySpec(juryRules({ juror_min_soul: "2.5", juror_bond_display: "1,250.5 FANG", min_jury: 5 }));
+  assert.equal(spec.who, "owner keys with at least 2.5 Soul (humans only)");
+  assert.equal(spec.params[0].initial, "1250.5");
+  assert.match(spec.params[0].help, /1,250\.5 FANG/);
+  assert.equal(spec.kind, "join_jury");
+  // A node that didn't say: nothing is filled in.
+  const bare = joinJurySpec(juryRules({}));
+  assert.equal(bare.who, JOIN_JURY.who);
+  assert.equal(bare.params[0].initial, undefined);
 });
 
 test("the pool program lists both, leaving right after joining", () => {

@@ -49,10 +49,11 @@ export function ageOf(height: number | null | undefined, head: number | undefine
   return `~${ago(Math.max(0, head - height) * blockMs)}`;
 }
 
-export function Term({ k, children }: { k: TermKey; children?: ReactNode }) {
+/** An underlined term with its definition on hover or focus: the glossary's (`k`), or a one-line `tip` of the page's own. */
+export function Term({ k, tip, children }: { k?: TermKey; tip?: string; children?: ReactNode }) {
   return (
-    <span className="term" tabIndex={0} data-tip={GLOSSARY[k]}>
-      {children ?? k.replace(/_/g, " ")}
+    <span className="term" tabIndex={0} data-tip={tip ?? (k ? GLOSSARY[k] : undefined)}>
+      {children ?? (k ?? "").replace(/_/g, " ")}
     </span>
   );
 }

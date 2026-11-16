@@ -115,6 +115,15 @@ test.describe("calling a deployed program", () => {
     const review = register.getByTestId("call-review");
     await expect(review).toBeVisible();
     const input = encodeProgramInput([{ type: { text: 32 } }, { type: { option: { text: 32 } } }, { type: { vec: ["address", 3] } }], ["Mina", { some: "mina_x" }, [me]]);
+    // The signer, the arguments and the total are in view; the program's whole address, the input and the
+    // whole version digest the call binds are under "Details", closed until it's opened.
+    await expect(review).toContainText("(owner)");
+    await expect(review.getByTestId("review-total")).toBeVisible();
+    await expect(review.getByTestId("review-details")).not.toHaveAttribute("open", "");
+    await expect(review.getByTestId("review-digest")).toBeHidden();
+    await review.getByTestId("review-details").getByText("Details", { exact: true }).click();
+    await expect(review.getByTestId("review-digest")).toBeVisible();
+    await expect(review.getByTestId("review-pinned")).toContainText("The call runs only while the program still has exactly this code, interface and version, or it's refused and nothing is charged.");
     await expect(review.getByTestId("review-program")).toHaveText(CALLABLE);
     await expect(review.getByTestId("review-input")).toHaveText(input);
     await expect(review.getByTestId("review-args")).toContainText("Mina");

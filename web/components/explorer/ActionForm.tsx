@@ -20,6 +20,7 @@ import { previewer, unsignedOf, useSpendCheck } from "@/lib/spend";
 import { useWallet } from "@/lib/wallet";
 import { Amount, Term } from "./kit";
 import { PreflightView } from "./PreflightView";
+import { Party, RawTx, ReviewCard, ReviewDetails } from "./Review";
 
 /**
  * Unlock right here, so acting on a page doesn't mean leaving it. Covers the usual case (this
@@ -200,6 +201,8 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false, ct
   const refused = !!preview?.pf.refusals.length;
   const expiresAt = preview && preview.tx.action.type === "create_hunt" ? preview.tx.action.expires_at : null;
   const mainnet = client.pin.chainId === MAINNET_CHAIN_ID;
+  // The action line and the SDK's own sentence for what's signed: both in view unless they say the same thing.
+  const sameWords = !!preview && preview.does.trim() === preview.headline.trim();
   return (
     <div className="action-body">
       {!compact && <p className="dim m0">{spec.blurb}</p>}
@@ -255,85 +258,98 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false, ct
           {busy === "preview" ? <Spinner>Preparing…</Spinner> : cta}
         </button>
       ) : (
-        <div className="preview" aria-live="polite" data-testid="action-preview">
-          <span className="eyebrow">Read it twice</span>
-          <p className="headline">{preview.headline}</p>
-          <dl className="kv">
-            <dt>From</dt>
-            <dd>
-              {account?.names[0] ?? shortAddr(wallet.account)} <span className="dim small">signed by {myKey ? `“${myKey.label}” (${myKey.role.type === "owner" ? "owner" : "agent"})` : "this device"}</span>
-            </dd>
-            {preview.names.map((r) => (
-              <div key={r.label} className="contents">
-                <dt>{r.label}</dt>
-                <dd>
+        <ReviewCard
+          testid="action-preview"
+          action={preview.headline}
+          rows={[
+            { k: "From", v: <Party name={account?.names[0]} address={wallet.account} />, hint: <>signed by {myKey ? `“${myKey.label}” (${myKey.role.type === "owner" ? "owner" : "agent"})` : "this device"}</> },
+            ...preview.names.map((r) => ({
+              k: r.label,
+              v: r.byChain ? (
+                r.name
+              ) : (
+                <>
                   {r.name}
-                  <div className="mono small break" data-testid="signed-name">{r.signed}</div>
-                  {r.byChain ? (
-                    <div className="small" data-testid="by-chain">
-                      Signed as the name: the chain acts on whoever owns {r.name} when this transaction runs, so no node can point it elsewhere. Your node says that&apos;s <span className="mono break">{r.address}</span> (not proven).
-                    </div>
-                  ) : r.proven ? (
-                    <div className="dim small">proven by {r.witnesses} other node{r.witnesses === 1 ? "" : "s"}</div>
-                  ) : (
-                    <div className="warn small">Looked up on your node only, not proven{mainnet ? "" : ". Check this address before you sign"}.</div>
-                  )}
-                </dd>
-              </div>
-            ))}
-            <dt>Signs</dt>
-            <dd data-testid="signs">{preview.does}</dd>
-            {preview.tx.memo && (
-              <>
-                <dt>Memo</dt>
-                <dd data-testid="memo">
+                  <span className="mono small break block" data-testid="signed-name">{r.signed}</span>
+                </>
+              ),
+              hint: r.byChain ? (
+                <>
+                  signed as the name · your node says <span className="mono nowrap" title={r.address}>{shortAddr(r.address)}</span> (not proven)
+                </>
+              ) : r.proven ? (
+                `proven by ${r.witnesses} other node${r.witnesses === 1 ? "" : "s"}`
+              ) : (
+                <span className="warn">Looked up on your node only, not proven{mainnet ? "" : ". Check this address before you sign"}.</span>
+              ),
+            })),
+            !sameWords && { k: "Signs", v: preview.does, testid: "signs" },
+            !!preview.tx.memo && {
+              k: "Memo",
+              testid: "memo",
+              v: (
+                <>
                   <span className="mono break">{preview.tx.memo}</span> <span className="dim small">(public)</span>
-                </dd>
-              </>
-            )}
-            {expiresAt != null && (
-              <>
-                <dt>Expires</dt>
-                <dd data-testid="expires">
-                  block #{expiresAt.toLocaleString("en-US")}{" "}
-                  <span className="dim small">
-                    {Math.round((expiresAt - preview.from) / BLOCKS_PER_DAY)} days of blocks after #{preview.from.toLocaleString("en-US")}, the height this transaction is signed against. Until then only an award, or a governance refund, releases the escrow.
-                  </span>
-                </dd>
-              </>
-            )}
-            <dt>
-              <Term k="fee">Fee</Term>
-            </dt>
-            <dd>
-              {formatDrops(fee)} <span className="dim small">at most: the base fee of the block that includes it (burned){BigInt(preview.tx.tip ?? 0) > 0n ? ` plus a ${formatDrops(BigInt(preview.tx.tip ?? 0))} tip to its proposer` : ""}</span>
-            </dd>
-            <dt className="total">Total</dt>
-            <dd className="total">
-              <b>
-                <Amount drops={preview.pf.cost} exact />
-              </b>{" "}
-              <span className="dim small">at most leaves this account</span>
-            </dd>
-            <dt>
-              <Term k="nonce" />
-            </dt>
-            <dd>{preview.tx.nonce}</dd>
-          </dl>
-          <PreflightView p={preview.pf} me={wallet.account} blockMs={preview.blockMs} />
-          <details className="raw">
-            <summary>The exact transaction you&apos;ll sign</summary>
-            <pre>{JSON.stringify({ ...preview.tx, public_key: `${preview.tx.public_key.slice(0, 24)}…`, signature: `${preview.tx.signature.length / 2} bytes, made when you sign` }, null, 2)}</pre>
-          </details>
-          <div className="row-gap">
-            <button className="btn" disabled={!!busy} onClick={() => setPreview(null)}>
-              ← Edit
-            </button>
-            <button className={`btn grow ${refused ? "" : "primary"}`} disabled={!!busy} onClick={send}>
-              {busy === "check" ? <Spinner>Waiting for your passkey…</Spinner> : busy === "send" ? <Spinner>Sending…</Spinner> : refused ? "Sign & send anyway" : "Sign & send"}
-            </button>
-          </div>
-        </div>
+                </>
+              ),
+            },
+            expiresAt != null && { k: "Expires", v: `block #${expiresAt.toLocaleString("en-US")}`, hint: `in about ${Math.round((expiresAt - preview.from) / BLOCKS_PER_DAY)} days. Until then only an award, or a governance refund, releases the escrow.` },
+            { k: <Term k="fee">Max fee</Term>, v: formatDrops(fee) },
+            {
+              k: "Total",
+              v: (
+                <b>
+                  <Amount drops={preview.pf.cost} exact />
+                </b>
+              ),
+              hint: "at most leaves this account",
+              total: true,
+            },
+          ]}
+          details={
+            <ReviewDetails
+              rows={[
+                sameWords && { k: "Signs", v: preview.does, testid: "signs" },
+                ...preview.names
+                  .filter((r) => r.byChain)
+                  .map((r) => ({
+                    k: r.label,
+                    v: <span className="mono small break" data-testid="signed-name">{r.signed}</span>,
+                    hint: (
+                      <span data-testid="by-chain">
+                        Signed as the name: the chain acts on whoever owns {r.name} when this transaction runs, so no node can point it elsewhere. Your node says that&apos;s <span className="mono break">{r.address}</span> (not proven).
+                      </span>
+                    ),
+                  })),
+                expiresAt != null && {
+                  k: "Expires",
+                  testid: "expires",
+                  v: `${Math.round((expiresAt - preview.from) / BLOCKS_PER_DAY)} days of blocks after #${preview.from.toLocaleString("en-US")}, the height this transaction is signed against.`,
+                },
+                {
+                  k: "Fee",
+                  v: `At most ${formatDrops(fee)}: the base fee of the block that includes it (burned)${BigInt(preview.tx.tip ?? 0) > 0n ? ` plus a ${formatDrops(BigInt(preview.tx.tip ?? 0))} tip to its proposer` : ""}.`,
+                },
+                { k: <Term k="nonce" />, v: preview.tx.nonce },
+              ]}
+            >
+              <PreflightView p={preview.pf} me={wallet.account} blockMs={preview.blockMs} part="changes" />
+            </ReviewDetails>
+          }
+          raw={<RawTx tx={preview.tx} />}
+          actions={
+            <>
+              <button className="btn" disabled={!!busy} onClick={() => setPreview(null)}>
+                ← Edit
+              </button>
+              <button className={`btn grow ${refused ? "" : "primary"}`} disabled={!!busy} onClick={send}>
+                {busy === "check" ? <Spinner>Waiting for your passkey…</Spinner> : busy === "send" ? <Spinner>Sending…</Spinner> : refused ? "Sign & send anyway" : "Sign & send"}
+              </button>
+            </>
+          }
+        >
+          <PreflightView p={preview.pf} me={wallet.account} blockMs={preview.blockMs} part="alerts" />
+        </ReviewCard>
       )}
       <ErrorNote error={error} />
     </div>

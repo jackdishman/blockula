@@ -8,7 +8,10 @@ import { ActionForm } from "@/components/explorer/ActionForm";
 import { Section, Term } from "@/components/explorer/kit";
 import { ProgramState } from "@/components/explorer/ProgramState";
 import { ProgramActivity } from "@/components/explorer/ProgramActivity";
-import { actionId, program, signature } from "@/lib/explorer/programs";
+import { joinJurySpec, juryRules } from "@/lib/explorer/jury";
+import { useNode } from "@/lib/explorer/node";
+import { actionId, program, signature, type ActionSpec } from "@/lib/explorer/programs";
+import type { ContributionsView } from "@/lib/explorer/types";
 import { NETWORK } from "@/lib/config";
 import { to } from "@/lib/explorer/routes";
 
@@ -24,6 +27,10 @@ function Program() {
   const id = useRouteParam("id");
   const params = useSearchParams();
   const p = program(id);
+  // The pool's juror rules (the Soul minimum, the bond) are the chain's: the join form takes them from its answer.
+  const pool = useNode<ContributionsView>(p?.id === "pool" ? "/contributions" : null);
+  const jury = pool.data ? juryRules(pool.data.rules) : null;
+  const specOf = (a: ActionSpec) => (a.kind === "join_jury" && jury ? joinJurySpec(jury) : a);
   if (!p)
     return (
       <main className="wide">
@@ -70,7 +77,7 @@ function Program() {
                     <span className="sig">{a.kind}</span>
                   </summary>
                   {/* Reset fields and previews for a new prefill, not reordered/unrelated URL params. */}
-                  <ActionForm key={JSON.stringify(a.params.map(({ key }) => open === actionId(a) ? initial[key] : null))} spec={a} initial={open === actionId(a) ? initial : {}} />
+                  <ActionForm key={JSON.stringify([...a.params.map(({ key }) => (open === actionId(a) ? initial[key] : null)), a.kind === "join_jury" ? jury?.bondInput : null])} spec={specOf(a)} initial={open === actionId(a) ? initial : {}} />
                 </details>
               ))}
               {p.elsewhere && <p className="card-note">{p.elsewhere}</p>}
@@ -96,7 +103,7 @@ function Program() {
                   .slice(a.kind.length)
                   .split(/(: \w+)/)
                   .map((part, i) => (i % 2 ? <span key={i} className="ty">{part}</span> : part))}
-                <span className="who-can block">{a.who}</span>
+                <span className="who-can block">{specOf(a).who}</span>
               </li>
             ))}
           </ul>
