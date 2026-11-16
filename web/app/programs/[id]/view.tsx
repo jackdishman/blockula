@@ -49,6 +49,11 @@ function Program() {
         </span>
         <h1>{p.title}</h1>
         <span className="sub">{p.tagline}</span>
+        {p.id === "pool" && (
+          <Link className="small" href={to.contribute()} data-testid="pool-jury-link">
+            Join the jury: your Soul, the bond and the next Séance →
+          </Link>
+        )}
       </div>
       {open && Object.keys(initial).length > 0 && (
         <div className="banner">A link filled in this action. It doesn&apos;t say which network it was made for: a .boo name can belong to someone else on another one. Check every field against {NETWORK.label}, and the preview, before you sign.</div>

@@ -12,6 +12,7 @@ import { BLOCKS_PER_DAY } from "../config";
 import { BOND_TERMS, CONTRIBUTION_NOTES_BOTH } from "../creators";
 import type { TermKey } from "./glossary";
 import { inertText, shortAddress } from "./inert";
+import { JOIN_JURY, LEAVE_JURY } from "./jury.ts";
 import type { DeployedProgramView } from "./types";
 import { xRecordMemo } from "./xlink";
 
@@ -383,16 +384,8 @@ export const PROGRAMS: NativeProgram[] = [
         build: (v) => ({ type: "vouch", account: String(v.account) }),
         describe: (r) => `Vouch for ${r.account || "…"}`,
       },
-      {
-        kind: "join_jury",
-        title: "Join the jury pool",
-        blurb: "Sit on Séances. Jurors who agree with the outcome earn Soul and a share of the payout; no-shows lose part of their bond.",
-        who: "owner keys with 5+ Soul (humans only)",
-        ownerOnly: true,
-        params: [{ key: "bond", label: "Bond", type: "fang", initial: "10" }],
-        build: (v) => ({ type: "join_jury", bond: fang(v, "bond") }),
-        describe: (r) => `Join the jury pool with a ${r.bond || "…"} FANG bond`,
-      },
+      JOIN_JURY,
+      LEAVE_JURY,
       {
         kind: "withdraw_vested",
         title: "Withdraw vested rewards",

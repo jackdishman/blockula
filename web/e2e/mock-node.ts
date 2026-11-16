@@ -677,12 +677,32 @@ export class MockNode {
           }
           break;
         }
+        case "join_jury":
+        case "leave_jury": {
+          // As node/src/poc.rs `JoinJury` and `LeaveJury`: owner keys only; joining holds the bond and adds
+          // it to what's held, and brings a benched juror back; leaving returns what's held and drops the record.
+          if (key.role.type !== "owner") throw new HttpError(400, "session keys can only send transfers");
+          const extra = this.accountExtra.get(tx.from) ?? {};
+          const pc = (extra.contribution ?? null) as (Json & { juror: { bond_display: string; active: boolean; served: number; joined_at: number } | null }) | null;
+          const bonded = pc?.juror ? parseFang(pc.juror.bond_display.replace(/ FANG$/, "")) : 0n;
+          if (act.type === "join_jury") {
+            if (!pc) throw new HttpError(400, "jurors need at least 5 Soul (you have 0)");
+            held(BigInt(act.bond));
+            pc.juror = { served: 0, joined_at: this.height + 1, ...pc.juror, bond_display: formatFang(bonded + BigInt(act.bond)), active: true };
+            summary = `${who} joined the Séance jury pool, bonding ${formatFang(BigInt(act.bond))}`;
+          } else {
+            if (!pc?.juror) throw new HttpError(400, "you're not in the jury pool");
+            a.balance += bonded;
+            pc.juror = null;
+            summary = `${who} left the Séance jury pool`;
+          }
+          break;
+        }
         case "cancel_hunt":
         case "release_name":
         case "register_familiar":
         case "link_github":
         case "submit_claim":
-        case "join_jury":
         case "withdraw_vested":
         case "unjail":
         case "update_validator":

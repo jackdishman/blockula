@@ -300,7 +300,7 @@ export default function AccountPage() {
           )}
 
           {hasContribution && pc && (
-            <Section title={<Term k="pool">Contribution</Term>} aside={<Link className="small" href={to.program("pool")}>The pool →</Link>}>
+            <Section title={<Term k="pool">Contribution</Term>} aside={<Link className="small" href={yours ? to.contribute() : to.program("pool")} data-testid="account-jury-link">{yours ? (pc.juror ? "Your jury seat →" : "Join the jury →") : "The pool →"}</Link>}>
               <dl className="details tight-120">
                 <dt><Term k="soul" /></dt>
                 <dd>{pc.soul.display} <span className="dim small">({pc.soul.earned_display} earned)</span></dd>

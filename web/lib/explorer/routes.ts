@@ -17,6 +17,8 @@ export const to = {
   /** The money graph around an account; `follow` lists accounts already followed (addresses). */
   trace: (nameOrAddress: string, follow?: string) => `/trace/${encodeURIComponent(nameOrAddress)}${follow ? `?follow=${encodeURIComponent(follow)}` : ""}`,
   name: (name: string) => `/name/${encodeURIComponent(name.replace(/\.boo$/, ""))}`,
+  /** The contribution pool from the wallet's side: joining and leaving the Séance juror pool (app/contribute). */
+  contribute: () => "/contribute",
   programs: () => "/programs",
   program: (id: string) => `/programs/${id}`,
   /** A program anyone deployed, by its address (or a stored code, by its hash). */
@@ -34,5 +36,5 @@ export const searchHref = (hit: { type: string; id: string }) =>
 
 /** Explorer pages are wide (charts, tables); the wallet's own pages are a narrow column. */
 export function isExplorerPath(path: string) {
-  return /^\/(explore|boos?|guestbook|leaderboard|block|tx|account|trace|programs?|hunt|claim|seance|blackjack)(\/|$)/.test(path) || /^\/name\/[^/]+/.test(path);
+  return /^\/(explore|boos?|guestbook|leaderboard|block|tx|account|trace|programs?|contribute|hunt|claim|seance|blackjack)(\/|$)/.test(path) || /^\/name\/[^/]+/.test(path);
 }

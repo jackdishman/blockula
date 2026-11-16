@@ -457,3 +457,9 @@ button.tbody { cursor: pointer; }
 .ballot-choices { display: flex; flex-wrap: wrap; gap: 6px 18px; }
 .ballot-choice { display: inline-flex; align-items: baseline; gap: 8px; cursor: pointer; }
 .ballot-spam { border: 0; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+
+/* The juror enrollment card (components/explorer/JuryCard.tsx). */
+.jury-card { display: flex; flex-direction: column; gap: 14px; }
+.jury-act { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--ink); padding-top: 14px; }
+.jury-act .action-body { padding: 0; }
+.jury-blockers { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; }

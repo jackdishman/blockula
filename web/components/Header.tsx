@@ -42,8 +42,8 @@ export function Header() {
   const router = useRouter();
   const open = wallet && hint?.account;
   const known = Object.values(NETWORKS).filter((n): n is Network => !!n);
-  // A program's records (a hunt, a claim, a Séance) belong to Programs; every other chain page to Explore.
-  const programs = /^\/(programs?|hunt|claim|seance|blackjack)(\/|$)/.test(path);
+  // A program's records (a hunt, a claim, a Séance, the jury) belong to Programs; every other chain page to Explore.
+  const programs = /^\/(programs?|contribute|hunt|claim|seance|blackjack)(\/|$)/.test(path);
   const boos = /^\/(boos?|guestbook)(\/|$)/.test(path);
   const explore = isExplorerPath(path) && !programs && !boos;
   return (

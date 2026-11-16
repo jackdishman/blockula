@@ -90,7 +90,7 @@ interface Preview {
  * `Wallet.build` so mainnet refuses an unproven one against the very status it signs for. An
  * action carrying a height (a hunt's expiry) is built from that same status read (gap-7-3).
  */
-export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: { spec: ActionSpec; initial?: Record<string, string>; /** Params the page already decides (e.g. the hunt on a hunt's page): set from `initial`, not shown. */ fixed?: string[]; compact?: boolean }) {
+export function ActionForm({ spec, initial = {}, fixed = [], compact = false, cta = "Preview" }: { spec: ActionSpec; initial?: Record<string, string>; /** Params the page already decides (e.g. the hunt on a hunt's page): set from `initial`, not shown. */ fixed?: string[]; compact?: boolean; /** The button that opens the preview, when the page names the action itself ("Join the jury"). Nothing is signed before the preview. */ cta?: string }) {
   const { wallet, account, client, hint, refresh } = useWallet();
   const router = useRouter();
   const unlock = useInlineUnlock();
@@ -252,7 +252,7 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
         <span className="warn small">This device signs with an agent key (“{myKey?.label}”), and agent keys can only send transfers. Use an owner device.</span>
       ) : !preview ? (
         <button className="btn primary self-start" disabled={!valid || !!busy} onClick={toPreview}>
-          {busy === "preview" ? <Spinner>Preparing…</Spinner> : "Preview"}
+          {busy === "preview" ? <Spinner>Preparing…</Spinner> : cta}
         </button>
       ) : (
         <div className="preview" aria-live="polite" data-testid="action-preview">

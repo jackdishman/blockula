@@ -151,6 +151,7 @@ export function CommandPalette() {
       { id: "programs", group: "Explore", label: "Programs", href: to.programs() },
       { id: "hunts", group: "Explore", label: "Hunts (bounties)", href: to.program("hunts") },
       { id: "pool", group: "Explore", label: "Contribution pool", href: to.program("pool") },
+      { id: "jury", group: "Explore", label: "Join the jury: Séances, Soul and your juror bond", href: to.contribute() },
       { id: "vals", group: "Explore", label: "Validators", href: to.program("validators") },
       { id: "names", group: "Explore", label: "Names", href: to.program("names") },
     ];
