@@ -17,7 +17,7 @@
   "dependencies": {
     "@blockula/blackjack": "0.1.0",
     "@blockula/blackjack-render": "0.1.0",
-    "@blockula/sdk": "1.0.12"
+    "@blockula/sdk": "1.0.13"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
