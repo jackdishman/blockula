@@ -67,12 +67,13 @@ test("Send checks what can move now, Max fills it less the fee, and payments are
   // No name on this account: "You send", not "You sends".
   await expect(page.locator("p.summary")).toHaveText(/^You send 49\.9999\d* FANG to alice\.boo$/);
 
-  // The payee on one line; the node-trust explanation behind "Why is this safe?".
+  // The payee on one line; the node-trust explanation under "Details", closed until it's opened.
   await expect(page.getByTestId("payee")).toHaveText(`Pays alice.boo · ${ALICE.slice(0, 10)}…${ALICE.slice(-6)} (your node's answer)`);
   const why = page.getByTestId("by-chain");
-  await expect(why.getByText(/^Signed as the name/)).toBeHidden();
-  await why.getByText("Why is this safe?").click();
-  await expect(why.getByText(/^Signed as the name/)).toBeVisible();
+  await expect(why).toBeHidden();
+  await page.getByTestId("review-details").getByText("Details", { exact: true }).click();
+  await expect(why).toBeVisible();
+  await expect(why).toHaveText(/^Signed as the name/);
   // A name that's settled (registered long before, far from expiring) gets no warning.
   await expect(page.getByTestId("name-risk")).toHaveCount(0);
 

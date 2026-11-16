@@ -2,16 +2,18 @@
 
 // One call of the blackjack table, signed the way every program call in this wallet is
 // (components/explorer/ProgramCalls.tsx): the SDK builds the exact transaction without signing it,
-// the review shows it (the program, the method, its input, the FANG sent, the storage limit, the
-// full version digest it binds, its fuel and the most it can cost), and only then does an owner key
+// the review shows it (who signs, the table, the FANG sent, the most it can cost and the total; the
+// program's address, the method, its input, the storage limit, the full version digest it binds and
+// its fuel are under Details), and only then does an owner key
 // sign it, right after a fresh passkey check. A transaction that was sent is never offered again:
 // one whose outcome isn't known is checked by its id.
 import { abortWords, eventsOf, type TableCall, type TableEvent } from "@blockula/blackjack";
 import { checkReceipt, describeAction, loadFuel, outcomeWords, ProgramAnswerError, TxFailedError, TxPendingError, txId, type Action, type ProgramInfo, type ProgramReceipt, type Tx } from "@blockula/sdk";
 import Link from "next/link";
-import { Fragment, useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useInlineUnlock } from "@/components/explorer/ActionForm";
 import { Amount, Named, Term } from "@/components/explorer/kit";
+import { Party, RawTx, ReviewCard, ReviewDetails } from "@/components/explorer/Review";
 import { useMultisig } from "@/components/shared";
 import { ErrorNote, Spinner } from "@/components/ui";
 import { COPY } from "@/lib/blackjack-copy";
@@ -20,7 +22,7 @@ import { formatDrops } from "@/lib/explorer/ledger";
 import { refusedByNode, submitTx, submitTxEverywhere } from "@/lib/explorer/node";
 import { sameCall } from "@/lib/explorer/program-calls";
 import { to } from "@/lib/explorer/routes";
-import { chainUnit, shortAddr } from "@/lib/format";
+import { chainUnit } from "@/lib/format";
 import { PasskeyCheckError } from "@/lib/keys";
 import { previewer, unsignedOf, useSpendCheck } from "@/lib/spend";
 import { useWallet } from "@/lib/wallet";
@@ -43,8 +45,12 @@ export interface CallRequest {
    * goes to each, and again if it isn't in a block when the wait ends.
    */
   everyNode?: boolean;
-  /** Extra lines for the review (the bet's seed). */
-  notes?: { k: string; v: ReactNode }[];
+  /** Extra lines for the review's Details (the seed); `show` keeps one in the summary (a warning). */
+  notes?: { k: string; v: ReactNode; show?: boolean }[];
+  /** One line under Details' input, saying what it is (the bet's input is its seed's hash). */
+  inputHint?: string;
+  /** One line that stays in view above the buttons (what happens if this isn't sent in time). */
+  warn?: ReactNode;
   /** The transaction's id, the moment it's signed (before the node answers). */
   onSigned?: (id: string) => void;
   /** Its receipt's table events, once it ran. */
@@ -241,88 +247,76 @@ export function useTableSigner(program: string, onDone: () => void): TableSigner
     }
   };
 
-  const who = account?.names[0] ?? shortAddr(wallet?.account ?? "");
+  const who = <Party name={account?.names[0]} address={wallet?.account ?? ""} />;
+  const value = review?.req.call.value ?? 0n;
+  const storage = review?.req.call.storageLimit ?? 0n;
+  const shown = (review?.req.notes ?? []).filter((n) => n.show);
+  const folded = (review?.req.notes ?? []).filter((n) => !n.show);
   const panel = (
     <>
       {busy === "review" && <Spinner>Preparing…</Spinner>}
       {review && info && (
-        <div className="preview" aria-live="polite" data-testid="bj-review">
-          <span className="eyebrow">{COPY.review.eyebrow}</span>
-          <p className="headline" data-testid="bj-review-does">{review.req.does}</p>
-          <dl className="kv">
-            <dt>From</dt>
-            <dd>
-              {who} <span className="dim small">signed by “{inertText(caller.kind === "owner" ? caller.label : "", 40)}” (owner)</span>
-            </dd>
-            <dt>Program</dt>
-            <dd>
-              <span className="mono break" data-testid="bj-review-program">{program}</span>
-              <span className="dim small block">{review.action}</span>
-            </dd>
-            <dt>Method</dt>
-            <dd>
-              <Named text={review.req.call.method} /> <span className="dim small">named by the program&apos;s deployer</span>
-            </dd>
-            <dt>Input</dt>
-            <dd>
-              <span className="mono break" data-testid="bj-review-input">{review.req.call.input || "(empty)"}</span>
-            </dd>
-            {(review.req.notes ?? []).map((n) => (
-              <Fragment key={n.k}>
-                <dt>{n.k}</dt>
-                <dd>{n.v}</dd>
-              </Fragment>
-            ))}
-            <dt>FANG sent</dt>
-            <dd data-testid="bj-review-value">
-              <Amount drops={review.req.call.value ?? 0n} exact />
-            </dd>
-            <dt>Storage limit</dt>
-            <dd data-testid="bj-review-storage">
-              <Amount drops={review.req.call.storageLimit ?? 0n} exact /> <span className="dim small">{(review.req.call.storageLimit ?? 0n) === 0n ? "this call stores nothing new" : "at most, bonded as a deposit for what it stores"}</span>
-            </dd>
-            <dt>
-              <Term k="digest">Version digest</Term>
-            </dt>
-            <dd>
-              <span className="mono break" data-testid="bj-review-digest">{info.version_digest}</span>
-              <span className="dim small block">
-                Version {info.version}. {COPY.review.digest}
-              </span>
-            </dd>
-            <dt>
-              <Term k="fuel">Fuel</Term>
-            </dt>
-            <dd>
-              {(review.fuel.run + review.fuel.load).toLocaleString("en-US")} reserved <span className="dim small">paid for whether it&apos;s used or not</span>
-            </dd>
-            <dt>
-              <Term k="fee">Max fee</Term>
-            </dt>
-            <dd data-testid="bj-review-fee">
-              {formatDrops(BigInt(review.tx.fee), chainUnit())} <span className="dim small">{COPY.review.fee}</span>
-            </dd>
-            <dt className="total">Total</dt>
-            <dd className="total" data-testid="bj-review-total">
-              <b>
-                <Amount drops={BigInt(review.tx.fee) + (review.req.call.value ?? 0n) + (review.req.call.storageLimit ?? 0n)} exact />
-              </b>{" "}
-              <span className="dim small">{COPY.review.total}</span>
-            </dd>
-          </dl>
-          <details className="raw">
-            <summary>{COPY.review.exact}</summary>
-            <pre>{JSON.stringify({ ...review.tx, public_key: `${review.tx.public_key.slice(0, 24)}…`, signature: `${review.tx.signature.length / 2} bytes, made when you sign` }, null, 2)}</pre>
-          </details>
-          <div className="row-gap">
-            <button className="btn" disabled={!!busy} onClick={() => setReview(null)}>
-              {COPY.review.back}
-            </button>
-            <button className="btn grow primary" disabled={!!busy} onClick={send} data-testid="bj-sign">
-              {busy === "check" ? <Spinner>Waiting for your passkey…</Spinner> : COPY.review.sign}
-            </button>
-          </div>
-        </div>
+        <ReviewCard
+          testid="bj-review"
+          eyebrow={COPY.review.eyebrow}
+          action={review.req.does}
+          actionTestid="bj-review-does"
+          rows={[
+            { k: "From", v: who, hint: <>signed by “{inertText(caller.kind === "owner" ? caller.label : "", 40)}” (owner)</> },
+            { k: "To", v: <Party address={program} label={COPY.review.table} /> },
+            { k: "Amount", v: <Amount drops={value} exact />, testid: "bj-review-value" },
+            storage > 0n && { k: "Deposit", v: <Amount drops={storage} exact />, hint: COPY.review.deposit, testid: "bj-review-storage" },
+            ...shown.map((n) => ({ k: n.k, v: n.v })),
+            { k: <Term k="fee">Max fee</Term>, v: formatDrops(BigInt(review.tx.fee), chainUnit()), hint: COPY.review.fee, testid: "bj-review-fee" },
+            {
+              k: "Total",
+              v: (
+                <b>
+                  <Amount drops={BigInt(review.tx.fee) + value + storage} exact />
+                </b>
+              ),
+              hint: COPY.review.total,
+              testid: "bj-review-total",
+              total: true,
+            },
+          ]}
+          details={
+            <ReviewDetails
+              testid="bj-review-details"
+              rows={[
+                { k: "Program", v: <span className="mono break" data-testid="bj-review-program">{program}</span> },
+                { k: "Signs", v: review.action },
+                { k: "Method", v: <Named text={review.req.call.method} />, hint: COPY.review.method },
+                { k: "Input", v: <span className="mono break" data-testid="bj-review-input">{review.req.call.input || "(empty)"}</span>, hint: review.req.inputHint },
+                ...folded.map((n) => ({ k: n.k, v: n.v })),
+                storage === 0n && { k: "Storage limit", v: <Amount drops={storage} exact />, hint: COPY.review.noStorage, testid: "bj-review-storage" },
+                {
+                  k: <Term k="digest">Version digest</Term>,
+                  v: <span className="mono break" data-testid="bj-review-digest">{info.version_digest}</span>,
+                  hint: (
+                    <span data-testid="bj-review-pinned">
+                      Version {info.version}. {COPY.review.digest}
+                    </span>
+                  ),
+                },
+                { k: <Term k="fuel">Fuel</Term>, v: `${(review.fuel.run + review.fuel.load).toLocaleString("en-US")} reserved`, hint: COPY.review.fuel },
+              ]}
+            />
+          }
+          raw={<RawTx tx={review.tx} label={COPY.review.exact} />}
+          actions={
+            <>
+              <button className="btn" disabled={!!busy} onClick={() => setReview(null)}>
+                {COPY.review.back}
+              </button>
+              <button className="btn grow primary" disabled={!!busy} onClick={send} data-testid="bj-sign">
+                {busy === "check" ? <Spinner>Waiting for your passkey…</Spinner> : COPY.review.sign}
+              </button>
+            </>
+          }
+        >
+          {review.req.warn && <p className="warn small m0">{review.req.warn}</p>}
+        </ReviewCard>
       )}
       {sent && (
         <div className="preview" aria-live="polite" data-testid="bj-sent" data-state={sent.state}>

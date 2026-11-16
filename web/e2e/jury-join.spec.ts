@@ -74,7 +74,9 @@ test.describe("joining the Séance jury from the wallet", () => {
     await expect(cutoff.getByTestId("jury-open-seance")).toContainText(/Séance #2 is open: jurors seal their votes until block #\d+ \(about \d\d:\d\d/);
     await expect(cutoff.getByRole("link", { name: "See it →" })).toHaveAttribute("href", /\/seance\/2\/?$/);
     await expect(cutoff).toContainText(new RegExp(`The one after can open from block #${w.pool.next_seance_at} \\(about \\d\\d:\\d\\d( tomorrow)?, in \\d+`));
-    await expect(cutoff).toContainText("3 jurors are available");
+    // How a Séance works is the diagram's to show (e2e/seance-flow.spec.ts), not prose in the card.
+    await expect(card.getByTestId("jury-how")).toHaveCount(0);
+    await expect(page.getByTestId("seance-flow").locator('[data-step="opens"]')).toContainText("Jury of up to 7, at least 3");
 
     // Locked: one unlock, here. Then the bond field starts from the chain's rule.
     const join = card.getByTestId("jury-join");

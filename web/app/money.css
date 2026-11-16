@@ -13,6 +13,9 @@
 
 /* "Payments are final", right above Confirm. */
 .money-final { margin: 0; padding: 10px 14px; border: 1.5px solid var(--blood); color: var(--ink); font-size: 16px; }
+@media (max-width: 640px) {
+  .money-final { padding: 6px 10px; font-size: 15px; line-height: 1.35; }
+}
 
 /* The amount's status line, with Max at its end. */
 .money-amount-row { display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; }

@@ -377,15 +377,17 @@ function revealRequest(game: bigint, seed: string, key: string, touch: () => voi
           <>
             <span className="mono break" data-testid="bj-review-seed">{seed}</span>
             <span className="dim small block">{COPY.seed.note}</span>
-            <span className="warn small block">{COPY.seed.warn}</span>
           </>
         ),
       },
       {
         k: COPY.seed.sentLabel,
+        // One node only is a warning, so it stays in the summary; several is a detail.
+        show: !OTHER_NODES.length,
         v: <span className={OTHER_NODES.length ? "small" : "warn small"} data-testid="bj-review-nodes">{OTHER_NODES.length ? COPY.seed.sentMany(OTHER_NODES.length) : COPY.seed.sentOne}</span>,
       },
     ],
+    warn: COPY.seed.warn,
     // The one call a node could profit from keeping to itself: it goes through every node the wallet knows.
     everyNode: true,
     onSigned: (id) => (noteRevealTx(storage(), key, game, id), touch()),
@@ -422,17 +424,8 @@ function BetForm({ ctx, me, adult, signer, storeKey: key, touch, canSign, last }
       call: call.bet(stake, hash),
       does: `Bet ${fangText(stake)} on a new hand (${COPY.bet.step})`,
       waiting: COPY.bet.waiting,
-      notes: [
-        {
-          k: COPY.bet.seedLabel,
-          v: (
-            <>
-              <span className="mono break" data-testid="bj-review-seed-hash">{hash}</span>
-              <span className="dim small block">{COPY.bet.seed}</span>
-            </>
-          ),
-        },
-      ],
+      // The bet's input is the seed's hash, so the review says so once, beside the input.
+      inputHint: COPY.bet.seed,
       onSigned: (id) => (noteBetTx(storage(), key, seed, id), touch()),
       onApplied: (id, events) => {
         // Filed under its hand with the commitment it took. The page then presents the seed's reveal by itself.
@@ -479,9 +472,7 @@ function BetForm({ ctx, me, adult, signer, storeKey: key, touch, canSign, last }
           ) : (
             <CallerNote signer={signer} />
           )}
-          <span className="dim small">
-            <span data-testid="bj-bet-two">{COPY.bet.two}</span> {COPY.bet.deposit}
-          </span>
+          <span className="dim small" data-testid="bj-bet-two">{COPY.bet.two}</span>
         </>
       )}
     </div>
@@ -671,7 +662,7 @@ function BalancePanel({ state, signer, adult, height, prefix }: { state: TableSt
     void signer.start({
       call: call.setRelayer(grant.relayer.trim(), maxBet, cap, until),
       does: `Let a relayer play your table balance: up to ${fangText(maxBet)} a bet and ${fangText(cap)} a day, until block ${until.toLocaleString("en-US")}`,
-      notes: [{ k: "Relayer", v: <span className="mono break">{grant.relayer.trim()}</span> }, { k: "What it allows", v: COPY.balance.grant }],
+      notes: [{ k: "Relayer", v: <span className="mono break">{grant.relayer.trim()}</span>, show: true }, { k: "What it allows", v: COPY.balance.grant, show: true }],
     });
   };
   const field = (k: keyof typeof grant, label: string, placeholder: string, mono = false) => (

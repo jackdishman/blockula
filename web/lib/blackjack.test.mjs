@@ -637,7 +637,7 @@ test("the rules state the table's limits as the chain has them, and the game as 
   assert.match(text, /The house can't get ahead of your bet, because your seed stays hidden until your bet already holds its commitment/);
   assert.match(strings(rulesText({ ...DEFAULT_LIMITS, seedBlocks: 60n }, 2000)).join("\n"), /you have 60 blocks \(about 2 min\) to reveal your seed/);
   assert.match(COPY.seed.missing, /can only be revealed from the browser that placed the bet/);
-  assert.match(COPY.bet.seed, /The bet sends only their hash/);
+  assert.match(COPY.bet.seed, /The bet sends only the hash/);
   assert.match(text, /stands on every 17\. There is no split, no double and no insurance/);
   assert.match(text, /two and a half times your bet/);
   // Other limits, other words: nothing is a constant of the page.

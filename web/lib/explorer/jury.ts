@@ -10,16 +10,16 @@ import type { ActionSpec } from "./programs";
 
 /**
  * The pool program's two jury actions (programs.ts lists them; /contribute signs them from its
- * card). The bond a form starts from here is only a placeholder for the generic form: the card
- * passes the chain's own (`juryRules`).
+ * card). The spec names no Soul minimum and no bond of its own: the card and the generic form
+ * (`joinJurySpec`) fill both from the chain's rules (`juryRules`).
  */
 export const JOIN_JURY: ActionSpec = {
   kind: "join_jury",
   title: "Join the jury pool",
-  blurb: "Sit on Séances. Jurors who agree with the outcome earn Soul and a share of the payout; no-shows lose part of their bond.",
-  who: "owner keys with 5+ Soul (humans only)",
+  blurb: "Sit on Séances. Agreeing with the outcome earns Soul; a no-show loses part of the bond.",
+  who: "owner keys with enough Soul (humans only)",
   ownerOnly: true,
-  params: [{ key: "bond", label: "Bond", type: "fang", initial: "10" }],
+  params: [{ key: "bond", label: "Bond", type: "fang" }],
   build: (v) => ({ type: "join_jury", bond: String(v.bond) }),
   describe: (r) => `Join the jury pool with a ${r.bond || "…"} FANG bond`,
 };
@@ -28,7 +28,7 @@ export const JOIN_JURY: ActionSpec = {
 export const LEAVE_JURY: ActionSpec = {
   kind: "leave_jury",
   title: "Leave the jury pool",
-  blurb: "Stop sitting on Séances and take your juror bond back, whatever no-shows left of it. A juror seated on the open Séance leaves once it closes.",
+  blurb: "Stop sitting on Séances and take your juror bond back. A juror seated on the open Séance leaves once it closes.",
   who: "owner keys of an account in the jury pool",
   ownerOnly: true,
   params: [],
@@ -82,6 +82,15 @@ export function juryRules(rules: Record<string, string | number> | null | undefi
     bond,
     bondInput: bond == null ? "" : asInput(bond),
     minJury: Number.isInteger(minJury) && minJury > 0 ? minJury : null,
+  };
+}
+
+/** `JOIN_JURY` for the generic form on the pool program's page: the Soul minimum and the bond are the chain's, when it said them. */
+export function joinJurySpec(rules: JuryRules): ActionSpec {
+  return {
+    ...JOIN_JURY,
+    who: rules.minSoul == null ? JOIN_JURY.who : `owner keys with at least ${rules.minSoul} Soul (humans only)`,
+    params: JOIN_JURY.params.map((p) => (p.key === "bond" && rules.bondDisplay != null ? { ...p, initial: rules.bondInput, help: `The chain's juror bond is ${rules.bondDisplay}.` } : p)),
   };
 }
 

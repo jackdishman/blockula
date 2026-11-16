@@ -4,6 +4,7 @@ import Link from "next/link";
 import { ContributionNote } from "@/components/creators";
 import { JuryCard } from "@/components/explorer/JuryCard";
 import { Term } from "@/components/explorer/kit";
+import { SeanceFlow } from "@/components/explorer/SeanceFlow";
 import { ProgramState } from "@/components/explorer/ProgramState";
 import { NodeError, useNode } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
@@ -11,7 +12,8 @@ import type { ContributionsView } from "@/lib/explorer/types";
 
 /**
  * The contribution pool from the wallet's side (the node explorer's `#/contribute`, plus what a
- * wallet can do there): the juror enrollment card first, then the pool, its open Séance, claims,
+ * wallet can do there): the juror enrollment card first, then the Séance and Soul flow as a diagram
+ * (components/explorer/SeanceFlow.tsx), then the pool, its open Séance, claims,
  * Souls and rules. Every other pool action stays on the program's page.
  */
 export default function ContributePage() {
@@ -49,10 +51,11 @@ export default function ContributePage() {
         <>
           {!pool.data.active && <p className="card-note m0">The pool pays nothing yet: it&apos;s switched on once governance adds a repository to it.</p>}
           <JuryCard pool={pool.data} />
+          <SeanceFlow pool={pool.data} />
           <ContributionNote />
-          <ProgramState id="pool" />
+          <ProgramState id="pool" brief />
           <p className="card-note">
-            Claiming a merged PR, linking GitHub, vouching, funding the pool and withdrawing vested rewards are on <Link href={to.program("pool")}>the pool&apos;s program page</Link>. Jurors seal and reveal their votes on each Séance&apos;s page.
+            Claim a merged PR, link GitHub, vouch or fund the pool on <Link href={to.program("pool")}>the pool&apos;s program page</Link>. Jurors vote on each Séance&apos;s page.
           </p>
         </>
       )}

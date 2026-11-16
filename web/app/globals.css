@@ -300,6 +300,11 @@ button.stage-head:hover .grow { color: var(--blood); }
 .kv dt { font: 400 16px/1.7 var(--caps); letter-spacing: 0.06em; color: var(--dim); }
 .kv dd { margin: 0; word-break: break-word; }
 .kv .total { border-top: 1px solid var(--ink); padding-top: 10px; }
+/* "How this works": an explanation folded away so the action stays on top */
+details.how > summary { cursor: pointer; color: var(--dim); font: 400 16px var(--caps); letter-spacing: 0.06em; width: fit-content; }
+details.how > summary:hover { color: var(--blood); }
+details.how[open] > summary { margin-bottom: 6px; }
+details.how > :not(summary) { margin: 0 0 6px; }
 .section-head { display: flex; flex-direction: column; gap: 6px; }
 .section-head h1 { margin: 0; }
 

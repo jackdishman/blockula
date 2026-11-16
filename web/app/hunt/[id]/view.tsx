@@ -93,7 +93,7 @@ export default function HuntPage() {
             format={(v) => `${v.toLocaleString("en-US")} FANG`}
           />
           <p className="card-note">
-            The bounty sits in <Term k="escrow">escrow</Term> until the creator awards it, before or after it expires. Expiring refunds nothing by itself: once it has expired the creator can cancel it, and each funder gets back exactly what they put in; before that only a governance refund (RefundHunt) can.
+            The bounty sits in <Term k="escrow">escrow</Term> until the creator awards it. Expiring refunds nothing by itself: once it has expired the creator can cancel it, and each funder gets back exactly what they put in.
           </p>
         </Section>
         {live && (

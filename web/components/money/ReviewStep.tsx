@@ -1,12 +1,14 @@
 "use client";
 
 import "@/app/money.css";
-import { Fragment, type ReactNode } from "react";
+import type { ReactNode } from "react";
+import { ReviewRows } from "@/components/explorer/Review";
 import { Spinner } from "@/components/ui";
 
 /**
- * A review step before staking, unstaking, moving stake or voting (USER-4): what gets signed, the
- * terms that come with it, and Confirm. Nothing is signed until Confirm; Edit goes back to the
+ * A review step before staking, unstaking, moving stake or voting (USER-4): one line naming the
+ * action, a compact summary (the rows of every review: components/explorer/Review.tsx), the terms
+ * that come with it, and Confirm. Nothing is signed until Confirm; Edit goes back to the
  * form with what was typed still there.
  */
 export function ReviewStep({
@@ -29,21 +31,13 @@ export function ReviewStep({
   onConfirm: () => void;
 }) {
   return (
-    <section className="money-review grow" data-testid="review" aria-label={title}>
+    <section className="money-review review grow" data-testid="review" aria-label={title}>
       <div className="section-head">
         <span className="eyebrow">Read it twice</span>
         <h3>{title}</h3>
       </div>
-      <p className="summary money-wrap">{summary}</p>
-      <dl className="kv">
-        {/* Keyed by place: a review may repeat a heading, and its rows never reorder. */}
-        {rows.map(([k, v], i) => (
-          <Fragment key={i}>
-            <dt>{k}</dt>
-            <dd>{v}</dd>
-          </Fragment>
-        ))}
-      </dl>
+      <p className="summary money-wrap review-action">{summary}</p>
+      <ReviewRows rows={rows.map(([k, v]) => ({ k, v }))} />
       {/* DRAFT copy for counsel (D4): lib/money-copy.ts. */}
       <ul className="money-terms" data-testid="review-terms">
         {terms.map((t) => (

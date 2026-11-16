@@ -1,8 +1,9 @@
 "use client";
 
 // Calling a deployed program from its page (docs/EXPLORER.md, docs/PROGRAMS.md 11.3): its views run on the
-// node, signed out too; its calls are reviewed (the program, the method, the encoded input, the value, the
-// storage limit, the full version digest the call binds and the most it can cost), then signed with an owner
+// node, signed out too; its calls are reviewed (who signs, the program, the arguments, the value, the most it
+// can cost and the total; the encoded input, the storage limit, the full version digest the call binds and its
+// fuel are under Details, components/explorer/Review.tsx), then signed with an owner
 // key right after a fresh passkey check. Forms are made from the record the SDK checked (`client.program`),
 // never from a node's unchecked answer; arguments are encoded by the SDK's ABI codec; what a program returns
 // is its claim, shown as text. A transaction that was sent is never offered again: one whose outcome isn't
@@ -25,6 +26,7 @@ import { previewer, unsignedOf, useSpendCheck } from "@/lib/spend";
 import { useWallet } from "@/lib/wallet";
 import { useInlineUnlock } from "./ActionForm";
 import { Amount, Named, Term } from "./kit";
+import { Party, RawTx, ReviewCard, ReviewDetails } from "./Review";
 
 /** An error's words, as text: the SDK's or the node's (the chain's own), stripped of what hides text, never rewritten into advice to try again. */
 const words = (e: unknown) => inertText(e instanceof Error ? e.message : String(e), 600);
@@ -491,7 +493,7 @@ function CallForm({ spec, info, caller, prefix, me, stale }: { spec: ProgramCall
             <span className="suffix">{chainUnit()}</span>
           </div>
           <span className="dim small" data-testid="storage-note">
-            The most this call may bond as a deposit for what it writes to the program&apos;s storage. At 0 it may write nothing new: a method that writes then traps, and its fee is still charged. This page can&apos;t tell which methods write; the program&apos;s author can.
+            The most this call may bond for what it stores. At 0 it may write nothing new: a method that writes then traps, and its fee is still charged.
           </span>
         </label>
       </div>
@@ -524,27 +526,27 @@ function CallForm({ spec, info, caller, prefix, me, stale }: { spec: ProgramCall
           {busy === "review" ? <Spinner>Preparing…</Spinner> : "Review"}
         </button>
       ) : (
-        <div className="preview" aria-live="polite" data-testid="call-review">
-          <span className="eyebrow">Read it twice</span>
-          <p className="headline">{review.does}</p>
-          <dl className="kv">
-            <dt>From</dt>
-            <dd>
-              {account?.names[0] ?? shortAddr(wallet?.account ?? "")} <span className="dim small">signed by “{inertText(caller.label, 40)}” (owner)</span>
-            </dd>
-            <dt>Program</dt>
-            <dd>
-              <span className="mono break" data-testid="review-program">{spec.program}</span>
-            </dd>
-            <dt>Method</dt>
-            <dd>
-              <Named text={spec.method} /> <span className="dim small">named by its deployer</span>
-            </dd>
-            <dt>Arguments</dt>
-            <dd data-testid="review-args">
-              {!spec.args.length ? (
-                <span className="dim">none</span>
-              ) : argValues ? (
+        <ReviewCard
+          testid="call-review"
+          actionTestid="review-does"
+          action={
+            <>
+              Call <Named text={spec.method} /> on program <span className="mono nowrap" title={spec.program}>{shortAddr(spec.program)}</span>
+              {review.value > 0n && (
+                <>
+                  {" "}
+                  with <Amount drops={review.value} exact />
+                </>
+              )}
+            </>
+          }
+          rows={[
+            { k: "From", v: <Party name={account?.names[0]} address={wallet?.account ?? ""} />, hint: <>signed by “{inertText(caller.label, 40)}” (owner)</> },
+            { k: "To", v: <Party address={spec.program} label="Program" /> },
+            spec.args.length > 0 && {
+              k: "Arguments",
+              testid: "review-args",
+              v: argValues ? (
                 spec.args.map((a, i) => (
                   <span key={i} className="block">
                     <Named text={a.untrusted_name} max={32} />: <ShownView s={shownValue(a.type, argValues[i], chainUnit())} />
@@ -552,70 +554,63 @@ function CallForm({ spec, info, caller, prefix, me, stale }: { spec: ProgramCall
                 ))
               ) : review.args.ok ? null : (
                 <span className="warn">{review.args.problem}</span>
-              )}
-              <span className="dim small block">read back from the input below, by the interface&apos;s types</span>
-            </dd>
-            <dt>Input</dt>
-            <dd>
-              <span className="mono break" data-testid="review-input">{review.input || "(empty)"}</span>
-              <span className="dim small block">{(review.input.length / 2).toLocaleString("en-US")} bytes, Borsh-encoded</span>
-            </dd>
-            {spec.payable && (
-              <>
-                <dt>Value</dt>
-                <dd data-testid="review-value">
-                  <Amount drops={review.value} exact /> <span className="dim small">sent to the program</span>
-                </dd>
-              </>
-            )}
-            <dt>Storage limit</dt>
-            <dd data-testid="review-storage">
-              <Amount drops={review.storageLimit} exact /> <span className="dim small">{review.storageLimit === 0n ? "no new storage: if the method writes, it traps and the fee is still charged" : "at most, bonded as deposit for what it writes"}</span>
-            </dd>
-            <dt>
-              <Term k="digest">Version digest</Term>
-            </dt>
-            <dd>
-              <span className="mono break" data-testid="review-digest">{spec.versionDigest}</span>
-              <span className="dim small block">The record on this page (version {info.version}): the call runs only while the program still has exactly this code, interface and version, or it&apos;s refused and nothing is charged.</span>
-            </dd>
-            <dt>
-              <Term k="fuel">Fuel</Term>
-            </dt>
-            <dd data-testid="review-fuel">
-              {(review.fuel.run + review.fuel.load).toLocaleString("en-US")} reserved <span className="dim small">({review.fuel.run.toLocaleString("en-US")} to run, {review.fuel.load.toLocaleString("en-US")} to load its code): paid for whether it&apos;s used or not</span>
-            </dd>
-            <dt>
-              <Term k="fee">Max fee</Term>
-            </dt>
-            <dd data-testid="review-fee">
-              {formatDrops(BigInt(review.tx.fee), chainUnit())} <span className="dim small">at most, fuel included: the base fee for its bytes and the fuel it reserves, burned{BigInt(review.tx.tip ?? 0) > 0n ? `, plus a ${formatDrops(BigInt(review.tx.tip ?? 0), chainUnit())} tip` : ""}</span>
-            </dd>
-            <dt className="total">Total</dt>
-            <dd className="total" data-testid="review-total">
-              <b>
-                <Amount drops={BigInt(review.tx.fee) + review.value + review.storageLimit} exact />
-              </b>{" "}
-              <span className="dim small">at most leaves this account</span>
-            </dd>
-            <dt>
-              <Term k="nonce" />
-            </dt>
-            <dd>{review.tx.nonce}</dd>
-          </dl>
-          <details className="raw">
-            <summary>The exact transaction you&apos;ll sign</summary>
-            <pre>{JSON.stringify({ ...review.tx, public_key: `${review.tx.public_key.slice(0, 24)}…`, signature: `${review.tx.signature.length / 2} bytes, made when you sign` }, null, 2)}</pre>
-          </details>
-          <div className="row-gap">
-            <button className="btn" disabled={!!busy} onClick={() => setReview(null)}>
-              ← Edit
-            </button>
-            <button className="btn grow primary" disabled={!!busy} onClick={send}>
-              {busy === "check" ? <Spinner>Waiting for your passkey…</Spinner> : "Sign & send"}
-            </button>
-          </div>
-        </div>
+              ),
+            },
+            spec.payable && { k: "Amount", v: <Amount drops={review.value} exact />, testid: "review-value" },
+            review.storageLimit > 0n && { k: "Deposit", v: <Amount drops={review.storageLimit} exact />, hint: "at most, bonded as deposit for what it writes", testid: "review-storage" },
+            { k: <Term k="fee">Max fee</Term>, v: formatDrops(BigInt(review.tx.fee), chainUnit()), hint: "at most, fuel included", testid: "review-fee" },
+            {
+              k: "Total",
+              v: (
+                <b>
+                  <Amount drops={BigInt(review.tx.fee) + review.value + review.storageLimit} exact />
+                </b>
+              ),
+              hint: "at most leaves this account",
+              testid: "review-total",
+              total: true,
+            },
+          ]}
+          details={
+            <ReviewDetails
+              rows={[
+                { k: "Program", v: <span className="mono break" data-testid="review-program">{spec.program}</span> },
+                { k: "Signs", v: review.does },
+                { k: "Method", v: <Named text={spec.method} />, hint: "named by its deployer" },
+                {
+                  k: "Input",
+                  v: <span className="mono break" data-testid="review-input">{review.input || "(empty)"}</span>,
+                  hint: `${(review.input.length / 2).toLocaleString("en-US")} bytes, Borsh-encoded${spec.args.length ? ". The arguments are read back from it." : ""}`,
+                },
+                review.storageLimit === 0n && { k: "Storage limit", v: <Amount drops={review.storageLimit} exact />, hint: "no new storage: if the method writes, it traps and the fee is still charged", testid: "review-storage" },
+                {
+                  k: <Term k="digest">Version digest</Term>,
+                  v: <span className="mono break" data-testid="review-digest">{spec.versionDigest}</span>,
+                  hint: <span data-testid="review-pinned">Version {info.version}. The call runs only while the program still has exactly this code, interface and version, or it&apos;s refused and nothing is charged.</span>,
+                },
+                {
+                  k: <Term k="fuel">Fuel</Term>,
+                  v: `${(review.fuel.run + review.fuel.load).toLocaleString("en-US")} reserved`,
+                  hint: `${review.fuel.run.toLocaleString("en-US")} to run, ${review.fuel.load.toLocaleString("en-US")} to load its code. Paid for whether it's used or not.`,
+                  testid: "review-fuel",
+                },
+                BigInt(review.tx.tip ?? 0) > 0n && { k: "Tip", v: formatDrops(BigInt(review.tx.tip ?? 0), chainUnit()), hint: "to the block's proposer, part of the max fee" },
+                { k: <Term k="nonce" />, v: review.tx.nonce },
+              ]}
+            />
+          }
+          raw={<RawTx tx={review.tx} />}
+          actions={
+            <>
+              <button className="btn" disabled={!!busy} onClick={() => setReview(null)}>
+                ← Edit
+              </button>
+              <button className="btn grow primary" disabled={!!busy} onClick={send}>
+                {busy === "check" ? <Spinner>Waiting for your passkey…</Spinner> : "Sign & send"}
+              </button>
+            </>
+          }
+        />
       )}
       <ErrorNote error={error} />
     </div>

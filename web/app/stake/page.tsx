@@ -170,7 +170,7 @@ function Stake() {
       <Delegate validators={validators} terms={terms} run={run} />
 
       <Tip>
-        Staked FANG stays yours, but it&apos;s bonded: it earns a share of issuance while the validator does its job, it&apos;s slashed with the pool if the validator double-signs or keeps missing its turns, and taking it out takes {unbondingFor}.
+        Staked FANG stays yours but is bonded: it can be slashed with the validator&apos;s pool, and taking it out takes {unbondingFor}.
       </Tip>
     </main>
   );

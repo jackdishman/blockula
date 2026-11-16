@@ -61,9 +61,7 @@ export function JuryCard({ pool }: { pool: ContributionsView }) {
         <Term k="seance">the Séance jury</Term>
       </span>
       <h2 className="m0">Join the jury</h2>
-      <p className="dim m0">
-        Jurors compare merged pull requests in pairs (“which mattered more?”), sealing their votes and then revealing them. Agreeing with the outcome earns <Term k="soul">Soul</Term> and a share of the payout; not showing up costs Soul and part of the bond. Jurors are people: only an owner key can join.
-      </p>
+      <p className="dim m0">Jurors compare merged pull requests in pairs. Only an owner key can join.</p>
       <dl className="kv">
         <dt>
           <Term k="soul">Your Soul</Term>
@@ -77,7 +75,7 @@ export function JuryCard({ pool }: { pool: ContributionsView }) {
         </dd>
         <dt>Bond</dt>
         <dd data-testid="jury-bond">
-          {rules.bondDisplay ?? "—"} <span className="dim small">held while you&apos;re in the pool, and yours again when you leave. A no-show loses part of it.</span>
+          {rules.bondDisplay ?? "—"} <span className="dim small">returned when you leave. A no-show loses part of it.</span>
         </dd>
         <dt>You</dt>
         <dd data-testid="jury-status">
@@ -105,10 +103,7 @@ export function JuryCard({ pool }: { pool: ContributionsView }) {
               )}
               {timing.open ? "The one after can open from " : "Can open from "}
               {timing.next}
-              <span className="dim small block">
-                {rules.minJury != null ? `It opens once claims by at least 2 people have matured and ${rules.minJury} jurors are available. ` : ""}
-                Its jury is drawn from jurors who joined at least an epoch before it opens, so joining close to an opening seats you from the one after. {pool.jurors.active.toLocaleString("en-US")} in the pool now.
-              </span>
+              <span className="dim small block">{pool.jurors.active.toLocaleString("en-US")} in the pool now.</span>
             </>
           )}
         </dd>
@@ -133,11 +128,10 @@ export function JuryCard({ pool }: { pool: ContributionsView }) {
       {standing !== "none" && (
         <div className="jury-act" data-testid="jury-leave">
           <span className="eyebrow">leave the jury</span>
-          <p className="dim m0">Leaving takes you out of the draw and returns your bond ({juror?.bond_display}) to this account. You can join again later.</p>
+          <p className="dim m0">Leaving returns your bond ({juror?.bond_display}) to this account. You can join again later.</p>
           {cantLeave.length > 0 ? <Blockers list={cantLeave} testid="jury-leave-blocked" /> : <ActionForm spec={LEAVE} compact cta="Leave the jury" />}
         </div>
       )}
-      {standing === "none" && a && <span className="dim small">Not enrolled, so there&apos;s nothing to leave: a way out, with your bond, shows here once you&apos;re in the pool.</span>}
     </section>
   );
 }

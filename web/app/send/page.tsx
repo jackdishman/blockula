@@ -5,11 +5,13 @@ import { isAddress, parseFang, type Tx } from "@blockula/sdk";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
+import { Term } from "@/components/explorer/kit";
 import { PreflightView } from "@/components/explorer/PreflightView";
+import { Party, RawTx, ReviewDetails, ReviewRows, useReveal } from "@/components/explorer/Review";
 import { RequireWallet } from "@/components/Gate";
 import { Apparition } from "@/components/Haunt";
 import { PayLinkNotice } from "@/components/PayLinkNotice";
-import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
+import { ErrorNote, ExplorerLink, Spinner } from "@/components/ui";
 import { explorer, MAINNET_PREFIX, NETWORK } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { PasskeyCheckError } from "@/lib/keys";
@@ -137,6 +139,8 @@ function Send() {
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recipient = useRecipient(to);
+  // The review replaces the form: bring it into view, wherever the form was scrolled to.
+  const revealRef = useReveal<HTMLElement>(!!review && !sent);
 
   // What can move now: v1 nodes report `transferable` (vote and vesting locks hold the rest), and
   // pending payments take theirs first (USER-5, TR-11).
@@ -270,90 +274,96 @@ function Send() {
     // A refusal the chain's state settles (balance, locks): no "Send anyway", only Edit.
     const sure = review.pf?.certain === true;
     return (
-      <main className="narrow stack-lg">
+      <main className="narrow stack">
         <div className="section-head">
           <span className="eyebrow">Read it twice</span>
           <h1>Review</h1>
         </div>
-        <section className="card stack">
-          <p className="summary">
+        <section className="card stack review" data-testid="send-review" ref={revealRef}>
+          <p className="summary review-action" data-testid="send-review-action">
             {me ? `${me} sends` : "You send"} {exact(amt)} to {review.display}
           </p>
-          <dl className="kv">
-            <dt>To</dt>
-            <dd>
-              {/* One line: who it pays, then exactly what's signed (the address, or the name the chain resolves). */}
-              <div className="money-payee" data-testid="payee">
-                Pays{" "}
-                {review.byChain ? (
+          <ReviewRows
+            rows={[
+              { k: "From", v: <Party name={me} address={wallet.account} />, testid: "send-review-from" },
+              {
+                k: "To",
+                v: (
                   <>
-                    <b data-testid="signed-to">{signed}</b> · <span className="mono">{shortAddr(review.nodeSays)}</span> <span className="dim small">(your node&apos;s answer)</span>
+                    {/* One line: who it pays, then exactly what's signed (the address, or the name the chain resolves). */}
+                    <div className="money-payee" data-testid="payee">
+                      Pays{" "}
+                      {review.byChain ? (
+                        <>
+                          <b data-testid="signed-to">{signed}</b> · <span className="mono">{shortAddr(review.nodeSays)}</span> <span className="dim small">(your node&apos;s answer)</span>
+                        </>
+                      ) : signed === review.nodeSays && review.display !== shortAddr(signed) ? (
+                        <>
+                          <b>{review.display}</b> · <span className="mono break" data-testid="signed-to">{signed}</span>
+                        </>
+                      ) : (
+                        <span className="mono break" data-testid="signed-to">{signed}</span>
+                      )}
+                    </div>
+                    {review.proven && !review.byChain && review.display !== shortAddr(signed) && client.witnesses.length > 0 && (
+                      <div className="ok small">Proven by {client.witnesses.length} other node{client.witnesses.length === 1 ? "" : "s"}.</div>
+                    )}
+                    {!review.proven && !review.byChain && <div className="warn small">Looked up on your node only, not proven. For a large payment, check this address with the person you&apos;re paying.</div>}
+                    {review.risks.map((r) => (
+                      <p key={r} className="warn small money-note" data-testid="name-risk">
+                        {r}
+                      </p>
+                    ))}
                   </>
-                ) : signed === review.nodeSays && review.display !== shortAddr(signed) ? (
+                ),
+              },
+              { k: "Amount", v: exact(amt) },
+              { k: <Term k="fee">Max fee</Term>, v: exact(fee), hint: tip > 0n ? <>includes a {exact(tip)} tip to the block&apos;s proposer</> : undefined },
+              opening > 0n && { k: "Opening their account", v: exact(opening), hint: "burned: this is the first payment to it", testid: "opening" },
+              { k: "Total", v: <b>{exact(amt + fee + opening)}</b>, total: true, testid: "send-review-total" },
+              !!review.tx.memo && {
+                k: "Memo",
+                v: (
                   <>
-                    <b>{review.display}</b> · <span className="mono break" data-testid="signed-to">{signed}</span>
+                    <i>“{review.tx.memo}”</i> <span className="dim small">(public)</span>
                   </>
-                ) : (
-                  <span className="mono break" data-testid="signed-to">{signed}</span>
-                )}
-              </div>
-              {review.byChain && (
-                <details className="money-why" data-testid="by-chain">
-                  <summary>Why is this safe?</summary>
-                  <p className="small">
+                ),
+              },
+            ]}
+          />
+          {review.pf && <PreflightView p={review.pf} me={wallet.account} blockMs={review.blockMs} part="alerts" />}
+          <ReviewDetails
+            rows={[
+              review.byChain && {
+                k: "Why by name",
+                v: (
+                  <span data-testid="by-chain">
                     Signed as the name: the chain pays whoever owns {review.display} when this transaction runs, so your node can&apos;t point it at another account now. Your node says that&apos;s <span className="mono break">{review.nodeSays}</span> (not proven). A dishonest node could still hold the transaction and release it later (its validity window counts from the height that node reports), after the name changed hands.
-                  </p>
-                </details>
-              )}
-              {review.proven && !review.byChain && review.display !== shortAddr(signed) && client.witnesses.length > 0 && (
-                <div className="ok small">Proven by {client.witnesses.length} other node{client.witnesses.length === 1 ? "" : "s"}.</div>
-              )}
-              {!review.proven && !review.byChain && <div className="warn small">Looked up on your node only, not proven. For a large payment, check this address with the person you&apos;re paying.</div>}
-              {review.risks.map((r) => (
-                <p key={r} className="warn small money-note" data-testid="name-risk">
-                  {r}
-                </p>
-              ))}
-            </dd>
-            <dt>Amount</dt>
-            <dd>{exact(amt)}</dd>
-            <dt>Network fee</dt>
-            <dd>
-              {exact(fee)} <span className="dim small">at most ({tip > 0n ? <>burned, but for a {exact(tip)} tip to the block&apos;s proposer</> : "burned"})</span>
-            </dd>
-            {opening > 0n && (
-              <>
-                <dt>Opening their account</dt>
-                <dd data-testid="opening">{exact(opening)} <span className="dim small">(burned: this is the first payment to it)</span></dd>
-              </>
+                  </span>
+                ),
+              },
+              { k: "From", v: <span className="mono small break">{wallet.account}</span> },
+              { k: "Fee", v: "Priced by the transaction's size and burned, not paid to anyone. This is the most it can be." },
+              { k: <Term k="nonce" />, v: review.tx.nonce },
+            ]}
+          >
+            {review.pf && <PreflightView p={review.pf} me={wallet.account} blockMs={review.blockMs} part="changes" />}
+            <RawTx tx={review.tx} />
+          </ReviewDetails>
+          {/* DRAFT copy for counsel (D4): lib/money-copy.ts. */}
+          <p className="money-final" data-testid="payments-final">{PAYMENTS_FINAL}</p>
+          <div className="row-gap review-actions">
+            <button className="btn" disabled={busy} onClick={() => setReview(null)}>← Edit</button>
+            {!sure && (
+              <button className={`btn grow ${refusals ? "" : "primary"}`} disabled={busy} onClick={confirm}>
+                {checking ? <Spinner>Waiting for your passkey…</Spinner> : busy ? <Spinner>Sealing into a block…</Spinner> : refusals ? "Send anyway" : "Confirm & send"}
+              </button>
             )}
-            <dt className="total">Total</dt>
-            <dd className="total"><b>{exact(amt + fee + opening)}</b></dd>
-            {review.tx.memo && (
-              <>
-                <dt>Memo</dt>
-                <dd><i>“{review.tx.memo}”</i> <span className="dim small">(public)</span></dd>
-              </>
-            )}
-          </dl>
-          {review.pf && <PreflightView p={review.pf} me={wallet.account} blockMs={review.blockMs} />}
+          </div>
+          {hint.kind === "passkey" && !sure && <p className="dim small m0" data-testid="check-note">Your passkey asks for Face ID, fingerprint or PIN before this is signed.</p>}
+          {sure && <p className="dim small m0" data-testid="cannot-send">The chain would refuse this as it is, so there&apos;s nothing to confirm. Change the amount, or wait for FANG to arrive or unlock.</p>}
+          <ErrorNote error={error} />
         </section>
-        <Tip>
-          The fee is priced by size: post-quantum signatures are about 3.3 KB, so every transaction pays a little for its bytes, and that fee is destroyed rather than paid to anyone.
-        </Tip>
-        {/* DRAFT copy for counsel (D4): lib/money-copy.ts. */}
-        <p className="money-final" data-testid="payments-final">{PAYMENTS_FINAL}</p>
-        {hint.kind === "passkey" && !sure && <p className="dim small" data-testid="check-note">Your passkey asks for Face ID, fingerprint or PIN before this is signed.</p>}
-        <div className="row-gap">
-          <button className="btn" disabled={busy} onClick={() => setReview(null)}>← Edit</button>
-          {!sure && (
-            <button className={`btn grow ${refusals ? "" : "primary"}`} disabled={busy} onClick={confirm}>
-              {checking ? <Spinner>Waiting for your passkey…</Spinner> : busy ? <Spinner>Sealing into a block…</Spinner> : refusals ? "Send anyway" : "Confirm & send"}
-            </button>
-          )}
-        </div>
-        {sure && <p className="dim small" data-testid="cannot-send">The chain would refuse this as it is, so there&apos;s nothing to confirm. Change the amount, or wait for FANG to arrive or unlock.</p>}
-        <ErrorNote error={error} />
       </main>
     );
   }
@@ -403,7 +413,7 @@ function Send() {
         <label className="money-check">
           <input type="checkbox" checked={priority} onChange={(e) => setPriority(e.target.checked)} />
           <span>
-            Priority <span className="dim small">(adds a tip for the block&apos;s proposer, the same again as the fee, so busy blocks take it first)</span>
+            Priority <span className="dim small">(doubles the fee as a tip, so busy blocks take it first)</span>
           </span>
         </label>
         <button className="btn primary" disabled={!canReview || busy} onClick={toReview}>
@@ -411,11 +421,14 @@ function Send() {
         </button>
         <ErrorNote error={error} />
       </section>
-      <Tip>
-        {client.witnesses.length
-          ? <>Names are proven against {client.witnesses.length + 1} independent nodes before you sign, and the review shows the exact address that gets paid.</>
-          : <>A payment to a name is signed as the name: the chain pays whoever owns it when the payment runs. The review shows exactly what gets signed.</>}
-      </Tip>
+      <details className="how">
+        <summary>How names are paid</summary>
+        <p className="dim small">
+          {client.witnesses.length
+            ? <>Names are proven against {client.witnesses.length + 1} independent nodes before you sign, and the review shows the exact address that gets paid.</>
+            : <>A payment to a name is signed as the name: the chain pays whoever owns it when the payment runs. The review shows exactly what gets signed.</>}
+        </p>
+      </details>
     </main>
   );
 }

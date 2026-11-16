@@ -145,9 +145,10 @@ test.describe("the blackjack table", () => {
     await expect(page.getByTestId("bj-review")).toHaveCount(0);
     expect(node.submitted).toHaveLength(0);
 
-    // Step 1 of 2, the bet, reviewed: the program, the method's input (the hash of the seed this
-    // browser just made, never the seed), the FANG sent, the storage limit, and the whole version
-    // digest the call binds.
+    // Step 1 of 2, the bet, reviewed: who signs, the table, the FANG sent, the deposit, the most it
+    // costs and the total in view; the program's whole address, the method's input (the hash of the
+    // seed this browser just made, never the seed) and the whole version digest the call binds under
+    // "Details", closed until it's opened.
     await expect(form.getByTestId("bj-bet-two")).toHaveText("A bet is two transactions: the bet, then your seed. Each one is signed with your passkey.");
     await form.getByTestId("bj-bet-input").fill("2");
     await reviewBet.click();
@@ -161,10 +162,22 @@ test.describe("the blackjack table", () => {
     const seed = (await kept(page))!.pending.at(-1)!.seed;
     expect(seed).toMatch(/^[0-9a-f]{64}$/);
     const hash = seedHash(me, seed);
-    await expect(review.getByTestId("bj-review-seed-hash")).toHaveText(hash);
+    // The bet's input is the seed's hash: said once, beside the input, not as a row of its own.
+    await expect(review.getByTestId("bj-review-seed-hash")).toHaveCount(0);
     await expect(review.getByTestId("bj-review-input")).toHaveText(hash);
     await expect(review).not.toContainText(seed);
-    await expect(review).toContainText("The bet sends only their hash.");
+    await expect(review).toContainText("The bet sends only the hash.");
+    // The signer and the total stay in view; the technical rows are one tap away.
+    await expect(review).toContainText("(owner)");
+    await expect(review.getByTestId("bj-review-total")).toBeVisible();
+    await expect(review.getByTestId("bj-review-total")).toContainText("at most leaves your account");
+    const more = review.getByTestId("bj-review-details");
+    await expect(more).not.toHaveAttribute("open", "");
+    await expect(review.getByTestId("bj-review-digest")).toBeHidden();
+    await more.getByText("Details", { exact: true }).click();
+    await expect(review.getByTestId("bj-review-program")).toBeVisible();
+    await expect(review.getByTestId("bj-review-digest")).toBeVisible();
+    await expect(review.getByTestId("bj-review-pinned")).toContainText("The call runs only while the program still has exactly this code, interface and version. If it changed, the call is refused and nothing is charged.");
     table.knownSeeds.push(seed);
     const before = node.acct(me).balance;
     await expect(review.getByTestId("bj-review-does")).toHaveText(/^Bet 2 FANG on a new hand \(step 1 of 2\)$/);
@@ -343,7 +356,7 @@ test.describe("the blackjack table", () => {
     expect(node.submitted).toHaveLength(before);
     const seed = (await kept(page))!.pending.at(-1)!.seed;
     expect(seed).not.toBe(first);
-    await expect(review.getByTestId("bj-review-seed-hash")).toHaveText(seedHash(me, seed));
+    await expect(review.getByTestId("bj-review-input")).toHaveText(seedHash(me, seed));
     table.knownSeeds.push(seed);
     await review.getByTestId("bj-sign").click();
     await expect(review.getByTestId("bj-review-does")).toHaveText(/^Reveal your seed for hand 1 \(step 2 of 2\)$/);

@@ -146,7 +146,7 @@ export default function NamePage() {
           <Section title="About names">
             <p>A .boo name points to an account, like a domain name points to a server, so boos can pay {r.name} instead of an address.</p>
             <p className="dim">
-              Names are registered for a year at a time{r.renewal_price_display ? ` (renewing costs ${r.renewal_price_display} a year)` : ""}. Shorter names cost more because they&apos;re scarcer. The price goes to the treasury.
+              Names are registered for a year at a time{r.renewal_price_display ? ` (renewing costs ${r.renewal_price_display} a year)` : ""}. The price goes to the treasury.
             </p>
           </Section>
         </div>

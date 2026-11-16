@@ -95,7 +95,8 @@ test("the review steps fit a 390 px phone", async ({ page, node }) => {
   await page.getByPlaceholder(/^alice\.boo or /).fill("mina.boo");
   await page.getByPlaceholder("0.0").fill("1");
   await page.getByRole("button", { name: "Review" }).click();
-  await page.getByTestId("by-chain").getByText("Why is this safe?").click();
+  await page.getByTestId("review-details").getByText("Details", { exact: true }).click();
+  await expect(page.getByTestId("by-chain")).toBeVisible();
   await fits(page, "send review");
 
   // Staking's review.
