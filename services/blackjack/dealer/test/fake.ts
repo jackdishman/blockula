@@ -45,9 +45,11 @@ export interface SettledHand {
 export class FakeTable implements TableReader, TxSender {
   /** Across every table of a test run: a timeout from the dealer that reached a hand it owed cards on. */
   static readonly violations: string[] = [];
-  readonly address = DEALER;
+  /** The dealer's account, and the owner's: stand-ins by default, real addresses for a test that encodes the records. */
+  readonly address: string;
+  readonly owner: string;
   height = 100;
-  dealer = DEALER;
+  dealer: string;
   nextCommit = 0n;
   nextGame = 0n;
   limits_: Limits = { ...DEFAULT_LIMITS, revealBlocks: 20n, idleBlocks: 30n, seedBlocks: 25n };
@@ -69,6 +71,12 @@ export class FakeTable implements TableReader, TxSender {
   private readonly waiting = new Map<string, TableCall>();
   private txs = 0;
 
+  constructor(address: string = DEALER, owner: string = OWNER) {
+    this.address = address;
+    this.owner = owner;
+    this.dealer = address;
+  }
+
   // ---- what the dealer reads
 
   private up(): void {
@@ -77,7 +85,7 @@ export class FakeTable implements TableReader, TxSender {
 
   async house(): Promise<House & { height: number }> {
     this.up();
-    return { owner: OWNER, dealer: this.dealer, bankroll: 0n, reserved: 0n, stakes: 0n, table: 0n, nextCommit: this.nextCommit, nextGame: this.nextGame, paused: false, open: this.open.length, height: this.height };
+    return { owner: this.owner, dealer: this.dealer, bankroll: 0n, reserved: 0n, stakes: 0n, table: 0n, nextCommit: this.nextCommit, nextGame: this.nextGame, paused: false, open: this.open.length, height: this.height };
   }
 
   async limits(): Promise<Limits> {
@@ -114,14 +122,14 @@ export class FakeTable implements TableReader, TxSender {
     const validUntil = this.height + (opts.validForBlocks ?? 600);
     switch (fate) {
       case "ok":
-        return this.land(id, c, DEALER);
+        return this.land(id, c, this.address);
       case "dry":
         // It ran out of the fuel it reserved, unless it reserved the chain's maximum.
-        if (opts.fuelLimit === undefined) return this.land(id, c, DEALER);
+        if (opts.fuelLimit === undefined) return this.land(id, c, this.address);
         this.height++;
         return { status: "aborted", id, height: this.height, code: undefined, trap: "out_of_fuel" };
       case "ghost":
-        this.land(id, c, DEALER);
+        this.land(id, c, this.address);
         return { status: "unknown", id, held: false, validUntil };
       case "held":
         this.waiting.set(id, c);
@@ -145,7 +153,7 @@ export class FakeTable implements TableReader, TxSender {
     const c = this.waiting.get(id);
     if (!c) throw new Error("nothing held under that id");
     this.waiting.delete(id);
-    this.land(id, c, DEALER);
+    this.land(id, c, this.address);
   }
 
   /** The node drops what it held: it never runs. */

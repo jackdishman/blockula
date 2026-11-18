@@ -4,6 +4,10 @@
  *
  * There is no default node: the RPC URL must be given, and it must be this machine's
  * (127.0.0.1, localhost or ::1) unless `allowRemote` says otherwise and the chain is pinned.
+ *
+ * `witnesses` turns on proven reads (docs/proposals/blackjack-card-privacy.md): other nodes of
+ * the same chain that must confirm the state root of every record the dealer acts on. Without
+ * them nothing changes.
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -48,6 +52,16 @@ export interface DealerConfig {
   /** The chain id and genesis hash the node must report, when pinned. */
   chainId?: string;
   genesisHash?: string;
+  /**
+   * Other nodes of the same chain. With any, every table record is read with its Merkle proof and
+   * its state root must be confirmed by them before the dealer makes anything of it. Empty: the
+   * node's word is taken, as before.
+   */
+  witnesses: string[];
+  /** How many witnesses must confirm each state root. Unset: all of them. */
+  witnessQuorum?: number;
+  /** How far behind the witnesses' newest head a proof's block may be. */
+  proofMaxLagBlocks: number;
 }
 
 /** Every setting by its JSON key, with its flag and environment variable. */
@@ -74,6 +88,9 @@ const KNOBS = [
   ["fullFuel", "--full-fuel", "BJ_DEALER_FULL_FUEL"],
   ["chainId", "--chain-id", "BJ_DEALER_CHAIN_ID"],
   ["genesisHash", "--genesis-hash", "BJ_DEALER_GENESIS_HASH"],
+  ["witnesses", "--witnesses", "BJ_DEALER_WITNESSES"],
+  ["witnessQuorum", "--witness-quorum", "BJ_DEALER_WITNESS_QUORUM"],
+  ["proofMaxLagBlocks", "--proof-max-lag-blocks", "BJ_DEALER_PROOF_MAX_LAG_BLOCKS"],
 ] as const;
 type Key = (typeof KNOBS)[number][0];
 const BOOLEANS: ReadonlySet<string> = new Set(["dryRun", "allowRemote", "keychain", "fullFuel"]);
@@ -144,6 +161,22 @@ export function isLocalRpc(rpc: string): boolean {
   return ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
 }
 
+/**
+ * A node's URL as one thing to compare: scheme and host in lowercase, the default port and any
+ * trailing slash dropped. `undefined` if it isn't a plain http(s) URL.
+ */
+export function nodeUrl(rpc: string): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(rpc);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+  if (url.username || url.password || url.search || url.hash) return undefined;
+  return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, "")}`;
+}
+
 export const DEFAULT_DIR = join(homedir(), ".blockula", "blackjack-dealer");
 
 /**
@@ -192,6 +225,26 @@ export function loadConfig(args: ParsedArgs, env: Readonly<Record<string, string
       if (!chainId || !genesisHash) throw new Error("a node on another machine needs the chain pinned: set chainId and genesisHash too");
     }
   }
+  // Witnesses: a list in the file, or text with commas (a flag, the environment).
+  const given = raw("witnesses");
+  if (given !== undefined && typeof given !== "string" && !(Array.isArray(given) && given.every((w) => typeof w === "string"))) throw new Error("witnesses is a list of node URLs (or text with commas between them)");
+  const listed = (typeof given === "string" ? given.split(",") : ((given as string[] | undefined) ?? [])).map((w) => w.trim()).filter((w) => w !== "");
+  const witnesses: string[] = [];
+  for (const w of listed) {
+    const url = nodeUrl(w);
+    if (url === undefined) throw new Error(`a witness is the http:// or https:// URL of a node, with nothing after its path: ${w.slice(0, 80)}`);
+    if (url === nodeUrl(rpc)) throw new Error(`${url} is the dealer's own node: a witness is another node, run by someone (or somewhere) else`);
+    if (witnesses.includes(url)) throw new Error(`${url} is listed twice: a witness counts once`);
+    if (!isLocalRpc(url)) {
+      if (!url.startsWith("https://")) throw new Error(`${url} is another machine's node over plain http: a witness on another machine must be https, or whoever is on the path answers for it`);
+      if (!chainId || !genesisHash) throw new Error("a witness on another machine needs the chain pinned: set chainId and genesisHash too");
+    }
+    witnesses.push(url);
+  }
+  if (witnesses.length > 16) throw new Error("at most 16 witnesses: each is asked about every block");
+  const witnessQuorum = raw("witnessQuorum") === undefined ? undefined : whole(raw("witnessQuorum"), "witnessQuorum", 1, 16);
+  if (witnessQuorum !== undefined && witnesses.length === 0) throw new Error("witnessQuorum needs witnesses");
+  if (witnessQuorum !== undefined && witnessQuorum > witnesses.length) throw new Error(`witnessQuorum is at most the number of witnesses (${witnesses.length})`);
   const table = str("table") ?? "";
   if (opts.needTable !== false && !/^t?boo1[0-9a-z]+$/.test(table)) throw new Error("no table: set --table (or BJ_DEALER_TABLE) to the program's address (boo1…)");
 
@@ -221,6 +274,9 @@ export function loadConfig(args: ParsedArgs, env: Readonly<Record<string, string
     fullFuel: flag("fullFuel"),
     chainId,
     genesisHash,
+    witnesses,
+    witnessQuorum,
+    proofMaxLagBlocks: num("proofMaxLagBlocks", 10, 0, 100_000),
   };
   if (!/^\d+(\.\d{1,9})?$/.test(cfg.lowBalance)) throw new Error("lowBalance is an amount of FANG, like 5 or 2.5");
   if (cfg.target < cfg.lowWater) throw new Error("target can't be under lowWater: the dealer tops up to target when fewer than lowWater commitments are left");

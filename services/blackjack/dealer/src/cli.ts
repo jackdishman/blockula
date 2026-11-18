@@ -9,7 +9,7 @@
  * Settings come from flags, `BJ_DEALER_*` variables or a JSON file (`--config`): the README has
  * the list. Secrets are only ever read from files (or the keychain), never from the command line.
  */
-import { DROPS_PER_FANG, Table, fang } from "@blockula/blackjack";
+import { DROPS_PER_FANG, fang } from "@blockula/blackjack";
 import { Client, Wallet } from "@blockula/sdk";
 import { mkdirSync } from "node:fs";
 import { WalletSender } from "./chain.js";
@@ -17,6 +17,7 @@ import { loadConfig, parseArgs, type DealerConfig } from "./config.js";
 import { Dealer, inspect, type Health } from "./dealer.js";
 import { checkPrivate, createDealerKey, createStoreKey, keychainStoreKey, readDealerSeed, readStoreKey } from "./keys.js";
 import { errorText, jsonLogger } from "./log.js";
+import { isNodeFault, readsText, tableReader, trustNotes } from "./reader.js";
 import { SeedStore, StoreError } from "./store.js";
 
 const USAGE = `blackjack-dealer <init | run | status> [options]
@@ -30,6 +31,8 @@ const USAGE = `blackjack-dealer <init | run | status> [options]
   --dir PATH           where the key, secret and store live (default ~/.blockula/blackjack-dealer)
   --config FILE        a JSON file of settings
   --dry-run            (run) log what would be sent; send nothing
+  --witnesses URLS     other nodes of the chain (commas between): every record the dealer acts on
+                       is then read with its Merkle proof, its state root confirmed by them
   --json               (status) print JSON
 
 Every setting, with its BJ_DEALER_* variable, is in services/blackjack/dealer/README.md.`;
@@ -94,11 +97,22 @@ async function run(cfg: DealerConfig): Promise<void> {
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
 
+  for (const note of trustNotes(cfg)) log[note.level](note.action, note.fields);
   // A node that isn't up yet (or a table that isn't created yet) is waited for, not a reason to exit.
   let fails = 0;
   const wait = async (what: string, e: unknown) => {
     fails++;
-    log.warn(what, { error: errorText(e), fails });
+    // A proof that doesn't check, or a witness with another state root: not a node that is slow,
+    // a node (or a witness) that is wrong.
+    if (isNodeFault(e)) {
+      log.error("node_disagreement", {
+        during: what,
+        kind: e.kind,
+        error: errorText(e),
+        fails,
+        advice: "the node's answer wasn't the chain's state as the witnesses have it, so nothing was made of it and nothing was revealed. Find out which of them is wrong before trusting either; a hand the dealer owes cards on is paid to its player if this outlasts its deadline",
+      });
+    } else log.warn(what, { error: errorText(e), fails });
     await sleep(Math.min(cfg.pollMs * 2 ** Math.min(fails, 6), 5_000));
   };
   let started: Dealer | undefined;
@@ -110,7 +124,7 @@ async function run(cfg: DealerConfig): Promise<void> {
       if (store.bindChain(genesisHash)) log.info("store_bound", { chain: genesisHash.slice(0, 12), stored: store.size });
       await c.addressPrefix();
       const wallet = Wallet.fromSeed(seed, c);
-      const d = new Dealer(Table.at(cfg.rpc, cfg.table), new WalletSender(wallet, c, cfg.table), store, log, {
+      const d = new Dealer(tableReader(cfg, c), new WalletSender(wallet, c, cfg.table), store, log, {
         lowWater: cfg.lowWater,
         target: cfg.target,
         batch: cfg.batch,
@@ -159,6 +173,7 @@ function statusText(cfg: DealerConfig, address: string, balance: bigint, h: Heal
   const lines = [
     `table            ${cfg.table}`,
     `node             ${cfg.rpc} (block ${h.height})`,
+    `reads            ${readsText(cfg)}`,
     `dealer address   ${address}${h.isDealer ? "" : "   ⚠ not this table's dealer: the owner names it with set_dealer"}`,
     `balance          ${fang(balance)} FANG${balance < drops(cfg.lowBalance) ? `   ⚠ under ${cfg.lowBalance}: it pays every reveal's fee and bonds a deposit for every commitment` : ""}`,
     `commitments      ${h.unused} unused (games ${h.nextGame}–${h.nextCommit - 1n}), ${h.servable} this store can deal; tops up under ${cfg.lowWater} to ${cfg.target}`,
@@ -182,10 +197,10 @@ async function status(cfg: DealerConfig, json: boolean): Promise<void> {
   await c.addressPrefix();
   const wallet = Wallet.fromSeed(seed, c);
   const sender = new WalletSender(wallet, c, cfg.table);
-  const [h, balance] = [await inspect(Table.at(cfg.rpc, cfg.table), store, wallet.address), await sender.balance()];
+  const [h, balance] = [await inspect(tableReader(cfg, c), store, wallet.address), await sender.balance()];
   if (!json) return void console.log(statusText(cfg, wallet.address, balance, h, store.backupCurrent));
   const text = (v: unknown): unknown => (typeof v === "bigint" ? v.toString() : Array.isArray(v) ? v.map(text) : v !== null && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, text(x)])) : v);
-  console.log(JSON.stringify(text({ table: cfg.table, rpc: cfg.rpc, address: wallet.address, balance, low_balance: balance < drops(cfg.lowBalance), backup_current: store.backupCurrent, ...h }), null, 2));
+  console.log(JSON.stringify(text({ table: cfg.table, rpc: cfg.rpc, proven: cfg.witnesses.length > 0, witnesses: cfg.witnesses, address: wallet.address, balance, low_balance: balance < drops(cfg.lowBalance), backup_current: store.backupCurrent, ...h }), null, 2));
 }
 
 async function main(): Promise<void> {
