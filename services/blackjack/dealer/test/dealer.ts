@@ -7,7 +7,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Outcome, Phase, call, chainFromTop, dealers, hexBytes, owedLinks, verifyHand, type Game, type TableCall } from "@blockula/blackjack";
-import { Dealer, FUEL, inspect, type DealerOptions } from "../src/dealer.js";
+import { Dealer, FUEL, inspect, openingMargin, type DealerOptions } from "../src/dealer.js";
 import { jsonLogger, scrub } from "../src/log.js";
 import { SeedStore } from "../src/store.js";
 import { DEALER, FakeTable, type Fate } from "./fake.js";
@@ -844,9 +844,8 @@ try {
       assert.equal(sent(r, "reveal").at(-1)!.call.input, call.reveal(id, chain.slice(1, 4)).input);
       const opened = r.table.games.get(id)!;
       assert.deepEqual([opened.phase, opened.dealt, opened.link, opened.clientSeed, opened.playerCards], [Phase.Seed, 3, chain[3], null, []]);
-      // The player's time for the seed runs from the opening (a top-up may have landed after it).
-      const seedTime = opened.deadline - BigInt(r.table.height);
-      assert.ok(seedTime === 25n || seedTime === 24n, `${seedTime} blocks left for the seed`);
+      // The player's time for the seed runs from the opening's deadline, whenever the dealer opened.
+      assert.equal(opened.deadline, g.deadline + 25n);
       // Opened and waiting for the seed: nothing more, tick after tick.
       const before = reveals();
       assert.deepEqual(await hands(r), []);
@@ -915,10 +914,19 @@ try {
     assert.deepEqual(await hands(again), [`reveal:${tight}:${Phase.Open}:0`]);
     assert.equal(sent(again, "reveal").at(-1)!.validForBlocks, 3);
     again.table.fate = () => "ok";
-    // It never arrived, and now the deadline is here: no link is sent any more (the program would
-    // refuse it, 73, with the link already public). The dealer refunds the hand and frees the seat.
-    again.table.mine(3);
+    // It never arrived. Two blocks from the deadline is inside the margin (a quarter of the
+    // table's 15 blocks to open, so 3): the links would be public with a block or two to land,
+    // and a player who had read them could try to hold them out. Nothing is sent.
+    assert.equal(openingMargin({ openBlocks: 15n }), 3n);
+    assert.deepEqual([openingMargin({ openBlocks: 150n }), openingMargin({ openBlocks: 4n }), openingMargin({})], [20n, 2n, 2n]);
+    again.table.mine(1);
     const sentBefore = reveals();
+    for (let i = 0; i < 4; i++) await again.step();
+    assert.equal(reveals(), sentBefore, "no opening inside the margin");
+    assert.ok(actions(again).includes("opening_too_late"));
+    // And at the deadline: still no link (the program would refuse it, 73, with the link already
+    // public). The dealer refunds the hand and frees the seat.
+    again.table.mine(2);
     const twin = again.restart();
     await twin.dealer.start();
     assert.deepEqual(await hands(twin), [`timeout:open:${tight}`]);

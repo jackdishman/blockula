@@ -146,6 +146,17 @@ const PHASE_NAMES: Record<Phase, string> = { 0: "seed", 1: "deal", 2: "player", 
 /** Aborts that say the table moved on since it was read: someone else's call got there first (73: the time to open a hand ran out before the links landed). */
 const MOVED: Record<string, readonly number[]> = { reveal: [54, 57, 58, 59, 73], timeout: [54, 60], commit: [61] };
 
+/**
+ * Blocks that must be left before a v2 hand's opening deadline for the dealer to still open it:
+ * a quarter of the table's `open_blocks`, at least 2 and at most 20. Closer than that, the links
+ * would be public with little time to land, and a player who had read them could try to hold
+ * them out.
+ */
+export function openingMargin(limits: Pick<Limits, "openBlocks">): bigint {
+  const quarter = (limits.openBlocks ?? 0n) / 4n;
+  return quarter < 2n ? 2n : quarter > 20n ? 20n : quarter;
+}
+
 function ranges(indexes: readonly bigint[]): Range[] {
   const out: Range[] = [];
   for (const k of indexes) {
@@ -394,6 +405,15 @@ export class Dealer {
       const chain = this.chainFor(g);
       if (!chain) {
         this.once(`lost:${g.id}`, 120, () => this.log.error("hand_without_secret", { game: g.id, height, phase: PHASE_NAMES[g.phase], deadline: g.deadline, advice: "the store has no secret for this hand's chain, so it can't be opened: at its deadline its stake goes back to its player. If the store was lost, restore it from the backup, or pause the table and have the owner drop the unused commitments with skip_commits" }));
+        return;
+      }
+      // Not with the deadline a block or two away either. The links are public the moment they
+      // are sent, and the player can read the cards they will deal: one who dislikes them would
+      // only have to keep this transaction out for those last blocks to get the stake back
+      // instead. With a margin left, nothing short of holding it out for the whole margin does
+      // that. Inside the margin the hand is left to be refunded.
+      if (left < openingMargin(limits)) {
+        this.once(`margin:${g.id}`, 120, () => this.log.warn("opening_too_late", { game: g.id, height, deadline: g.deadline, advice: "too close to this hand's deadline to open it safely: it will be refunded" }));
         return;
       }
       const links = owedLinks(g, chain);

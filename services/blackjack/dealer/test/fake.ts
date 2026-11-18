@@ -100,7 +100,7 @@ export class FakeTable implements TableReader, TxSender {
 
   async limits(): Promise<Limits> {
     this.up();
-    return { ...this.limits_ };
+    return this.rules === 2 ? { ...this.limits_, openBlocks: this.openBlocks } : { ...this.limits_ };
   }
 
   async openGames(): Promise<bigint[]> {
@@ -260,7 +260,8 @@ export class FakeTable implements TableReader, TxSender {
           if (step?.kind === "settled") outcome = step.outcome;
         }
         if (opened.length) {
-          const deadline = hand.phase === Phase.Seed ? BigInt(this.height) + this.limits_.seedBlocks : g.deadline;
+          // The seed's time runs from the opening's deadline, whenever the dealer opened.
+          const deadline = hand.phase === Phase.Seed ? g.deadline + this.limits_.seedBlocks : g.deadline;
           this.games.set(id, { ...g, link, deadline, phase: hand.phase, dealt: hand.dealt });
           return [{ name: "opened", game: id, player: g.player, first, links: opened, phase: hand.phase, deadline }];
         }
