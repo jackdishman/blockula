@@ -51,7 +51,9 @@
 //! whole reserve to the bankroll.
 //!
 //! **Deadlines.** The dealer has `open_blocks` from an account's bet to open the hand. The player
-//! then has `seed_blocks` from the opening to reveal the seed. Whenever the dealer owes a card it
+//! then has until `seed_blocks` past *that deadline* to reveal the seed, whenever the dealer
+//! opened: a player who looks again when the refund would have been due always has `seed_blocks`
+//! left, and a refunded bet doesn't count toward the day's cap. Whenever the dealer owes a card it
 //! has `reveal_blocks`, counted from the seed's reveal (a natural waiting on the hole card), a
 //! relayed bet, the hit or the stand. A player who doesn't move for `idle_blocks` (counted from
 //! the cards that gave them the turn) stands by `timeout`.
@@ -88,7 +90,7 @@
 //! **Events.** v1's, and:
 //! - `opened`: game 8 ‖ player 32 ‖ first link's index 1 ‖ n 1 ‖ n × link 32 ‖ phase 1 (6 while
 //!   more are owed, 0 once the player owes the seed) ‖ deadline 8.
-//! - `tripped`: game 8 ‖ outcome 1 (9).
+//! - `tripped`: game 8 ‖ outcome 1 (6 or 7); nine bytes.
 //! - `seed` is v1's; its deadline is the next one (the player's move, or the dealer's hole card).
 //! - `settled`'s outcome may be 9; then, as for 8, its seed field is the seed's hash.
 //!
@@ -1023,6 +1025,15 @@ fn settle(id: u64, g: &[u8; GAME], hand: &Hand, outcome: Outcome) {
 
     let mut p = player_record(&player);
     set(&mut p, P_OPEN, 0);
+    // A refunded bet was never a wager: it comes off the day's count, if that day is still the
+    // one counted. (Saturating: the owner may have renumbered the days since the bet.)
+    if outcome == Outcome::Refund {
+        let day = block_height() / u64_at(&limits(), L_DAY_BLOCKS);
+        if u64_at(&p, P_DAY) == day {
+            let wagered = u64_at(&p, P_WAGERED).saturating_sub(stake);
+            set(&mut p, P_WAGERED, wagered);
+        }
+    }
     set(&mut p, P_LAST_GAME, id);
     p[P_LAST_OUTCOME] = outcome as u8;
     p[P_LAST_DEALT] = hand.dealt;
@@ -1161,10 +1172,14 @@ pub extern "C" fn bk_reveal() {
     ev[41] = n as u8;
     store_hand(&mut g, &hand);
     if opening {
-        // All three out: the player owes the seed, and has `seed_blocks` from here. Until then
-        // the dealer's own deadline stands, whatever it revealed so far.
+        // All three out: the player owes the seed. Their time is counted from the opening's
+        // deadline, not from the opening: whenever the dealer opened, early or at the last
+        // block, a player who comes back when the refund would have been due still has all of
+        // `seed_blocks`. A dealer can't choose its moment to catch a player away. Until the
+        // third link the dealer's own deadline stands, whatever it revealed so far.
         if hand.phase == Phase::Seed {
-            set(&mut g, G_DEADLINE, now + u64_at(&l, L_SEED_BLOCKS));
+            let opening_deadline = u64_at(&g, G_DEADLINE);
+            set(&mut g, G_DEADLINE, opening_deadline + u64_at(&l, L_SEED_BLOCKS));
         }
         let tail = 42 + 32 * n;
         ev[tail] = hand.phase as u8;

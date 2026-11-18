@@ -605,13 +605,13 @@ fn a_hand_from_bet_to_settlement() {
     assert_eq!((r.returns[0].as_slice(), r.events.len(), r.diff.storage.len()), (&[Phase::Open as u8, 0][..], 0, 0));
 
     // The rest, in a call that repeats the first: it is passed over. The player now owes the
-    // seed, and has `seed_blocks` from here.
+    // seed, and has `seed_blocks` past the opening's deadline, however early the dealer opened.
     t.host.height = 1_010;
     let r = t.reveal(0, 1, 3);
     assert_eq!(r.returns[0], [Phase::Seed as u8, 0]);
-    assert_eq!(event(&r, "opened"), [&le(0)[..], &addr("alice"), &[2, 2], &links[2], &links[3], &[Phase::Seed as u8], &le(1_010 + SEED_BLOCKS)].concat());
+    assert_eq!(event(&r, "opened"), [&le(0)[..], &addr("alice"), &[2, 2], &links[2], &links[3], &[Phase::Seed as u8], &le(1_150 + SEED_BLOCKS)].concat());
     let g = t.game(0).unwrap();
-    assert_eq!((g[120], g[122], g[123], g[124], &g[72..104], u64_at(&g, 104)), (Phase::Seed as u8, 3, 0, 0, &links[3][..], 1_310));
+    assert_eq!((g[120], g[122], g[123], g[124], &g[72..104], u64_at(&g, 104)), (Phase::Seed as u8, 3, 0, 0, &links[3][..], 1_450));
     // A fourth link would be the player's hit card: the dealer owes none, and none is taken.
     assert_eq!(abort_code(&t.reveal(0, 4, 1)), Some(57));
     assert_eq!(abort_code(&t.reveal(0, 3, 2)), Some(57), "nor behind one the hand holds");
@@ -719,9 +719,62 @@ fn a_hand_the_dealer_never_opens_is_refunded_to_the_drop() {
         assert_eq!(abort_code(&t.tx("stranger", "timeout", le(0), 0)), Some(54));
         assert_eq!(abort_code(&t.reveal(0, 1, 3)), Some(54));
         assert_eq!(abort_code(&t.reveal_seed("alice", 0, &seed)), Some(54));
+        // A refunded bet was never a wager: it is off the day's count.
+        assert_eq!(u64_at(&p, 16), 0, "wagered today");
         // The table takes the next bet.
         assert!(t.commit_bet("alice", stake, &seed).ok());
     }
+}
+
+/// The dealer chooses when to open, so the player's time for the seed must not depend on it: it
+/// is `seed_blocks` past the opening's deadline, whether the dealer opened at once or at the last
+/// block. A player who comes back when the refund would have been due always has all of it.
+#[test]
+fn the_seeds_deadline_does_not_depend_on_when_the_dealer_opened() {
+    for opened_at in [1_001, 1_075, 1_150] {
+        let mut t = Table::new();
+        t.host.height = 1_000;
+        let seed = seed_for(0, never, plain);
+        assert!(t.commit_bet("alice", FANG, &seed).ok());
+        t.host.height = opened_at;
+        t.open(0);
+        assert_eq!(u64_at(&t.game(0).unwrap(), 104), 1_150 + SEED_BLOCKS, "opened at {opened_at}");
+        // The player returns at the block the refund would have been claimable from.
+        t.host.height = 1_151;
+        assert_eq!(abort_code(&t.tx("stranger", "timeout", le(0), 0)), Some(60), "not the house's yet");
+        t.host.height = 1_150 + SEED_BLOCKS;
+        assert_eq!(t.reveal_seed("alice", 0, &seed).returns[0], [Phase::Player as u8, 0]);
+    }
+}
+
+/// During an outage every bet is refunded, and none of them uses up the player's day.
+#[test]
+fn refunded_bets_do_not_use_up_the_daily_cap() {
+    let mut t = Table::new();
+    t.commit(16, 16);
+    // 500 FANG a day at 50 a bet: ten wagers. Twelve refunds leave all ten.
+    for id in 0..12u64 {
+        assert!(t.commit_bet("alice", 50 * FANG, &[id as u8; 32]).ok(), "bet {id}");
+        t.host.height += OPEN_BLOCKS + 1;
+        assert_eq!(t.tx("alice", "timeout", le(id), 0).returns[0][1], Outcome::Refund as u8);
+        assert_eq!(u64_at(&t.player("alice"), 16), 0);
+    }
+    // A hand that is opened counts, whatever becomes of it.
+    assert!(t.commit_bet("alice", 50 * FANG, &[99; 32]).ok());
+    t.open(12);
+    t.host.height += OPEN_BLOCKS + SEED_BLOCKS + 1;
+    assert_eq!(t.tx("alice", "timeout", le(12), 0).returns[0][1], Outcome::NoSeed as u8);
+    assert_eq!(u64_at(&t.player("alice"), 16), 50 * FANG);
+    // A refund on a later day leaves that day's count alone (and never underflows).
+    assert!(t.commit_bet("alice", 50 * FANG, &[98; 32]).ok());
+    t.host.height += 43_200;
+    assert_eq!(t.tx("alice", "timeout", le(13), 0).returns[0][1], Outcome::Refund as u8);
+    assert_eq!(u64_at(&t.player("alice"), 16), 100 * FANG, "the earlier day's count, untouched");
+    // The owner renumbers the days so that the bet's day number comes round again with less counted.
+    assert!(t.commit_bet("alice", FANG, &[97; 32]).ok());
+    assert!(t.tx("house", "set_limits", limits_input(&[(DAY_BLOCKS, 1 << 30)]), 0).ok());
+    t.host.height += OPEN_BLOCKS + 1;
+    assert_eq!(t.tx("alice", "timeout", le(14), 0).returns[0][1], Outcome::Refund as u8);
 }
 
 #[test]
@@ -764,11 +817,11 @@ fn a_seed_that_never_comes_still_forfeits_the_stake() {
     assert!(t.commit_bet("alice", stake, &seed).ok());
     t.host.height = 2_030;
     t.open(0);
-    // The player has seen the three cards, and has `seed_blocks` from the opening.
-    assert_eq!(u64_at(&t.game(0).unwrap(), 104), 2_030 + SEED_BLOCKS);
-    t.host.height = 2_330;
+    // The player has seen the three cards, and has `seed_blocks` past the opening's deadline.
+    assert_eq!(u64_at(&t.game(0).unwrap(), 104), 2_000 + OPEN_BLOCKS + SEED_BLOCKS);
+    t.host.height = 2_450;
     assert_eq!(abort_code(&t.tx("dealer", "timeout", le(0), 0)), Some(60));
-    t.host.height = 2_331;
+    t.host.height = 2_451;
     assert_eq!(abort_code(&t.reveal_seed("alice", 0, &seed)), Some(72), "a late seed is refused, as in v1");
     let r = t.tx("dealer", "timeout", le(0), 0);
     assert_eq!(r.returns[0], [Phase::Done as u8, Outcome::NoSeed as u8]);
@@ -1299,7 +1352,7 @@ fn a_soak_keeps_the_invariant_and_every_drop() {
                 }
                 if quirk == 5 {
                     // A player who never reveals the seed: the stake is the house's.
-                    t.host.height += SEED_BLOCKS + 1;
+                    t.host.height += OPEN_BLOCKS + SEED_BLOCKS + 1;
                     break 'hand t.tx("dealer", "timeout", le(id), 0).returns[0][1];
                 }
                 t.host.height += rng.below(3);
