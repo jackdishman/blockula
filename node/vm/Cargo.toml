@@ -36,6 +36,8 @@ wat = "1"
 # The blackjack guest's rules (guests/bj-core: no_std, no dependencies), built for the host so
 # tests/blackjack_rules.rs holds them to an independent reference and writes the TypeScript vectors.
 bj-core = { path = "guests/bj-core" }
+# Rules v2 (guests/bj2-core, the `blackjack2` guest): tests/blackjack2_rules.rs walks every state.
+bj2-core = { path = "guests/bj2-core" }
 
 # Calibration (`cargo bench --bench calibrate`): plain std timing, no harness.
 [[bench]]

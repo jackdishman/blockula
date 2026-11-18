@@ -1,0 +1,13 @@
+[package]
+name = "blackjack2"
+description = "Blackjack, rules v2: the `blackjack` guest with a hand the dealer opens before it can know a card, a refund when it doesn't, a forfeit that pays what the cards still allow, and a circuit breaker (docs/proposals/blackjack-dealer-outage.md). A separate program: `blackjack` is unchanged."
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+abi = { path = "../abi" }
+bj2-core = { path = "../bj2-core" }

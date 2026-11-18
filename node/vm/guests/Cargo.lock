@@ -11,11 +11,26 @@ name = "bj-core"
 version = "0.0.0"
 
 [[package]]
+name = "bj2-core"
+version = "0.0.0"
+dependencies = [
+ "bj-core",
+]
+
+[[package]]
 name = "blackjack"
 version = "0.0.0"
 dependencies = [
  "abi",
  "bj-core",
+]
+
+[[package]]
+name = "blackjack2"
+version = "0.0.0"
+dependencies = [
+ "abi",
+ "bj2-core",
 ]
 
 [[package]]

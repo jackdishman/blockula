@@ -37,6 +37,13 @@ name = "bj-core"
 version = "0.0.0"
 
 [[package]]
+name = "bj2-core"
+version = "0.0.0"
+dependencies = [
+ "bj-core",
+]
+
+[[package]]
 name = "blake3"
 version = "1.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -54,6 +61,7 @@ name = "blockula-vm"
 version = "0.1.0"
 dependencies = [
  "bj-core",
+ "bj2-core",
  "blake3",
  "blockula-vm",
  "soroban-wasmi",
