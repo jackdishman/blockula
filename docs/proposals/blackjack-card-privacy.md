@@ -226,6 +226,12 @@ has a price: while it lasts the dealer deals nothing, and a hand whose deadline 
 player. `witnessQuorum` is the dial: with three witnesses and a quorum of two, one may be down.
 A disagreement still stops everything.
 
+Because a dissenting witness is never outvoted, each witness is given the chance to answer once
+for every block, even after the quorum is reached. One that is down answers at once (a refused
+connection); one that accepts the connection and then says nothing holds each new block's reads
+up for a few seconds (`attemptMs`, 4 s). The dealer still deals, slowly; take such a witness
+off the list.
+
 ### 4.6 The sender
 
 The sender is unchanged: the dealer still signs against, and submits to, its one node. The SDK
