@@ -6,8 +6,7 @@ import assert from "node:assert/strict";
 import { keyHash, rootOf, valueHash, verifyProof, type ProofResponse } from "@blockula/sdk";
 import { DEFAULT_LIMITS, Phase, Table, bytesAddress, chainFromTop, decodeGame, decodeHouse, decodeLimits, decodeOpenList, storageKey, toHex, type Game, type House } from "../src/index.js";
 import { ProofError, ProvenTable, RootWitnesses, storageRecordKey, storedValue, type ProofFailure, type ProofNode, type WitnessNode } from "../src/proven.js";
-import { encodeGame, encodeHouse, encodeLimits, encodeOpenList, tableStorage } from "./encode.js";
-import { StateTree, storageRecords, storedEntry } from "./prover.js";
+import { StateTree, encodeGame, encodeHouse, encodeLimits, encodeOpenList, storageRecords, storedEntry, tableStorage } from "../src/testing.js";
 
 const A = (n: number) => bytesAddress(new Uint8Array(32).fill(n), "boo");
 const PROGRAM = A(9);

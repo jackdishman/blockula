@@ -9,7 +9,8 @@
   "exports": {
     ".": "./dist/index.js",
     "./rules": "./dist/rules.js",
-    "./proven": "./dist/proven.js"
+    "./proven": "./dist/proven.js",
+    "./testing": "./dist/testing.js"
   },
   "scripts": {
     "build": "tsc",
