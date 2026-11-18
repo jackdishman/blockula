@@ -140,7 +140,7 @@ export interface Limits {
   relayMaxBet: bigint;
   /** The longest a relayer grant may last, in blocks. */
   grantMaxBlocks: bigint;
-  /** Blocks a player has to reveal the seed their bet committed to: from the bet (v1), or from the dealer's opening (v2). */
+  /** Blocks a player has to reveal the seed their bet committed to: from the bet (v1), or from the deadline the dealer had to open the hand by, whenever it opened (v2). */
   seedBlocks: bigint;
   /** Rules v2 only (a fourteenth limit): blocks the dealer has, from the bet, to open a hand. Past them the stake is refunded. */
   openBlocks?: bigint;

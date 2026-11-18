@@ -140,10 +140,13 @@ v2:  bet(seed hash) ─→ [dealer: 3 links, no cards] ─→ reveal_seed = the 
    first three links with `reveal`. They are checked against the commitment as always, and they
    deal nothing. The dealer has only the seed's hash, so it opens (or doesn't) without knowing a
    card. **This is the dealer's proof that it is there for this hand.**
-3. Then the player owes the seed, with `seed_blocks` from the opening. `reveal_seed` checks the
-   seed against the hash and computes cards 1 to 3 from the three links already on the chain,
-   in the same transaction. There is no state in which the dealer knows the deal and still owes
-   it.
+3. Then the player owes the seed. `reveal_seed` checks the seed against the hash and computes
+   cards 1 to 3 from the three links already on the chain, in the same transaction. There is no
+   state in which the dealer knows the deal and still owes it. The player's time is
+   `seed_blocks` counted from the **opening's deadline**, not from the opening: the dealer
+   chooses when it opens, and must not be able to choose a moment when the player is away. A
+   player who looks again when the refund would have been due finds either the refund or an
+   opened hand with all of `seed_blocks` left.
 4. From there the hand is v1's.
 
 The dealer sends the same number of transactions as under v1 (the three links just move one step
@@ -163,6 +166,14 @@ Two details close the free options (property 4):
   choose between letting it in and calling `timeout`.
 - **A seed is refused until the hand is opened** (abort 70). Otherwise a player could hand the
   dealer the seed first, and the dealer could look before opening.
+- **The dealer daemon keeps a margin.** It doesn't send opening links with the deadline a block
+  or two away (a quarter of `open_blocks`, between 2 and 20 blocks). Links sent that late are
+  public with almost no time to land, and a player who had read them would only have to crowd
+  that one transaction out of the last blocks to turn a bad start into a refund. Inside the
+  margin the daemon lets the hand be refunded.
+
+A refunded bet also comes off the player's daily count: it was never a wager, and an outage
+shouldn't use up a player's day.
 
 ### 4.3 After the seed, a stall pays exactly what the cards still allow
 
@@ -233,8 +244,11 @@ invariant `balance = bankroll + reserved + stakes + table` after every call of a
 `node/vm/tests/blackjack2.rs` runs the first three rows against the compiled program.
 
 **Player fairness.** A played hand is paid exactly as under v1 (10,000 hands compared card by
-card). A player is never worse off for a dealer's failure: an unopened hand returns the stake,
-and from the seed on a stall pays the most the cards allowed. What a player loses is the windfall:
+card). A player is never worse off for a dealer's failure: an unopened hand returns the stake
+(and doesn't count toward the day's cap), a hand opened late still leaves the player all of
+`seed_blocks` after the opening's deadline, and from the seed on a stall pays the most the cards
+allowed. What a player does have to do is look again once `open_blocks` have passed: by then
+the hand is either refundable or waiting for their seed. What a player loses is the windfall:
 3:2 for a hand that was never dealt, and 3:2 for a stalled deal that could no longer be a
 natural.
 
@@ -267,10 +281,23 @@ seed that never comes costs the stake.)
   is the mirror of BJ-04, where producers who side with the house can keep a seed out. Under v1
   the same producers could keep the dealer's reveals out and collect 3:2 on everything, so v2 is
   strictly better here, but not immune. A larger `open_blocks` makes it costlier; a table on a
-  chain whose producers aren't its players' doesn't have it.
-- *A weak seed.* The opening is blind only if the seed can't be guessed from its hash. The
-  wallet's seeds are 32 random bytes. A client that used guessable seeds would give the dealer a
-  look before it opens.
+  chain whose producers aren't its players' doesn't have it. The cheap form of the same thing,
+  crowding a link out of the last block or two before the deadline, is what the daemon's margin
+  (4.2) is for; a dealer other than this daemon must keep one too.
+- *A seed sent too early.* The program refuses a seed before the hand is opened, but a refused
+  transaction's input is public all the same. A client that sends `reveal_seed` on seeing the
+  opening in the mempool, before it is in a block, has shown the dealer the seed while the
+  dealer can still withhold the opening. The wallet waits for the opened hand on the chain.
+  Any other client must too, and must never reuse a seed whose reveal was refused.
+- *An owner's limits.* `open_blocks` can be set as high as 86,400 (two days), like
+  `reveal_blocks`, and a stake waits that long for a dealer that never opens. `seed_blocks`
+  can't be under 20. Limits are public and apply to hands in play, as under v1 (BJ-02).
+- *A weak or reused seed.* The opening is blind only if the seed can't be guessed from its hash.
+  The wallet's seeds are 32 fresh random bytes, never used twice. A client that used guessable
+  seeds, or the same seed for two hands (the hash binds the account and the seed, so the dealer
+  would recognise it), would give the dealer a look before it opens, and with it the choice not
+  to open. That costs such a player their winning hands (they are refunded instead); it costs
+  the house and other players nothing.
 - *A chain-wide pause of programs* (BJ-05) still ends hands by the clock; under v2 unopened
   hands are refunded rather than paid, which is an improvement, and the first forfeit after the
   pause trips the breaker.
@@ -359,6 +386,8 @@ Before a v2 table carries anything that matters:
 | Limits | 13 (104 bytes) | 14 (112 bytes): + `open_blocks`, 1 to 86,400, 150 by default |
 | A bet from an account starts | waiting for its seed (phase 0) | waiting to be opened (phase 6); the seed is owed once it is (phase 0) |
 | `reveal` on such a hand | refused until the seed | takes the three opening links, deals no card, emits `opened`; refused past the deadline (73) |
+| The seed's deadline | `seed_blocks` from the bet | `seed_blocks` from the opening's deadline, whenever the dealer opened |
+| The daily cap | counts every bet | a refunded bet comes off the day's count |
 | `reveal_seed` | starts the dealer's deadline | deals cards 1 to 3 (and settles a natural the upcard can't match); returns phase ‖ outcome |
 | `timeout`, dealer's deadline missed | 3:2 or 1:1 | refund (unopened), or the tight forfeit; a forfeit trips the breaker |
 | `paused` | 0, 1 | 0, 1 (owner), 2 (tripped); `pause(false)` clears both |
