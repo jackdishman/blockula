@@ -3,8 +3,9 @@
 // confirmed by witnesses, and every way an answer can be wrong refused.
 // docs/proposals/blackjack-card-privacy.md, section 7.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { keyHash, rootOf, valueHash, verifyProof, type ProofResponse } from "@blockula/sdk";
-import { DEFAULT_LIMITS, Phase, Table, bytesAddress, chainFromTop, decodeGame, decodeHouse, decodeLimits, decodeOpenList, storageKey, toHex, type Game, type House } from "../src/index.js";
+import { DEFAULT_LIMITS, Phase, Table, bytesAddress, chainFromTop, decodeGame, decodeHouse, decodeLimits, decodeOpenList, hexBytes, storageKey, toHex, type Game, type House } from "../src/index.js";
 import { ProofError, ProvenTable, RootWitnesses, storageRecordKey, storedValue, type ProofFailure, type ProofNode, type WitnessNode } from "../src/proven.js";
 import { StateTree, encodeGame, encodeHouse, encodeLimits, encodeOpenList, storageRecords, storedEntry, tableStorage } from "../src/testing.js";
 
@@ -82,6 +83,34 @@ console.log("✓ the test encoders write what the decoders read");
   assert.deepEqual([...storageRecordKey(PROGRAM, "48")], [...new Uint8Array(32).fill(9), 0x48]);
   assert.throws(() => storageRecordKey(PROGRAM, ""), /empty/);
   console.log("✓ a stored entry gives up its value only in the one format known; its tree key is the program's bytes then the key");
+}
+
+// ---- the node's own bytes: test/storage-vectors.json is written by the node's tests ----
+{
+  interface Answered {
+    key: string;
+    answer: ProofResponse;
+  }
+  const v = JSON.parse(readFileSync(new URL("./storage-vectors.json", import.meta.url), "utf8")) as { program: string; entries: (Answered & { value: string; payer: string; deposit: string; capacity: number })[]; absent: Answered };
+  /** A node that answers from the file, and a witness that has the file's root at its height. */
+  const answers = new Map([...v.entries, v.absent].map((e) => [e.answer.key, e.answer]));
+  const node: ProofNode = { proof: async (_namespace, key) => answers.get(toHex(key))! };
+  const witness = (root: string): WitnessNode => ({ status: async () => ({ height: 0 }), block: async () => ({ state_root: root }) });
+  const table = new ProvenTable(v.program, node, [witness(v.absent.answer.root)], FAST);
+  assert.equal(v.entries.length, 2);
+  for (const e of v.entries) {
+    // The tree key is the program's 32 address bytes then the key, and the stored entry gives up the program's value.
+    assert.equal(toHex(storageRecordKey(v.program, e.key)), e.answer.key);
+    assert.deepEqual(await table.entry(e.key), { value: e.value, height: 0 });
+    // And the test prover writes an entry as the node does (the payer, the deposit and the capacity included).
+    const made = storedEntry(e.value, hexBytes(e.payer, 32), BigInt(e.deposit));
+    new DataView(made.buffer).setUint32(made.length - 4, e.capacity, true);
+    assert.equal(toHex(made), e.answer.value);
+  }
+  assert.deepEqual(await table.entry(v.absent.key), { value: null, height: 0 });
+  // Under any other root, the node's own answers are refused.
+  await refused(new ProvenTable(v.program, node, [witness("00".repeat(32))], FAST).entry(v.entries[0].key), "disagreement", "the node's answer under a root the witness doesn't have");
+  console.log("✓ the node's own answers for program storage (storage-vectors.json, written by its tests) are read: the tree key, the stored entry, an absence");
 }
 
 // ---- nodes ----

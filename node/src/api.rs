@@ -3457,6 +3457,11 @@ mod http_tests {
         assert_eq!(s, StatusCode::OK, "{p}");
         let (r, proof, value) = parse(&p);
         assert_eq!((p["height"].as_u64(), p["root"].as_str()), (Some(1), status["state_root"].as_str()));
+        // The proof's root is the `state_root` of the block at the proof's height: what a client
+        // asks another node for to confirm it (the SDK's `confirmStateRoot`, the blackjack
+        // dealer's witnesses).
+        let (_, block, _) = call(&n, "GET", "/api/block/1", None, "127.0.0.1:1").await;
+        assert_eq!(block["state_root"].as_str(), p["root"].as_str());
         let value = value.expect("alice exists");
         assert!(tree::verify(&r, ns::ACCOUNTS, key.as_bytes(), Some(&value), &proof));
         assert_eq!(decode::<crate::chain::Account>(&value).unwrap().balance, 10 * DROPS_PER_FANG);
