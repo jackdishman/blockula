@@ -8,11 +8,12 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": "./dist/index.js",
-    "./rules": "./dist/rules.js"
+    "./rules": "./dist/rules.js",
+    "./proven": "./dist/proven.js"
   },
   "scripts": {
     "build": "tsc",
-    "test": "tsc --noEmit -p tsconfig.test.json && tsx test/rules.ts && tsx test/codec.ts && tsx test/svg.ts && tsx test/properties.ts",
+    "test": "tsc --noEmit -p tsconfig.test.json && tsx test/rules.ts && tsx test/codec.ts && tsx test/svg.ts && tsx test/properties.ts && tsx test/proven.ts",
     "test:live": "tsx test/live.ts"
   },
   "license": "MIT",
