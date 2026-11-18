@@ -48,6 +48,7 @@ export const COPY = {
     waiting: "Placing your bet (step 1 of 2)…",
     seed: "The hash of your seed. The bet sends only the hash. This browser keeps the seed and reveals it in step 2.",
     two: "A bet is two transactions: the bet, then your seed. Each one is signed with your passkey.",
+    unkept: "This browser couldn't save the bet's seed (its storage is full or switched off), so nothing was signed. Without the seed the bet could never be opened, and it would go to the house. Free some space or allow storage for this site, then try again.",
     deposit: "A bet also bonds a small storage deposit. It comes back when the hand is settled.",
   },
   seed: {

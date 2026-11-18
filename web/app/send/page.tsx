@@ -62,6 +62,9 @@ const sendableOf = (a: Account) => movable({ label: a.account, balance: a.balanc
 function useRecipient(input: string): Recipient {
   const { client, status } = useUnlocked();
   const [r, setR] = useState<Recipient>({ state: "empty" });
+  // Only the validator's address is read from the status, which is a new object every few
+  // seconds: depending on the object would look a name up again (and blank the review) each time.
+  const validator = status?.validator.address;
   useEffect(() => {
     const q = input.trim().toLowerCase();
     if (!q) return setR({ state: "empty" });
@@ -71,7 +74,7 @@ function useRecipient(input: string): Recipient {
     if (prefix && prefix !== hrp) return setR({ state: "bad", msg: `That's an address on another network (${prefix}1…). Addresses on ${NETWORK.label} start with ${hrp}1.` });
     if (q.startsWith(`${hrp}1`)) {
       if (!isAddress(q)) return setR({ state: "bad", msg: "That address doesn't look right. Check for typos." });
-      const label = status?.validator.address === q ? "the validator" : "an address";
+      const label = validator === q ? "the validator" : "an address";
       return setR({ state: "ok", signed: q, address: q, display: shortAddr(q), detail: label, proven: true });
     }
     setR({ state: "checking" });
@@ -95,7 +98,7 @@ function useRecipient(input: string): Recipient {
       live = false;
       clearTimeout(t);
     };
-  }, [input, client, status]);
+  }, [input, client, validator]);
   return r;
 }
 

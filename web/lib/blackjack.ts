@@ -338,14 +338,26 @@ export function readStore(storage: KeyValue | null, key: string): HandStore {
   }
 }
 
-function writeStore(storage: KeyValue | null, key: string, s: HandStore): void {
+/**
+ * Writes the store, keeping the newest `MAX_PENDING` seeds and `MAX_HANDS` hands. Hands are
+ * dropped oldest first by when their seed was made (then by lowest id), never by id alone: on a
+ * chain that was made again a table's ids start over while this browser still holds the old
+ * chain's hands under the same key, and the hand just bet (a low id) must outlive them, because
+ * its seed is still owed. `keep` is the hand being written: it is never the one dropped.
+ */
+function writeStore(storage: KeyValue | null, key: string, s: HandStore, keep?: string): void {
   if (!storage) return;
-  const ids = Object.keys(s.hands).sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
-  const hands = Object.fromEntries(ids.slice(-MAX_HANDS).map((id) => [id, s.hands[id]]));
+  const ids = Object.keys(s.hands).sort((a, b) => s.hands[a].at - s.hands[b].at || (BigInt(a) < BigInt(b) ? -1 : 1));
+  const drop = new Set<string>();
+  for (const id of ids) {
+    if (ids.length - drop.size <= MAX_HANDS) break;
+    if (id !== keep) drop.add(id);
+  }
+  const hands = Object.fromEntries(ids.filter((id) => !drop.has(id)).map((id) => [id, s.hands[id]]));
   try {
     storage.setItem(key, JSON.stringify({ v: 1, pending: s.pending.slice(-MAX_PENDING), hands }));
   } catch {
-    /* storage full or unavailable: the hand still plays, the commitment just isn't kept */
+    /* storage full or unavailable: nothing is kept. `rememberSeed` says so, and no bet is signed without its seed kept. */
   }
 }
 
@@ -366,13 +378,19 @@ export function seedUsed(storage: KeyValue | null, key: string, seed: string): b
  * Keeps a seed made for a bet that's about to be reviewed, with the hash the bet will carry
  * (`seedHash(account, seed)`). The bet sends only the hash: the seed must still be here to be
  * revealed once the bet is in a block. Throws if this browser used the seed before.
+ *
+ * Returns whether the seed is kept: read back from the storage, not assumed. A storage that is
+ * full, switched off or absent keeps nothing and says nothing, and a bet signed then could never
+ * be opened: its stake would go to the house at the seed's deadline. So a caller signs the bet
+ * only when this is true.
  */
-export function rememberSeed(storage: KeyValue | null, key: string, seed: string, now: number, hash?: string): void {
+export function rememberSeed(storage: KeyValue | null, key: string, seed: string, now: number, hash?: string): boolean {
   if (!isHash(seed)) throw new Error("a seed is 32 bytes of hex");
   if (seedUsed(storage, key, seed)) throw new Error("This seed was used before. A new one is made for every bet.");
   const s = readStore(storage, key);
   s.pending.push({ seed, ...(isHash(hash) ? { seedHash: hash } : {}), txs: [], at: now });
   writeStore(storage, key, s);
+  return readStore(storage, key).pending.some((h) => h.seed === seed);
 }
 
 /** Whether a stored hand's seed is the one `account`'s bet committed to with `hash`. Recomputed, never taken from what was stored. */
@@ -414,7 +432,7 @@ export function bindBet(storage: KeyValue | null, key: string, seed: string, bet
   const from = i >= 0 ? s.pending.splice(i, 1)[0] : (s.hands[id]?.seed === seed ? s.hands[id] : { seed, txs: [], at: 0 });
   const betTx = bet.txId ?? from.betTx;
   s.hands[id] = { ...from, seed, game: id, ...(isHash(bet.seedHash) ? { seedHash: bet.seedHash } : {}), ...(isHash(bet.commit) ? { commit: bet.commit } : {}), ...(betTx ? { betTx } : {}), txs: betTx ? [betTx, ...from.txs.filter((t) => t !== betTx && t !== from.betTx)] : from.txs };
-  writeStore(storage, key, s);
+  writeStore(storage, key, s, id);
 }
 
 /** Adds a transaction this page sent (a hit, a stand, a claim) to its hand's list. */
@@ -626,6 +644,9 @@ export function logLine(e: TableEvent, me: string | null): string | null {
 // ---------------------------------------------------------------------------------- a relayer's grant
 
 /** Why a grant can't be made, or null: the program's own rule (`set_relayer`), from the table's limits. */
+/** The largest daily cap the program takes for a grant: the chain's whole supply, in drops. */
+export const MAX_GRANT_CAP = 1_000_000_000n * DROPS_PER_FANG;
+
 export function grantProblem(g: { relayer: string; maxBet: string; dailyCap: string; blocks: string }, limits: Limits, prefix?: string): string | null {
   if (!isTableAddress(g.relayer.trim(), prefix)) return "The relayer is an address (boo1…), never a .boo name.";
   const maxBet = parseAmount(g.maxBet);
@@ -634,6 +655,8 @@ export function grantProblem(g: { relayer: string; maxBet: string; dailyCap: str
   const cap = parseAmount(g.dailyCap);
   if (cap === null) return "The most per day is an amount of FANG, like 20.";
   if (cap < maxBet) return "The most per day can't be less than the most per bet.";
+  // The program refuses a cap above the whole supply (and one past a u64 can't even be written).
+  if (cap > MAX_GRANT_CAP) return `The most per day can't be more than ${fangText(MAX_GRANT_CAP)}: that is all the FANG there is.`;
   if (!/^\d{1,9}$/.test(g.blocks.trim()) || BigInt(g.blocks.trim()) < 1n) return "How long is a number of blocks.";
   if (BigInt(g.blocks.trim()) > limits.grantMaxBlocks) return `A grant lasts at most ${limits.grantMaxBlocks.toLocaleString("en-US")} blocks at this table.`;
   return null;

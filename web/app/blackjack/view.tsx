@@ -398,6 +398,8 @@ function revealRequest(game: bigint, seed: string, key: string, touch: () => voi
 function BetForm({ ctx, me, adult, signer, storeKey: key, touch, canSign, last }: { ctx: BetContext; me: string; adult: boolean; signer: TableSigner; storeKey: string; touch: () => void; canSign: boolean; last: LastHand | null }) {
   // The field starts from the last hand's stake. An amount the table no longer takes says so at once.
   const [raw, setRaw] = useState(() => betPrefill(last));
+  /** The last bet's seed couldn't be saved in this browser, so the bet wasn't signed. */
+  const [unkept, setUnkept] = useState(false);
   const [touched, setTouched] = useState(() => !!last && betProblem(betPrefill(last), ctx) !== null);
   const blocked = tableProblem(ctx);
   const problem = betProblem(raw, ctx);
@@ -418,7 +420,11 @@ function BetForm({ ctx, me, adult, signer, storeKey: key, touch, canSign, last }
     // only its hash, and the seed must still be here to be revealed once the bet is in a block.
     const seed = newSeed();
     const hash = seedHash(me, seed);
-    rememberSeed(storage(), key, seed, Date.now(), hash);
+    // Nothing is signed unless the seed is really kept: a bet whose seed is lost can't be
+    // opened, and goes to the house at the seed's deadline.
+    const kept = rememberSeed(storage(), key, seed, Date.now(), hash);
+    setUnkept(!kept);
+    if (!kept) return;
     touch();
     void signer.start({
       call: call.bet(stake, hash),
@@ -444,6 +450,11 @@ function BetForm({ ctx, me, adult, signer, storeKey: key, touch, canSign, last }
           </button>
           {!blocked && <span className="dim small" data-testid="bj-play-again-note">{COPY.bet.againNote(fangText(last.stake))}</span>}
         </div>
+      )}
+      {unkept && (
+        <p className="warn m0" role="alert" data-testid="bj-seed-unkept">
+          {COPY.bet.unkept}
+        </p>
       )}
       {!last && <h3 className="bj-rule">{COPY.bet.title}</h3>}
       {blocked ? (

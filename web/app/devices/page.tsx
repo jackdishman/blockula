@@ -298,7 +298,8 @@ function AddAgent() {
   const [done, setDone] = useState<{ tx: TxView; limit: string; days: number } | null>(null);
   // The agent's grant: its consent to spending from this account (audit gap-7-2).
   const { grant, problem } = parseGrant(id, wallet.account);
-  const nDays = Number(days);
+  // Digits only: `Number` alone would take "1e2", "0x1e" and " 30 " as days.
+  const nDays = /^\d{1,3}$/.test(days.trim()) ? Number(days.trim()) : NaN;
   let limitOk = true;
   try {
     limitOk = parseFang(limit) > 0n;
