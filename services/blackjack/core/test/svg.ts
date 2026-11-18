@@ -211,7 +211,13 @@ assert.equal(statusLine(base), "Your move: hit or stand.");
 assert.equal(statusLine(settled(Outcome.Blackjack)), "Blackjack. 12.5 FANG came back.");
 assert.equal(statusLine(settled(Outcome.Bust)), "Bust. Nothing came back.");
 assert.equal(statusLine(settled(Outcome.Push)), "Push. 5 FANG came back.");
-assert.deepEqual(outcomes.map(stampWords), ["Blackjack", "You win", "Push", "Dealer wins", "Bust", "You win", "You win", "No seed"]);
+assert.deepEqual(outcomes.map(stampWords), ["Blackjack", "You win", "Push", "Dealer wins", "Bust", "You win", "You win", "No seed", "Refunded"]);
+// Rules v2: a hand the dealer never opened, and its refund.
+const unopened: TableSnapshot = { ...empty, phase: Phase.Open };
+assert.equal(statusLine(unopened), "The bet is placed. Waiting for the dealer to open the hand.");
+const refund: TableSnapshot = { ...empty, phase: Phase.Done, outcome: Outcome.Refund, payout: empty.stake };
+assert.ok(statusLine(refund).startsWith("Your stake is back: the dealer never opened the hand."));
+assert.ok(tableSvg(refund).includes("Refunded"));
 // A bet waiting for its seed, and one whose seed never came: an empty table, said in words.
 const waiting: TableSnapshot = { ...empty, phase: Phase.Seed };
 assert.equal(statusLine(waiting), "The bet is placed. Waiting for the player's seed.");

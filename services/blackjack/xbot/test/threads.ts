@@ -134,7 +134,9 @@ for (const action of ["deal", "hit", "stand", "balance", "stop", "update", "time
 // Every outcome a relayed hand can have: a seed that never came (outcome 8) ends only a bet from
 // an account, which the bot never places.
 assert.ok(!seen.outcomes.has(Outcome.NoSeed), "no relayed hand waits for a seed");
-for (const o of Object.values(Outcome).filter((x) => x !== Outcome.NoSeed)) assert.ok(seen.outcomes.has(o), `the fixture has a hand that ended with outcome ${o}`);
+// Nor a refund (outcome 9, rules v2): only a bet from an account waits for the dealer to open it.
+assert.ok(!seen.outcomes.has(Outcome.Refund), "no relayed hand is refunded");
+for (const o of Object.values(Outcome).filter((x) => x !== Outcome.NoSeed && x !== Outcome.Refund)) assert.ok(seen.outcomes.has(o), `the fixture has a hand that ended with outcome ${o}`);
 assert.ok(seen.posts >= 1_000 && seen.hands >= 150);
 
 console.log(`✓ threads: 100 threads, ${seen.posts} posts, ${seen.replies} replies matched exactly, ${seen.hands} hands settled and verified`);

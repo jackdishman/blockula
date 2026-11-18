@@ -111,7 +111,8 @@ assert.equal(committed.seeded(), true);
 assert.equal(committed.phase, Phase.Deal);
 assert.equal(committed.seeded(), false, "once");
 assert.equal(payout(5n, Outcome.NoSeed), 0n);
-assert.ok(isOutcome(8) && !isOutcome(9) && !isOutcome(0));
+// 9 is rules v2's refund (test/rules2.ts): a v1 table never records it.
+assert.ok(isOutcome(8) && isOutcome(9) && !isOutcome(10) && !isOutcome(0));
 
 assert.equal(prevLink("00".repeat(32)), "2ada83c1819a5372dae1238fc1ded123c8104fdaa15862aaee69428a1820fcda");
 assert.equal(cardLabel(0), "A♠");

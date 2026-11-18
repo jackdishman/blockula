@@ -6,6 +6,12 @@
  *
  * Rules v1: one hand against the dealer, an infinite deck, the dealer stands on every 17, a
  * natural pays 3:2, no split, double or insurance.
+ *
+ * Rules v2 (`node/vm/guests/bj2-core`, the `blackjack2` program, a separate table:
+ * docs/proposals/blackjack-dealer-outage.md) deal the same cards and change what a dealer that
+ * stops costs: `Phase.Open`, `Outcome.Refund`, `Hand.unopened`, `Hand.openLink`,
+ * `Hand.dealOpening` and `forfeitOf`. `test/vectors2.json` holds those to the v2 program's code.
+ * A v1 table never shows the v2 numbers.
  */
 import { blake3 } from "@noble/hashes/blake3.js";
 
@@ -104,20 +110,36 @@ export const natural = (cards: readonly number[]): boolean => cards.length === 2
 /** Whether a dealer showing `upcard` could still hold a natural. */
 export const mayBeNatural = (upcard: number): boolean => points(upcard) === 1 || points(upcard) === 10;
 
-/** How a hand ended: the program's numbers. */
-export const Outcome = { Blackjack: 1, Win: 2, Push: 3, Lose: 4, Bust: 5, Forfeit: 6, ForfeitDeal: 7, NoSeed: 8 } as const;
+/** The rules a table runs: 1 (`blackjack`) or 2 (`blackjack2`). */
+export type Rules = 1 | 2;
+
+/** Links a v2 dealer reveals to open a hand, before the player's seed. */
+export const OPENING_LINKS = 3;
+
+/**
+ * How a hand ended: the program's numbers. `Refund` is rules v2's: the dealer never opened the
+ * hand, and the stake went back.
+ */
+export const Outcome = { Blackjack: 1, Win: 2, Push: 3, Lose: 4, Bust: 5, Forfeit: 6, ForfeitDeal: 7, NoSeed: 8, Refund: 9 } as const;
 export type Outcome = (typeof Outcome)[keyof typeof Outcome];
 
 export function isOutcome(n: number): n is Outcome {
-  return Number.isInteger(n) && n >= 1 && n <= 8;
+  return Number.isInteger(n) && n >= 1 && n <= 9;
 }
 
-/** A hand's phase: the program's numbers. */
-export const Phase = { Seed: 0, Deal: 1, Player: 2, Hit: 3, Dealer: 4, Done: 5 } as const;
+/**
+ * A hand's phase: the program's numbers. `Open` is rules v2's: the bet is placed and the dealer
+ * owes the opening links, before it can know a card. Under v2 `Seed` means the hand is opened
+ * and the player owes the seed; under v1, that the bet is placed and the player owes it.
+ */
+export const Phase = { Seed: 0, Deal: 1, Player: 2, Hit: 3, Dealer: 4, Done: 5, Open: 6 } as const;
 export type Phase = (typeof Phase)[keyof typeof Phase];
 
 /** Whether the next move is the dealer's: a link to reveal. */
-export const dealers = (p: Phase): boolean => p === Phase.Deal || p === Phase.Hit || p === Phase.Dealer;
+export const dealers = (p: Phase): boolean => p === Phase.Open || p === Phase.Deal || p === Phase.Hit || p === Phase.Dealer;
+
+/** Whether the player's seed is public, so that the dealer can know the hand's cards. */
+export const seeded = (p: Phase): boolean => p !== Phase.Open && p !== Phase.Seed;
 
 /** The house's exposure to a stake (drops): a natural's 3:2, half a drop rounded down. */
 export const exposure = (stake: bigint): bigint => stake + stake / 2n;
@@ -132,6 +154,7 @@ export function payout(stake: bigint, outcome: Outcome): bigint {
     case Outcome.Forfeit:
       return 2n * stake;
     case Outcome.Push:
+    case Outcome.Refund:
       return stake;
     case Outcome.Lose:
     case Outcome.Bust:
@@ -187,6 +210,41 @@ export class Hand {
     if (this.phase !== Phase.Seed) return false;
     this.phase = Phase.Deal;
     return true;
+  }
+
+  /** Rules v2: a hand whose bet is placed with the hash of a seed. The dealer owes the opening links. */
+  static unopened(): Hand {
+    const hand = new Hand();
+    hand.phase = Phase.Open;
+    return hand;
+  }
+
+  /**
+   * Rules v2: the dealer revealed the next opening link, which deals no card (the seed isn't
+   * known). True once all three are out and the player owes the seed, false while more are owed,
+   * null (and nothing changes) unless the hand is being opened.
+   */
+  openLink(): boolean | null {
+    if (this.phase !== Phase.Open) return null;
+    this.dealt++;
+    if (this.dealt < OPENING_LINKS) return false;
+    this.phase = Phase.Seed;
+    return true;
+  }
+
+  /**
+   * Rules v2: the player revealed their seed, and `cards` are the three the opening links deal
+   * under it, in chain order. They are on the table at once, by v1's deal. Null (and nothing
+   * changes) unless the hand was opened and waited for its seed.
+   */
+  dealOpening(cards: readonly [number, number, number]): Step | null {
+    if (this.phase !== Phase.Seed || this.dealt !== OPENING_LINKS) return null;
+    cards.forEach(checkCard);
+    this.phase = Phase.Deal;
+    this.dealt = 0;
+    let step: Step | null = null;
+    for (const c of cards) step = this.deal(c);
+    return step;
   }
 
   /** The player hits; false (and nothing changes) unless it's the player's turn. */
@@ -245,6 +303,31 @@ export class Hand {
   private settle(): Step {
     this.phase = Phase.Done;
     return { kind: "settled", outcome: showdown(this.player, this.dealer) };
+  }
+}
+
+/**
+ * How a hand ends if the dealer misses its deadline now, under `rules`; null when the dealer
+ * owes nothing (the player's seed or move is awaited, or the hand is over).
+ *
+ * v1 pays the most any hand could: 3:2 until the deal is done or against a natural, else 1:1.
+ * v2 refunds a hand that was never opened (the dealer had seen no card), and otherwise pays
+ * exactly the most the cards on the table still allow: 3:2 only for a natural in the player's
+ * hand, or during a relayed hand's deal while the player's first card is unseen or is an ace or
+ * a ten-value card.
+ */
+export function forfeitOf(hand: Pick<Hand, "phase" | "player">, rules: Rules): Outcome | null {
+  switch (hand.phase) {
+    case Phase.Open:
+      return Outcome.Refund;
+    case Phase.Deal:
+      if (rules === 1) return Outcome.ForfeitDeal;
+      return hand.player.length === 0 || mayBeNatural(hand.player[0]) ? Outcome.ForfeitDeal : Outcome.Forfeit;
+    case Phase.Hit:
+    case Phase.Dealer:
+      return natural(hand.player) ? Outcome.ForfeitDeal : Outcome.Forfeit;
+    default:
+      return null;
   }
 }
 
@@ -395,5 +478,7 @@ export function outcomeWords(o: Outcome): string {
       return "You win: the dealer never dealt";
     case Outcome.NoSeed:
       return "The bet is the house's: its seed was never revealed";
+    case Outcome.Refund:
+      return "Your stake is back: the dealer never opened the hand";
   }
 }

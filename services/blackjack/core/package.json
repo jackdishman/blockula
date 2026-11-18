@@ -14,7 +14,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "tsc --noEmit -p tsconfig.test.json && tsx test/rules.ts && tsx test/codec.ts && tsx test/svg.ts && tsx test/properties.ts && tsx test/proven.ts",
+    "test": "tsc --noEmit -p tsconfig.test.json && tsx test/rules.ts && tsx test/rules2.ts && tsx test/codec.ts && tsx test/svg.ts && tsx test/properties.ts && tsx test/proven.ts",
     "test:live": "tsx test/live.ts"
   },
   "license": "MIT",
