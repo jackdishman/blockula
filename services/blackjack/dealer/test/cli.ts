@@ -2,11 +2,16 @@
 // prints the address; `run` and `status` refuse a key others can read, a missing node and a
 // node on another machine, and never print a secret.
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStoreKey } from "../src/keys.js";
+import { SeedStore } from "../src/store.js";
 
 const CLI = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 const dir = mkdtempSync(join(tmpdir(), "bj-dealer-cli."));
@@ -21,6 +26,15 @@ function run(args: string[], env: Record<string, string> = {}): { code: number; 
     const err = e as { status: number | null; stdout: string; stderr: string };
     return { code: err.status ?? -1, out: err.stdout + err.stderr };
   }
+}
+
+/** The same, without blocking this process: for a command that talks to a server this test runs. */
+function runAsync(args: string[], env: Record<string, string> = {}): Promise<{ code: number; out: string }> {
+  return new Promise((resolve) => {
+    execFile(process.execPath, ["--import", "tsx", CLI, ...args], { env: { PATH: process.env.PATH, HOME: dir, ...env }, encoding: "utf8", timeout: 60_000 }, (err, stdout, stderr) => {
+      resolve({ code: err ? (typeof err.code === "number" ? err.code : -1) : 0, out: stdout + stderr });
+    });
+  });
 }
 
 try {
@@ -77,6 +91,61 @@ try {
   // No command: the usage, and a non-zero exit for one it doesn't know.
   assert.match(run([]).out, /blackjack-dealer <init \| run \| status>/);
   assert.equal(run(["deal"]).code, 2);
+
+  // ---- one chain a store: `status` and `run` refuse a store that another chain's dealer wrote,
+  // even though the table's address is the same (it comes from the creator and a nonce, never
+  // from the chain). The node here is a stand-in that only says which chain it is on.
+  {
+    const A = "a".repeat(64);
+    const B = "b".repeat(64);
+    let genesis = A;
+    let asked = 0;
+    const server = createServer((req, res) => {
+      asked++;
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/api/status") return void res.end(JSON.stringify({ chain_id: "blockula-test", genesis_hash: genesis, address_prefix: "boo", height: 10 }));
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: "not found" }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const rpc = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      // The store as the dealer left it on chain A, with one secret.
+      const top = randomBytes(32).toString("hex");
+      const at = { path: join(home, "seeds.enc.json"), backupPath: join(home, "seeds.enc.json.backup"), key: readStoreKey(secretFile), table: TABLE };
+      const s = SeedStore.open(at);
+      s.bindChain(A);
+      s.put(new Map([[0n, top]]));
+      s.close();
+      const stored = readFileSync(at.path);
+
+      // The node is on chain B now (the chain was made again): both commands stop at once.
+      genesis = B;
+      for (const command of ["status", "run"]) {
+        asked = 0;
+        const out = await runAsync([command, ...base, "--rpc", rpc]);
+        assert.equal(out.code, 1, `${command}: ${out.out}`);
+        assert.match(out.out, /is for another chain \(genesis aaaaaaaaaaaa…\), not the one this node is on \(genesis bbbbbbbbbbbb…\)/, command);
+        assert.match(out.out, /needs a new, empty store/);
+        assert.ok(!out.out.includes(top) && !out.out.includes(seed) && !out.out.includes(storeKey), "no secret is printed");
+        assert.ok(asked >= 1, "the node was asked which chain it is on");
+        assert.ok(readFileSync(at.path).equals(stored), `${command} leaves the store as it was`);
+      }
+      // A node that says nothing about its chain is refused the same way.
+      genesis = "";
+      const none = await runAsync(["status", ...base, "--rpc", rpc]);
+      assert.equal(none.code, 1);
+      assert.match(none.out, /reports no chain id and genesis hash/);
+      // Back on chain A the store is accepted: `status` gets past it, to the table, which this
+      // stand-in node doesn't have (and whose address here is no real one).
+      genesis = A;
+      const ok = await runAsync(["status", ...base, "--rpc", rpc]);
+      assert.equal(ok.code, 1);
+      assert.ok(!/another chain|genesis/.test(ok.out), ok.out);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }
 } finally {
   rmSync(dir, { recursive: true, force: true });
 }

@@ -99,6 +99,12 @@ The store holds, for each game not yet settled, the secret every card of that ga
 
 **Back up three things, off the machine:** the key file, the secret file, and the store's backup (`backupPath`). The first two never change. The backup changes with every batch committed (about every `target − lowWater` hands), so point `backupPath` at another disk or a synced folder rather than copying it by hand; it is encrypted, and useless without the secret file.
 
+### One chain a store
+
+A table's address comes from the account that created it and a nonce, never from the chain. So when a chain is made again (a dev or preview chain recreated, a testnet restarted) and the same owner creates the table the same way, the new table has the old address, and the old store would open for it. It must not be used there: the links the old chain's hands revealed are public for good, the daemon commits a stored secret again when its index isn't committed yet, and a player who knows a hand's first links before betting picks a seed that deals a natural.
+
+The store therefore records the genesis hash of the chain it deals on, the first time `run` reaches a node, and `run` and `status` refuse it on any other chain ("the seed store … is for another chain"). The daemon also pins the chain its node reported when it started, so a local node that is later on another chain is refused for every transaction. For a chain that was made again: move the old store and its backup away (keep them: they prove the old hands) and start on a new, empty store. A store written before this was recorded is tied to the chain of the first node it is run against.
+
 ### Restore from the backup
 
 The store is lost or damaged, the backup is fine:

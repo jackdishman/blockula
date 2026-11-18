@@ -85,6 +85,87 @@ try {
     console.log("✓ a changed store, a wrong key and another table's store are refused");
   }
 
+  // ---- one chain a store: a table's address doesn't name its chain, so the store does
+  {
+    const A = "a".repeat(64);
+    const B = "b".repeat(64);
+    const at = place();
+    let s = SeedStore.open(at);
+    assert.equal(s.boundChain, undefined);
+    assert.equal(s.bindChain(A), true, "a new store takes the first chain it is given");
+    assert.equal(existsSync(at.path), false, "binding an empty store writes nothing yet");
+    const tops = new Map([[0n, secret()], [1n, secret()]]);
+    s.put(tops);
+    assert.equal(s.bindChain(A), false, "the same chain again is fine");
+    assert.equal(s.bindChain(A.toUpperCase()), false, "whatever the case of the hex");
+    s.close();
+    // After a reopen the store still knows its chain, and another chain's node is refused:
+    // the same table address on a chain made again must not get this store's secrets.
+    s = SeedStore.open(at);
+    assert.equal(s.boundChain, A);
+    assert.equal(s.bindChain(A), false);
+    refuses(() => s.bindChain(B), /is for another chain \(genesis aaaaaaaaaaaa…\), not the one this node is on \(genesis bbbbbbbbbbbb…\)/, "a store bound to another chain");
+    assert.equal(s.boundChain, A, "a refused bind changes nothing");
+    for (const [k, top] of tops) assert.equal(s.top(k), top);
+    // The message names the chains by twelve characters: nothing a log would scrub, and no secret.
+    try {
+      s.bindChain(B);
+    } catch (e) {
+      const text = (e as Error).message;
+      assert.ok(!/[0-9a-f]{32,}/.test(text), "no long hex in the message");
+      for (const top of tops.values()) assert.ok(!text.includes(top));
+    }
+    for (const bad of ["", "abc", "g".repeat(64), "a".repeat(63)]) refuses(() => s.bindChain(bad), /reports no genesis hash/, `a genesis hash of ${JSON.stringify(bad)}`);
+    refuses(() => s.bindChain(undefined as unknown as string), /reports no genesis hash/, "no genesis hash at all");
+    s.close();
+    // Read only (the `status` command): the same refusal, and nothing written.
+    const before = readFileSync(at.path);
+    const ro = SeedStore.open({ ...at, readOnly: true });
+    assert.equal(ro.bindChain(A), false);
+    refuses(() => ro.bindChain(B), /is for another chain/, "a read-only store bound to another chain");
+    assert.ok(readFileSync(at.path).equals(before));
+
+    // A store written before stores recorded their chain has none: the first bind records it,
+    // durably (the store and its backup), and from then on it is that chain's alone.
+    const old = place();
+    s = SeedStore.open(old);
+    s.put(new Map([[7n, secret()]]));
+    assert.equal(s.boundChain, undefined);
+    s.close();
+    const legacy = readFileSync(old.path);
+    // Read only, it is checked against nothing and not written.
+    const peek = SeedStore.open({ ...old, readOnly: true });
+    assert.equal(peek.bindChain(B), true);
+    assert.ok(readFileSync(old.path).equals(legacy), "a read-only bind writes nothing");
+    s = SeedStore.open(old);
+    assert.equal(s.boundChain, undefined);
+    assert.equal(s.bindChain(B), true);
+    assert.ok(!readFileSync(old.path).equals(legacy), "the bind is written at once");
+    assert.ok(readFileSync(old.backupPath).equals(readFileSync(old.path)), "and to the backup");
+    assert.ok(!readFileSync(old.path, "utf8").includes(B), "the chain is inside the encrypted part");
+    s.close();
+    s = SeedStore.open(old);
+    assert.equal(s.boundChain, B);
+    assert.equal(s.size, 1);
+    refuses(() => s.bindChain(A), /is for another chain/, "the adopted store on another chain");
+    s.close();
+
+    // A bind that can't be written isn't half made: the store stays unbound.
+    const torn = place();
+    s = SeedStore.open(torn);
+    s.put(new Map([[0n, secret()]]));
+    s.close();
+    let fail = true;
+    s = SeedStore.open({ ...torn, fault: (step) => { if (fail && step === "rename") throw new Error("power cut"); } });
+    assert.throws(() => s.bindChain(A), /power cut/);
+    assert.equal(s.boundChain, undefined);
+    fail = false;
+    assert.equal(s.bindChain(B), true);
+    s.close();
+    assert.equal(SeedStore.open({ ...torn, readOnly: true }).boundChain, B);
+    console.log("✓ a store is one chain's: the same table address on another chain is refused");
+  }
+
   // ---- a crash at each step of a write leaves a complete store
   {
     const at = place();

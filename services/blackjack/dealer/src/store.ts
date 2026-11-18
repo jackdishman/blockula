@@ -10,6 +10,14 @@
  *
  * A file that was changed, or opened with another key, doesn't decrypt: `open` throws and the
  * daemon doesn't start. No secret is ever part of an error message.
+ *
+ * **One chain a store.** A table's address comes from its creator and a nonce, never from the
+ * chain, so a chain that is made again (a dev or preview chain recreated, a testnet restarted)
+ * can hold "the same" table at the same address. The links the old chain's hands revealed are
+ * public for good, and the dealer commits a stored secret again when its index isn't committed
+ * yet: on the new chain that would be a chain whose first cards anyone can compute, and a player
+ * who can compute them picks a seed that deals a natural. So the store also records the genesis
+ * hash of the chain it deals on (`bindChain`), and is refused on any other.
  */
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
@@ -130,6 +138,8 @@ export class SeedStore implements SecretStore {
   /** The store's file holds something its backup doesn't yet. */
   private backupBehind = false;
   private locked = false;
+  /** The genesis hash of the chain this store deals on, once bound (`bindChain`). */
+  private chain: string | undefined;
 
   private constructor(private readonly opts: SeedStoreOptions) {}
 
@@ -182,7 +192,7 @@ export class SeedStore implements SecretStore {
       return;
     }
     const file = readFileSync(path);
-    let plain: { table?: unknown; secrets?: unknown };
+    let plain: { table?: unknown; chain?: unknown; secrets?: unknown };
     try {
       plain = JSON.parse(decrypt(key, file, path).toString("utf8")) as typeof plain;
     } catch (e) {
@@ -191,6 +201,9 @@ export class SeedStore implements SecretStore {
     }
     if (plain === null || typeof plain !== "object" || typeof plain.table !== "string" || plain.secrets === null || typeof plain.secrets !== "object") throw new StoreError(`the seed store ${path} is damaged: it isn't the file the dealer wrote`);
     if (plain.table !== table) throw new StoreError(`the seed store ${path} is for the table ${plain.table}, not ${table}: give each table its own store`);
+    // Stores written before the chain was recorded have none: the first `bindChain` records it.
+    if (plain.chain !== undefined && (typeof plain.chain !== "string" || !HEX32.test(plain.chain))) throw new StoreError(`the seed store ${path} is damaged: it isn't the file the dealer wrote`);
+    this.chain = plain.chain as string | undefined;
     for (const [k, top] of Object.entries(plain.secrets as Record<string, unknown>)) {
       if (!/^\d+$/.test(k) || typeof top !== "string" || !HEX32.test(top)) throw new StoreError(`the seed store ${path} is damaged: it isn't the file the dealer wrote`);
       this.secrets.set(BigInt(k), top);
@@ -201,6 +214,37 @@ export class SeedStore implements SecretStore {
       atomicWrite(backupPath, file);
       this.backupBehind = false;
     }
+  }
+
+  /** The genesis hash of the chain this store is bound to, if it is yet. */
+  get boundChain(): string | undefined {
+    return this.chain;
+  }
+
+  /**
+   * Ties the store to the chain whose genesis hash is `genesisHash` (64 hex characters, as the
+   * node's `/api/status` reports it), and throws `StoreError` when it is already tied to another:
+   * its secrets belong to hands of that chain, some of them with links already public there, and
+   * must never be committed anywhere else. A store that isn't tied yet (a new one, or one written
+   * before stores recorded their chain) is tied now, durably when it holds secrets. Returns
+   * whether this call tied it. Call it before the first `put`.
+   */
+  bindChain(genesisHash: string): boolean {
+    const chain = typeof genesisHash === "string" ? genesisHash.toLowerCase() : "";
+    if (!HEX32.test(chain)) throw new StoreError("the node reports no genesis hash (64 hex characters): the dealer can't tell which chain this is, so it won't use the seed store");
+    if (this.chain === chain) return false;
+    // Twelve characters name a chain well enough for a person, and stay under what a log scrubs.
+    if (this.chain !== undefined) throw new StoreError(`the seed store ${this.opts.path} is for another chain (genesis ${this.chain.slice(0, 12)}…), not the one this node is on (genesis ${chain.slice(0, 12)}…). A chain that was made again is another chain: its table needs a new, empty store. Move this store and its backup away (keep them), and start again`);
+    this.chain = chain;
+    if (!this.opts.readOnly && this.secrets.size > 0) {
+      try {
+        this.write(new Map(this.secrets));
+      } catch (e) {
+        this.chain = undefined;
+        throw e;
+      }
+    }
+    return true;
   }
 
   /** Whether the backup is the same file as the store (always, after a `put` that returned). */
@@ -229,7 +273,7 @@ export class SeedStore implements SecretStore {
     const { path, backupPath, key, table, fault } = this.opts;
     const secrets: Record<string, string> = {};
     for (const [k, top] of [...next].sort((a, b) => (a[0] < b[0] ? -1 : 1))) secrets[k.toString()] = top;
-    const file = encrypt(key, Buffer.from(JSON.stringify({ table, secrets })));
+    const file = encrypt(key, Buffer.from(JSON.stringify({ table, ...(this.chain === undefined ? {} : { chain: this.chain }), secrets })));
     atomicWrite(path, file, () => fault?.("rename", path));
     // From here the store's file holds `next`: memory follows it, and the backup is owed.
     this.secrets = next;
