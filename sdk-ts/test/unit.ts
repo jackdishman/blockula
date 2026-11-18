@@ -11,6 +11,7 @@ import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import {
   ApiError, ChainMismatchError, Client, MAINNET_CHAIN_ID, MAX_TIMEOUT_MS, MainnetNotAllowedError, UnprovenNameError, actionDigest, describeAction, describeKind, fangText, decodeKeyGrant, encodeKeyGrant, proposalDigest, seancePairsDigest, verifyKeyGrant, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxFailedError, TxPendingError, Wallet, txDropped, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
   HeightAheadError, HEIGHT_CLOCK_TOLERANCE_MS, heightLimit, reviewAction,
+  formatFang, parseFang,
   keyHash, keyId, leafHash, maxTip, minFee, paramsOf, proposal, proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, valueHash, verifyDistributionProof, verifyReleaseSignature, type Action,
   type Tx,
 } from "../src/index.js";
@@ -411,6 +412,20 @@ await sender(new Client("http://redirect.node", { witnesses })).send("alice.boo"
 assert.equal((redirect.posted.at(-1)!.action as { to: string }).to, VICTIM, "the proven owner is signed, whatever /api/name says");
 assert.deepEqual([(await new Client("http://redirect.node", { witnesses }).recipient("alice")).signed, (await new Client("http://redirect.node", { witnesses }).recipient("alice")).byChain], [VICTIM, false], "with witnesses the proven address is signed");
 assert.deepEqual(await new Client("http://redirect.node").resolution(BOB), { input: BOB, address: BOB, name: null, proven: true, how: "an address, signed as given" });
+// A name may start the way an address does: the chain registers "boo123.boo" like any other
+// (node/src/types.rs `normalize_name`), so it resolves, and can be paid, like any other. Only
+// something too long (or too odd) to be a name is a mistyped address.
+redirect.names = { ...redirect.names, boo123: BOB, tboo1x: BOB, boo1: BOB };
+for (const name of ["boo123.boo", "boo123", "BOO123.boo", "tboo1x.boo", "boo1.boo", " boo123 "]) {
+  const r = await new Client("http://redirect.node").resolution(name);
+  assert.deepEqual([r.address, r.name, r.proven], [BOB, bareName(name), false], name);
+}
+const byName = await new Client("http://redirect.node").recipient("boo123.boo");
+assert.deepEqual([byName.signed, byName.byChain, byName.address], ["boo123.boo", true, BOB], "paid by name, like any other");
+await assert.rejects(new Client("http://redirect.node").resolution("boo1nobody"), /boo1nobody\.boo isn't registered/, "a free name that starts like an address is a name that isn't registered");
+for (const typo of [BOB.slice(0, -1), BOB + "q", BOB.toUpperCase(), BOB.slice(0, 40), "boo1" + "!".repeat(5), `t${BOB}x`]) {
+  await assert.rejects(new Client("http://redirect.node").resolution(typo), /isn't a valid address \(check for typos/, typo);
+}
 assert.throws(() => new Client("http://redirect.node", { requireProvenNames: true }), /needs witnesses/);
 assert.throws(() => new Client("http://redirect.node", { witnesses: [new Client("http://redirect.node/")] }), /another node/);
 // The same node under any spelling is still the client's own (audit MCK-1, as in the MCP): scheme
@@ -859,4 +874,47 @@ console.log(`✓ ${DV.trees.length} distribution trees (leaves, roots, proofs) m
   assert.equal(page.accounts_total, 3);
   assert.equal((await client.names({ sort: "alpha", after: "amber.boo" })).names[0].owner.address, BOB);
   console.log("✓ the people directory pages accounts and names");
+}
+
+// ---- amounts: FANG as text or bigint drops, never a float that lost digits, never negative ----
+{
+  const D = 1_000_000_000n;
+  // What an amount is.
+  for (const [text, drops] of [["0", 0n], ["1", D], ["1.5", 1_500_000_000n], ["0.000000001", 1n], ["1.000000001", D + 1n], [" 2 ", 2n * D], ["18446744073.709551615", (1n << 64n) - 1n], ["007", 7n * D]] as const) {
+    assert.equal(parseFang(text), drops, text);
+  }
+  assert.equal(parseFang(5n), 5n, "bigint is drops, as given");
+  assert.equal(parseFang(0n), 0n);
+  assert.equal(parseFang(1.5), 1_500_000_000n, "a number that says what it means still parses (deprecated)");
+  assert.equal(parseFang(3), 3n * D);
+  // What isn't: exponents, signs, separators, more than nine decimals, a bare dot, hex, other digits, nothing.
+  for (const bad of ["1e3", "1E3", "-1", "+1", "1,5", "1.", ".5", "1.0000000001", "0x10", "1_000", "١", "", " ", "1 000", "1.5.0", "NaN", "Infinity", "1.5 FANG"]) {
+    assert.throws(() => parseFang(bad), /invalid FANG amount/, JSON.stringify(bad));
+  }
+  // Floats that can't say an amount of drops exactly are refused, not rounded.
+  for (const bad of [0.1 + 0.2, 1e-10, 1e21, NaN, Infinity, -1, -0.5]) assert.throws(() => parseFang(bad), /invalid FANG amount/, String(bad));
+  // A whole number past 2^53 has already lost its last digits before it gets here.
+  assert.throws(() => parseFang(9007199254740993), /too large for a number/);
+  assert.throws(() => parseFang(2 ** 60), /too large for a number/);
+  assert.equal(parseFang(Number.MAX_SAFE_INTEGER), BigInt(Number.MAX_SAFE_INTEGER) * D);
+  // Negative drops are never an amount.
+  assert.throws(() => parseFang(-5n), /invalid FANG amount: -5 drops/);
+  assert.throws(() => parseFang(-1n), /invalid FANG amount/);
+  // Formatting: exact, trailing zeros dropped, and every amount comes back as it went in.
+  for (const [drops, text] of [[0n, "0 FANG"], [1n, "0.000000001 FANG"], [D, "1 FANG"], [1_500_000_000n, "1.5 FANG"], [D + 1n, "1.000000001 FANG"], [(1n << 64n) - 1n, "18446744073.709551615 FANG"], [10n * D, "10 FANG"]] as const) {
+    assert.equal(formatFang(drops), text);
+    assert.equal(formatFang(drops.toString()), text, "drops as a string");
+    assert.equal(parseFang(text.replace(" FANG", "")), drops, `${text} round-trips`);
+  }
+  let x = 0x9e3779b97f4a7c15n;
+  for (let i = 0; i < 2_000; i++) {
+    x = (x * 6364136223846793005n + 1442695040888963407n) & ((1n << 64n) - 1n);
+    const drops = x >> BigInt(i % 64);
+    assert.equal(parseFang(formatFang(drops).replace(" FANG", "")), drops, `${drops} drops round-trip`);
+  }
+  // A difference can be negative: the sign goes in front, once.
+  assert.equal(formatFang(-1n), "-0.000000001 FANG");
+  assert.equal(formatFang(-1_500_000_000n), "-1.5 FANG");
+  assert.equal(formatFang(-D), "-1 FANG");
+  console.log("✓ amounts: decimal strings to nine places and bigint drops, round-tripped; floats that lost digits, exponents, signs and negative drops refused");
 }

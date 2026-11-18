@@ -37,6 +37,27 @@ export function clean(s: string, max = 500): string {
   return chars.length > max ? `${chars.slice(0, max).join("")}… (${chars.length - max} more characters)` : t;
 }
 
+/** An amount as a node displays one: digits (grouped or not), up to nine decimals, and a ticker. */
+const AMOUNT_TEXT = /^(\d{1,3}(,\d{3})+|\d{1,24})(\.\d{1,9})? [A-Za-z0-9]{1,16}$/;
+
+/**
+ * What a node says about a tx it ran, for the keys a tool result reports as plain facts (`fee`,
+ * `tx_id`, `block`): each held to its shape, so nothing but an amount, a 64-hex id and a height
+ * gets through under them. A `fee_display` that isn't an amount is replaced by the drops the node
+ * charged (or left out), an id that isn't one is left out, and so is a height that isn't a whole
+ * number. Without this a node could put a sentence under `fee` and have it read as this MCP's own.
+ */
+export function txFacts(r: unknown): { fee: string | undefined; tx_id: string | undefined; block: number | undefined } {
+  const o = (r !== null && typeof r === "object" ? r : {}) as { fee_display?: unknown; fee?: unknown; id?: unknown; height?: unknown };
+  const shown = typeof o.fee_display === "string" ? clean(o.fee_display, 64) : "";
+  const drops = typeof o.fee === "string" || typeof o.fee === "number" ? String(o.fee) : "";
+  return {
+    fee: AMOUNT_TEXT.test(shown) ? shown : /^\d{1,20}$/.test(drops) ? formatFang(BigInt(drops)) : undefined,
+    tx_id: typeof o.id === "string" && /^[0-9a-f]{64}$/.test(o.id) ? o.id : undefined,
+    block: Number.isSafeInteger(o.height) && (o.height as number) >= 0 ? (o.height as number) : undefined,
+  };
+}
+
 /** The bytes of a program's return value or event (hex, in a receipt's `claims`) longer than this many bytes are summarized, never relayed. */
 const CLAIM_BYTES_SHOWN = 64;
 

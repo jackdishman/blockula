@@ -33,7 +33,9 @@ const ID = /^[0-9a-f]{64}$/;
 /** An address as tx_status reads and quotes it: lowercase bech32 characters only. */
 const ACCOUNT = /^[a-z0-9]{1,128}$/;
 /** A chain id and a genesis hash as tx_status quotes them. */
-const CHAIN_ID = /^[A-Za-z0-9-]{1,64}$/;
+// The same characters `network.ts` lets a pinned chain id have (`CHAIN_ID`): with fewer here, a
+// chain id with a '.' or '_' kept no record at all, and tx_status lost what it knew of its txs.
+const CHAIN_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const GENESIS = /^[0-9a-f]{64}$/;
 const optional = (v: unknown, re: RegExp) => v === undefined || (typeof v === "string" && re.test(v));
 

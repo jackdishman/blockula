@@ -21,18 +21,18 @@
 // 8. tx_status for a tx this MCP signed that the node can't show (review-r3-wallet-1): read
 //    against the account's nonce, with BLOCKULA_WITNESSES proven against them.
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { bech32m } from "@scure/base";
 import { NAMESPACES, addressFromPublicKey, decodeKeyGrant, heightLimit, keyHash, leafHash, parseFang, proposalDigest, txId, valueHash, verifyKeyGrant, type Tx } from "@blockula/sdk";
 import { KNOWN_CLOCKS, KNOWN_GENESIS } from "../src/network.js";
-import { SpendLedger } from "../src/spend.js";
+import { SpendLedger, takeOverStale } from "../src/spend.js";
 import { chainData, clean } from "../src/untrusted.js";
 
 const FANG = 1_000_000_000n;
@@ -69,6 +69,26 @@ const dir = mkdtempSync(join(tmpdir(), "blockula-mcp-spend-"));
   assert.throws(() => c.reserve(1n), /locked/, "another server holds the lock");
   rmSync(`${file}.lock`);
   assert.equal(c.reserve(1n).drops, 1n);
+  // A lock whose holder died (older than the stale limit) is taken over, and spending goes on.
+  const old = new Date(Date.now() - 60_000);
+  writeFileSync(`${file}.lock`, "");
+  utimesSync(`${file}.lock`, old, old);
+  assert.equal(c.reserve(1n).drops, 1n, "a dead server's lock doesn't stop spending");
+  assert.ok(!existsSync(`${file}.lock`));
+  // The takeover removes only a lock that is really old. Two servers can judge one dead lock at
+  // once: the first removes it and a third makes a fresh one before the second acts. The second
+  // must leave that fresh lock alone, or two servers would rewrite the ledger at the same time.
+  writeFileSync(`${file}.lock`, "");
+  utimesSync(`${file}.lock`, old, old);
+  assert.equal(takeOverStale(`${file}.lock`, 10_000), true, "the first judge removes the dead lock");
+  assert.ok(!existsSync(`${file}.lock`));
+  writeFileSync(`${file}.lock`, ""); // the third server's fresh lock
+  assert.equal(takeOverStale(`${file}.lock`, 10_000), false, "the second judge finds a live lock");
+  assert.ok(existsSync(`${file}.lock`), "and leaves it where it was");
+  assert.throws(() => c.reserve(1n), /locked/, "the live holder still holds it");
+  rmSync(`${file}.lock`);
+  assert.throws(() => takeOverStale(`${file}.lock`, 10_000), /ENOENT/, "a lock that's gone is nothing to take over");
+  assert.deepEqual(readdirSync(dirname(file)).filter((f) => f.endsWith(".stale")), [], "nothing is left behind");
   // Nonce slots: at most one tx per (account, nonce) executes, so a slot counts its largest tx.
   rmSync(file);
   const n = new SpendLedger(file, 10n, "x", () => now);

@@ -434,6 +434,63 @@ test("stored hands are read defensively and bounded", () => {
   assert.equal(ADULT_KEY, "blockula.blackjack.adult");
 });
 
+test("a seed that couldn't be saved is reported, so its bet is never signed", () => {
+  const key = storeKey("c", TABLE);
+  const hash = seedHash(ME, "ab".repeat(32));
+  // Kept: read back from the storage.
+  const store = memory();
+  assert.equal(rememberSeed(store, key, "ab".repeat(32), 1, hash), true);
+  assert.equal(storedSeedFor(store, key, ME, hash).seed, "ab".repeat(32));
+  // A full storage, one that is switched off, and none at all keep nothing: the bet's seed
+  // could never be revealed, and the stake would go to the house at the seed's deadline.
+  const full = { getItem: () => null, setItem: () => { throw new Error("QuotaExceededError"); } };
+  assert.equal(rememberSeed(full, key, "cd".repeat(32), 2, hash), false);
+  assert.equal(rememberSeed(null, key, "cd".repeat(32), 2, hash), false);
+  // A storage that takes the write and loses it (a private window that forgets) is found out too.
+  const forgets = { getItem: () => null, setItem: () => {} };
+  assert.equal(rememberSeed(forgets, key, "cd".repeat(32), 2, hash), false);
+  // One that fills up later keeps what it had and reports the new seed as lost.
+  let room = true;
+  const filling = memory();
+  const tight = { getItem: (k) => filling.getItem(k), setItem: (k, v) => { if (!room) throw new Error("full"); filling.setItem(k, v); } };
+  assert.equal(rememberSeed(tight, key, "01".repeat(32), 3), true);
+  room = false;
+  assert.equal(rememberSeed(tight, key, "02".repeat(32), 4), false);
+  assert.deepEqual(readStore(tight, key).pending.map((h) => h.seed), ["01".repeat(32)]);
+});
+
+test("the hand just bet is never the one pruned, whatever its id", () => {
+  // A chain that was made again: the table's ids start over, while this browser still holds a
+  // hundred hands of the old chain with higher ids under the same key (a dev chain's id and a
+  // table's address are the same after a reset).
+  const key = storeKey("blockula-dev", TABLE);
+  const store = memory();
+  const hex = (n) => n.toString(16).padStart(64, "0");
+  for (let i = 0; i < 100; i++) {
+    assert.equal(rememberSeed(store, key, hex(5000 + i), 1_000 + i), true);
+    bindBet(store, key, hex(5000 + i), { game: BigInt(500 + i) });
+  }
+  assert.equal(Object.keys(readStore(store, key).hands).length, 100);
+  // The new chain's first hand: id 0, lower than every hand kept.
+  const seed = "ab".repeat(32);
+  const hash = seedHash(ME, seed);
+  assert.equal(rememberSeed(store, key, seed, 9_000, hash), true);
+  bindBet(store, key, seed, { game: 0n, seedHash: hash });
+  const after = readStore(store, key);
+  assert.equal(after.hands["0"]?.seed, seed, "the seed still owed is kept");
+  assert.equal(Object.keys(after.hands).length, 100);
+  assert.ok(!("500" in after.hands), "the oldest hand made room");
+  // The page finds it the way it does when the hand waits for its seed.
+  assert.equal(storedHand(store, key, 0n, null, { account: ME, seedHash: hash })?.seed, seed);
+  assert.equal(storedSeedFor(store, key, ME, hash)?.seed, seed);
+  // A hand whose seed this browser never kept (bound from its receipt, no time on it) is the
+  // oldest there is, and still survives its own write.
+  bindBet(store, key, "cd".repeat(32), { game: 1n });
+  assert.equal(readStore(store, key).hands["1"]?.seed, "cd".repeat(32));
+  assert.equal(readStore(store, key).hands["0"]?.seed, seed, "and the hand before it is still there");
+  assert.equal(Object.keys(readStore(store, key).hands).length, 100);
+});
+
 // ---------------------------------------------------------------------------------- the check
 
 test("every vector hand verifies from its last link and seed alone: each card, both hands, the outcome and the payout", () => {
@@ -553,6 +610,11 @@ test("a relayer's grant is held to the table's limits before it's reviewed", () 
   assert.match(grantProblem({ ...g, relayer: "bot.boo" }, DEFAULT_LIMITS), /never a \.boo name/);
   assert.match(grantProblem({ ...g, maxBet: "26" }, DEFAULT_LIMITS), /most a relayed bet may be at this table is 25 FANG/);
   assert.match(grantProblem({ ...g, maxBet: "0" }, DEFAULT_LIMITS), /most per bet/);
+  // A daily cap above the whole supply: the program refuses it, and past a u64 the call can't
+  // even be built, so the form says so instead of doing nothing when the button is pressed.
+  assert.equal(grantProblem({ ...g, dailyCap: "1000000000" }, DEFAULT_LIMITS, "boo"), null, "the whole supply itself is allowed");
+  assert.match(grantProblem({ ...g, dailyCap: "1000000000.000000001" }, DEFAULT_LIMITS, "boo"), /all the FANG there is/);
+  assert.match(grantProblem({ ...g, dailyCap: "99999999999" }, DEFAULT_LIMITS, "boo"), /all the FANG there is/);
   assert.match(grantProblem({ ...g, dailyCap: "4" }, DEFAULT_LIMITS), /can't be less than the most per bet/);
   assert.match(grantProblem({ ...g, blocks: "43201" }, DEFAULT_LIMITS), /at most 43,200 blocks/);
   assert.match(grantProblem({ ...g, blocks: "soon" }, DEFAULT_LIMITS), /number of blocks/);
