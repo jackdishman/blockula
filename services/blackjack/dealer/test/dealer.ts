@@ -818,6 +818,186 @@ try {
     console.log("✓ a bet waiting for its seed is left alone, dealt once the seed is revealed, and ended by timeout when it never comes");
   }
 
+  // ---- rules v2: the dealer opens a hand before its seed, with exactly three links, and never a late one
+  {
+    const r = rig({ lowWater: 20, target: 40 });
+    r.table.rules = 2;
+    await r.step();
+    /** One look, and what it started for hands (a top-up of commitments may ride along). */
+    const hands = async (x: Rig) => (await x.step()).filter((k) => !k.startsWith("commit:"));
+    const reveals = () => sent(r, "reveal").length;
+    const timeouts = () => sent(r, "timeout").length;
+    const outcomes = new Set<number>();
+    const seen = new Set<number>();
+    for (let n = 0; n < 300; n++) {
+      const s = seed();
+      const id = r.table.commitBet("boo1alice", s);
+      const g = r.table.games.get(id)!;
+      const chain = chainFromTop(r.store.top(id)!);
+      assert.deepEqual([g.phase, g.clientSeed, g.deadline], [Phase.Open, null, BigInt(r.table.height) + 15n]);
+      // The seed isn't owed yet, and isn't taken: the dealer hasn't opened the hand.
+      assert.throws(() => r.table.revealSeed(id, "boo1alice", s), (e) => e === 70);
+      // One look opens it: the chain's first three links and not one more, though the dealer
+      // holds all thirty-two and knows no card.
+      assert.deepEqual(owedLinks(g, chain), chain.slice(1, 4));
+      assert.deepEqual(await hands(r), [`reveal:${id}:${Phase.Open}:0`]);
+      assert.equal(sent(r, "reveal").at(-1)!.call.input, call.reveal(id, chain.slice(1, 4)).input);
+      const opened = r.table.games.get(id)!;
+      assert.deepEqual([opened.phase, opened.dealt, opened.link, opened.clientSeed, opened.playerCards], [Phase.Seed, 3, chain[3], null, []]);
+      // The player's time for the seed runs from the opening (a top-up may have landed after it).
+      const seedTime = opened.deadline - BigInt(r.table.height);
+      assert.ok(seedTime === 25n || seedTime === 24n, `${seedTime} blocks left for the seed`);
+      // Opened and waiting for the seed: nothing more, tick after tick.
+      const before = reveals();
+      assert.deepEqual(await hands(r), []);
+      assert.equal(reveals(), before);
+      // The seed deals the first three cards itself; the rest is the hand as v1 deals it.
+      r.table.revealSeed(id, "boo1alice", s);
+      for (;;) {
+        const now = r.table.games.get(id);
+        if (!now) break;
+        seen.add(now.phase);
+        assert.ok(now.dealt >= 3 && now.playerCards.length >= 2, "its cards are out");
+        if (dealers(now.phase)) {
+          const owed = owedLinks(now, chain);
+          assert.deepEqual(await hands(r), [`reveal:${id}:${now.phase}:${now.dealt}`]);
+          assert.equal(sent(r, "reveal").at(-1)!.call.input, call.reveal(id, owed).input);
+        } else {
+          r.table.move(id, now.playerTotal < 17);
+        }
+      }
+    }
+    assert.ok(!seen.has(Phase.Deal), "a v2 hand from an account is never in the deal's phase: the dealer never knows a deal it still owes");
+    assert.equal(r.table.settled.length, 300);
+    for (const h of r.table.settled) {
+      outcomes.add(h.outcome);
+      const v = verifyHand({ ...h, rules: 2, relayed: false });
+      assert.deepEqual([v.forfeited, v.refunded, v.unrevealed], [false, false, false]);
+    }
+    for (const o of [Outcome.Blackjack, Outcome.Win, Outcome.Push, Outcome.Lose, Outcome.Bust]) assert.ok(outcomes.has(o), `outcome ${o} came up in 300 hands`);
+    assert.equal(timeouts(), 0);
+    assert.ok(!r.table.tripped);
+    const openLine = r.logs.find((l) => l.action === "reveal" && l.turn === "open")!;
+    assert.deepEqual([openLine.opened, openLine.phase, openLine.links, "cards" in openLine], [3, "seed", 3, false]);
+
+    // An opening that part-landed (someone got ahead with the first link): the rest, and no more.
+    const s1 = seed();
+    const part = r.table.commitBet("boo1bob", s1);
+    const chain = chainFromTop(r.store.top(part)!);
+    r.table.call(call.reveal(part, [chain[1]]), "boo1stranger");
+    assert.deepEqual(await hands(r), [`reveal:${part}:${Phase.Open}:1`]);
+    assert.equal(sent(r, "reveal").at(-1)!.call.input, call.reveal(part, chain.slice(2, 4)).input);
+    assert.equal(r.table.games.get(part)!.phase, Phase.Seed);
+    // An opening whose answer was lost: followed by its id, and never sent twice.
+    const s2 = seed();
+    r.table.fate = only("reveal", "ghost");
+    const ghost = r.table.commitBet("boo1carol", s2);
+    const n = reveals();
+    await r.step();
+    r.table.fate = () => "ok";
+    assert.equal(r.table.games.get(ghost)!.phase, Phase.Seed, "it landed");
+    await r.step();
+    await r.step();
+    assert.equal(reveals(), n + 1, "one opening, however its answer got lost");
+    // A restart between the opening and the seed changes nothing.
+    const again = r.restart({ lowWater: 20, target: 40 });
+    await again.dealer.start();
+    assert.deepEqual(await hands(again), []);
+    r.table.revealSeed(part, "boo1bob", s1);
+    r.table.revealSeed(ghost, "boo1carol", s2);
+    await playOut(again);
+
+    // The opening is valid no longer than its deadline: three blocks are left, so three it is.
+    const tight = again.table.commitBet("boo1dave", seed());
+    again.table.mine(12);
+    assert.equal(again.table.games.get(tight)!.deadline - BigInt(again.table.height), 3n);
+    again.table.fate = only("reveal", "lost");
+    assert.deepEqual(await hands(again), [`reveal:${tight}:${Phase.Open}:0`]);
+    assert.equal(sent(again, "reveal").at(-1)!.validForBlocks, 3);
+    again.table.fate = () => "ok";
+    // It never arrived, and now the deadline is here: no link is sent any more (the program would
+    // refuse it, 73, with the link already public). The dealer refunds the hand and frees the seat.
+    again.table.mine(3);
+    const sentBefore = reveals();
+    const twin = again.restart();
+    await twin.dealer.start();
+    assert.deepEqual(await hands(twin), [`timeout:open:${tight}`]);
+    assert.equal(reveals(), sentBefore, "no opening link after the deadline");
+    const refunded = twin.table.settled.at(-1)!;
+    assert.deepEqual([refunded.game, refunded.outcome, refunded.payout, refunded.clientSeed, refunded.dealt, refunded.by], [tight, Outcome.Refund, refunded.stake, null, 0, DEALER]);
+    const v = verifyHand({ ...refunded, rules: 2 });
+    assert.deepEqual([v.refunded, v.unrevealed, v.forfeited, v.cards], [true, false, false, []]);
+    assert.ok(actions(twin).includes("opening_missed"));
+    const refundLine = twin.logs.find((l) => l.action === "timeout")!;
+    assert.deepEqual([refundLine.outcome, refundLine.turn], ["refund", "open"]);
+    assert.ok(!twin.table.tripped, "a refund trips nothing");
+    // The fake refuses a late link as the program does.
+    const late = twin.table.commitBet("boo1erin", seed());
+    twin.table.mine(15);
+    assert.throws(() => twin.table.call(call.reveal(late, chainFromTop(twin.store.top(late)!).slice(1, 4)), DEALER), (e) => e === 73);
+    await twin.step();
+    assert.equal(twin.table.settled.at(-1)!.outcome, Outcome.Refund);
+
+    // An outage. The dealer is down and five players bet against the commitments it left: every
+    // one gets the stake back and nothing else, whoever calls the timeout. (A v1 table paid each
+    // of them 3:2.)
+    const down: bigint[] = [];
+    for (const who of ["boo1a", "boo1b", "boo1c", "boo1d", "boo1e"]) down.push(twin.table.commitBet(who, seed()));
+    twin.table.mine(15);
+    for (const id of down) {
+      const [ev] = twin.table.call(call.timeout(id), "boo1stranger");
+      assert.ok(ev.name === "settled" && ev.outcome === Outcome.Refund && ev.payout === ev.stake);
+    }
+    assert.ok(!twin.table.tripped);
+    // The dealer comes back to a table that still takes bets, and deals the next hand.
+    const back = twin.restart({ lowWater: 20, target: 40 });
+    await back.dealer.start();
+    const s3 = seed();
+    const next = back.table.commitBet("boo1alice", s3);
+    assert.deepEqual(await hands(back), [`reveal:${next}:${Phase.Open}:0`]);
+    back.table.revealSeed(next, "boo1alice", s3);
+    await playOut(back);
+
+    // A hand opened and then left by a dealer that stops: the player stands and is paid 1:1 at
+    // the deadline (the cards allow no more), and that trips the breaker. The dealer says so.
+    let stalled = 0n;
+    let s4 = "";
+    for (;;) {
+      s4 = seed();
+      stalled = back.table.commitBet("boo1bob", s4);
+      await back.step();
+      back.table.revealSeed(stalled, "boo1bob", s4);
+      if (back.table.games.get(stalled)?.phase === Phase.Player) break;
+      await playOut(back);
+    }
+    back.table.move(stalled, false);
+    back.table.mine(21);
+    const [forfeit] = back.table.call(call.timeout(stalled), "boo1bob");
+    assert.ok(forfeit.name === "settled" && forfeit.outcome === Outcome.Forfeit && forfeit.payout === 2n * forfeit.stake);
+    assert.ok(back.table.tripped);
+    assert.throws(() => back.table.commitBet("boo1carol", seed()), (e) => e === 46);
+    await back.step();
+    const tripLine = back.logs.find((l) => l.action === "table_tripped")!;
+    assert.match(String(tripLine.advice), /pause\(false\)/);
+    back.table.tripped = false;
+
+    // A dry run says it would open a hand, and sends nothing.
+    const dryId = back.table.commitBet("boo1dave", seed());
+    const dry = back.restart({ dryRun: true });
+    const sends = dry.table.sends.length;
+    assert.deepEqual(await hands(dry), [`reveal:${dryId}:${Phase.Open}:0`]);
+    assert.ok(actions(dry).includes("would_reveal"));
+    assert.equal(dry.table.sends.length, sends);
+    // `inspect` shows a hand waiting to be opened as the dealer's.
+    const health = await inspect(dry.table, dry.store, DEALER);
+    assert.deepEqual(health.open, [{ id: dryId, phase: Phase.Open, deadline: dry.table.games.get(dryId)!.deadline, dealers: true, waitsForSeed: false, hasSecret: true }]);
+    dry.table.mine(16);
+    const live = dry.restart({ dryRun: false });
+    await live.step();
+    assert.equal(live.table.open.length, 0);
+    console.log(`✓ rules v2: 300 hands opened with exactly three links before their seed and dealt to the end (outcomes ${[...outcomes].sort().join(", ")}); a late opening is never sent and the hand is refunded; an outage's bets win nothing; a forfeit trips the table`);
+  }
+
   // ---- `inspect`: what `status` shows
   {
     const r = rig();

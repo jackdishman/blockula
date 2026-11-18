@@ -16,6 +16,14 @@
  * - a `commit_batch` when fewer than `lowWater` commitments are left, each chain's secret in the
  *   store and its backup before the commitment leaves this machine.
  *
+ * On a rules v2 table (`blackjack2`, docs/proposals/blackjack-dealer-outage.md) a hand bet from
+ * an account is *opened* first: the dealer reveals its chain's first three links before the
+ * player's seed is known, and those links deal no card yet (`owedLinks` gives exactly them, and
+ * never a fourth). A link that could no longer land by the opening's deadline isn't sent: the
+ * program refuses it, and the hand's stake goes back by `timeout`, which the dealer then sends
+ * itself to free the seat. The dealer needs no setting for this: a hand's phase says what it is
+ * owed, and a v1 table never shows that phase.
+ *
  * So a restart needs nothing but the chain and the store. Every call is safe to repeat: the
  * program takes a link only as its chain's next (58; one the hand already holds is passed over, so
  * a reveal someone got ahead of still deals the rest), a batch only where the last one ended (61)
@@ -133,10 +141,10 @@ export interface Health {
   open: { id: bigint; phase: Phase; deadline: bigint; dealers: boolean; waitsForSeed: boolean; hasSecret: boolean }[];
 }
 
-const OUTCOME_NAMES: Record<Outcome, string> = { 1: "blackjack", 2: "win", 3: "push", 4: "lose", 5: "bust", 6: "forfeit", 7: "forfeit_deal", 8: "no_seed" };
-const PHASE_NAMES: Record<Phase, string> = { 0: "seed", 1: "deal", 2: "player", 3: "hit", 4: "dealer", 5: "done" };
-/** Aborts that say the table moved on since it was read: someone else's call got there first. */
-const MOVED: Record<string, readonly number[]> = { reveal: [54, 57, 58, 59], timeout: [54, 60], commit: [61] };
+const OUTCOME_NAMES: Record<Outcome, string> = { 1: "blackjack", 2: "win", 3: "push", 4: "lose", 5: "bust", 6: "forfeit", 7: "forfeit_deal", 8: "no_seed", 9: "refund" };
+const PHASE_NAMES: Record<Phase, string> = { 0: "seed", 1: "deal", 2: "player", 3: "hit", 4: "dealer", 5: "done", 6: "open" };
+/** Aborts that say the table moved on since it was read: someone else's call got there first (73: the time to open a hand ran out before the links landed). */
+const MOVED: Record<string, readonly number[]> = { reveal: [54, 57, 58, 59, 73], timeout: [54, 60], commit: [61] };
 
 function ranges(indexes: readonly bigint[]): Range[] {
   const out: Range[] = [];
@@ -163,6 +171,12 @@ function eventFields(events: readonly TableEvent[]): LogFields {
       out.outcome = OUTCOME_NAMES[e.outcome];
       out.stake = fang(e.stake);
       out.payout = fang(e.payout);
+    } else if (e.name === "opened") {
+      // How many links opened the hand, never the links.
+      out.opened = e.links.length;
+      out.phase = PHASE_NAMES[e.phase];
+    } else if (e.name === "tripped") {
+      out.tripped = "yes";
     } else if (e.name === "seed") {
       // That it came, never what it is.
       out.seed = "revealed";
@@ -336,6 +350,14 @@ export class Dealer {
     const height = house.height;
     const started: string[] = [];
 
+    if (house.tripped) {
+      this.once("tripped", 300, () =>
+        this.log.error("table_tripped", {
+          height,
+          advice: "a hand ended by the dealer's missed deadline and the house paid for it, so the table takes no new bet. Find out why a reveal was late (this daemon, its node, its balance), then the owner allows bets again with pause(false). Open hands are still dealt",
+        }),
+      );
+    }
     await this.followUp(height);
     for (const g of games) this.planHand(g, height, limits, started);
     this.planCommit(house, height, started);
@@ -356,6 +378,30 @@ export class Dealer {
   }
 
   private planHand(g: Game, height: number, limits: Limits, started: string[]): void {
+    if (g.phase === Phase.Open) {
+      // Rules v2: the bet is placed, and the hand is the dealer's to open before the player's
+      // seed is known: its chain's first three links, which deal no card yet.
+      const left = g.deadline - BigInt(height);
+      if (left < 1n) {
+        // Too late: the program refuses an opening link past the deadline, and the stake is the
+        // player's to take back. The timeout does that and frees the seat. It can only ever
+        // refund: no link of this hand can land any more, so the hand stays unopened.
+        this.once(`unopened:${g.id}`, 120, () => this.log.warn("opening_missed", { game: g.id, height, deadline: g.deadline, advice: "this hand wasn't opened in time (was the dealer down?): its stake goes back to its player" }));
+        const validForBlocks = Math.max(2, Math.min(this.opts.txValidBlocks, Number(limits.revealBlocks / 2n)));
+        this.begin(`timeout:open:${g.id}`, "timeout", call.timeout(g.id), { validForBlocks, fuelLimit: FUEL.timeout }, { game: g.id, turn: "open", deadline: g.deadline, read_at: height }, started);
+        return;
+      }
+      const chain = this.chainFor(g);
+      if (!chain) {
+        this.once(`lost:${g.id}`, 120, () => this.log.error("hand_without_secret", { game: g.id, height, phase: PHASE_NAMES[g.phase], deadline: g.deadline, advice: "the store has no secret for this hand's chain, so it can't be opened: at its deadline its stake goes back to its player. If the store was lost, restore it from the backup, or pause the table and have the owner drop the unused commitments with skip_commits" }));
+        return;
+      }
+      const links = owedLinks(g, chain);
+      // Valid no longer than the deadline: a copy that arrives after it would be refused anyway.
+      const validForBlocks = Math.max(1, Math.min(this.opts.txValidBlocks, Number(left)));
+      this.begin(`reveal:${g.id}:${g.phase}:${g.dealt}`, "reveal", call.reveal(g.id, links), { validForBlocks, fuelLimit: FUEL.reveal(links.length) }, { game: g.id, turn: PHASE_NAMES[g.phase], links: links.length, deadline: g.deadline, read_at: height }, started);
+      return;
+    }
     if (g.phase === Phase.Seed) {
       // The bet is placed; its seed isn't revealed. Nothing is owed, and nothing of the chain is
       // touched. Once the block a call would land in is past the seed's deadline, the hand is
