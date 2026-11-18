@@ -1075,7 +1075,13 @@ export function txId(tx: Tx): string {
 
 /** "1.5" → 1500000000n drops. Accepts numbers, decimal strings or bigint drops. */
 export function parseFang(amount: string | number | bigint): bigint {
-  if (typeof amount === "bigint") return amount;
+  if (typeof amount === "bigint") {
+    // Drops are never negative: a negative amount is a bug in the caller, not an amount.
+    if (amount < 0n) throw new Error(`invalid FANG amount: ${amount} drops`);
+    return amount;
+  }
+  // A number past 2^53 has already lost its last digits: it isn't the amount that was meant.
+  if (typeof amount === "number" && Number.isInteger(amount) && !Number.isSafeInteger(amount)) throw new Error(`invalid FANG amount: ${amount} is too large for a number; pass a string or bigint drops`);
   const s = String(amount).trim();
   if (!/^\d+(\.\d{1,9})?$/.test(s)) throw new Error(`invalid FANG amount: ${s}`);
   const [whole, frac = ""] = s.split(".");
@@ -1083,8 +1089,11 @@ export function parseFang(amount: string | number | bigint): bigint {
 }
 
 export function formatFang(drops: bigint | string): string {
-  const d = BigInt(drops);
+  const signed = BigInt(drops);
+  // The sign once, in front: a negative number's remainder is negative too, and would print in
+  // the middle of the decimals ("0.0000000-1 FANG").
+  const d = signed < 0n ? -signed : signed;
   const whole = d / DROPS_PER_FANG;
   const frac = (d % DROPS_PER_FANG).toString().padStart(9, "0").replace(/0+$/, "");
-  return `${whole}${frac ? "." + frac : ""} FANG`;
+  return `${signed < 0n ? "-" : ""}${whole}${frac ? "." + frac : ""} FANG`;
 }

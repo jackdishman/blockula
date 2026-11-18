@@ -104,6 +104,16 @@ export function bareName(name: string): string {
   return n;
 }
 
+/** Whether `input` is a name the chain could hold (`bareName` takes it), whatever it starts with. */
+function couldBeName(input: string): boolean {
+  try {
+    bareName(input);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The most `Wallet.propose` bonds by default without being told (audit gap-7-5): mainnet's genesis
  * `proposal_deposit` (node/src/params.rs). A node reporting more is refused; pass `deposit`.
@@ -3023,7 +3033,10 @@ export class Client {
   async resolution(nameOrAddress: string): Promise<Resolution> {
     const input = nameOrAddress;
     if (isAddress(input)) return { input, address: input, name: null, proven: true, how: "an address, signed as given" };
-    if (/^t?boo1/i.test(input.trim())) throw new Error(`${input} isn't a valid address (check for typos; addresses are lowercase)`);
+    // Something that starts like an address and isn't one is a mistyped address, unless it is
+    // short enough to be a name: the chain registers "boo123.boo" like any other (3–32 of a-z,
+    // 0-9 and '-'), and an address is about twice as long as the longest name.
+    if (/^t?boo1/i.test(input.trim()) && !couldBeName(input)) throw new Error(`${input} isn't a valid address (check for typos; addresses are lowercase)`);
     const name = bareName(input);
     if (this.witnesses.length) {
       const rec = await this.provenName(name, { witnesses: this.witnesses });
