@@ -335,6 +335,294 @@ fn payouts_and_exposure() {
     }
 }
 
+#[test]
+fn payouts_round_down_never_up_for_any_stake() {
+    // The largest stake whose payout fits a `u64`: far above the supply (10^18 drops).
+    const TOP: u64 = u64::MAX / 5 * 2;
+    let mut rng = Rng::new("blackjack/payouts");
+    let mut stakes: Vec<u64> = vec![0, 1, 2, 3, 4, 5, FANG - 1, FANG, FANG + 1, 1_000_000_000 * FANG, TOP - 1, TOP];
+    for _ in 0..20_000 {
+        // Every size of stake, from a few drops to the top.
+        stakes.push(rng.u64() % TOP >> (rng.u64() % 62));
+    }
+    for &stake in &stakes {
+        let s = u128::from(stake);
+        // Exactly 1.5 × and 2.5 ×, the half drop dropped: never a drop more than the odds.
+        assert_eq!(u128::from(exposure(stake)), s * 3 / 2, "{stake}");
+        assert_eq!(u128::from(payout(stake, Outcome::Blackjack)), s * 5 / 2, "{stake}");
+        assert_eq!(u128::from(payout(stake, Outcome::Win)), s * 2, "{stake}");
+        // The house keeps the half drop of an odd stake's natural, and only that.
+        assert_eq!(s * 5 - 2 * u128::from(payout(stake, Outcome::Blackjack)), s % 2, "{stake}");
+        // What a hand sets aside (its stake and its exposure) covers every way it can end.
+        let aside = s + u128::from(exposure(stake));
+        let mut most = 0;
+        for o in (1..=8).map(|o| Outcome::from_u8(o).unwrap()) {
+            let pays = u128::from(payout(stake, o));
+            assert!(pays <= aside, "{o:?} of {stake} pays {pays}, more than the {aside} set aside");
+            most = most.max(pays);
+        }
+        assert_eq!(most, aside, "{stake}: the reserve is exactly the dearest ending, not a drop more");
+        // A forfeit pays what the hand it stands for would have: no more, no less.
+        assert_eq!(payout(stake, Outcome::ForfeitDeal), payout(stake, Outcome::Blackjack));
+        assert_eq!(payout(stake, Outcome::Forfeit), payout(stake, Outcome::Win));
+    }
+    // A bigger stake never pays less, and a stake cut in pieces never pays more than it whole:
+    // nobody gains a drop from the rounding by betting many small odd stakes.
+    for pair in stakes.chunks(2) {
+        let (a, b) = (pair[0] / 2, pair[1] / 2);
+        for o in (1..=8).map(|o| Outcome::from_u8(o).unwrap()) {
+            assert!(payout(a + b, o) >= payout(a, o) + payout(b, o), "{o:?}: {a} + {b} pays more apart");
+            assert!(payout(a + b, o) - (payout(a, o) + payout(b, o)) <= 1, "{o:?}: {a} + {b} differ by more than the half drop");
+            assert!(payout(a.max(b), o) >= payout(a.min(b), o), "{o:?} isn't monotone");
+            assert!(exposure(a + b) >= exposure(a) + exposure(b));
+        }
+    }
+}
+
+#[test]
+fn a_payout_that_doesnt_fit_stops_the_program_instead_of_wrapping() {
+    // Past the top the sums don't fit a `u64`. The guests are built with overflow checks (as this
+    // test is), so such a sum is a panic, which the program's panic handler turns into an abort:
+    // the call fails and nothing is paid. A wrapped sum would pay a small number for a huge stake.
+    let top = u64::MAX / 5 * 2;
+    assert_eq!(u128::from(payout(top, Outcome::Blackjack)), u128::from(top) * 5 / 2);
+    for (stake, outcome) in [(u64::MAX, Outcome::Blackjack), (u64::MAX, Outcome::Win), (u64::MAX / 2 + 1, Outcome::Win), (u64::MAX / 5 * 2 + 2, Outcome::ForfeitDeal), (u64::MAX, Outcome::Forfeit)] {
+        let wrapped = std::panic::catch_unwind(|| payout(std::hint::black_box(stake), outcome));
+        assert!(wrapped.is_err(), "{outcome:?} of {stake} wrapped to {wrapped:?}");
+    }
+    assert!(std::panic::catch_unwind(|| exposure(std::hint::black_box(u64::MAX))).is_err());
+    // Nothing that can't pay is affected.
+    assert_eq!(payout(u64::MAX, Outcome::Push), u64::MAX);
+    assert_eq!(payout(u64::MAX, Outcome::Lose), 0);
+    // The profile the guests are built with says so, for every guest.
+    let manifest = include_str!("../guests/Cargo.toml");
+    let release = manifest.split("[profile.release]").nth(1).expect("the guests' release profile");
+    let release = release.split("\n[").next().unwrap();
+    assert!(release.lines().any(|l| l.trim() == "overflow-checks = true"), "the guests must be built with overflow checks");
+    assert!(release.lines().any(|l| l.trim() == "panic = \"abort\""));
+}
+
+/// The rules as a player would read them, on final hands: an oracle that shares nothing with
+/// `bj_core::showdown` (aces start at 11 and come down, where the crate's start at 1 and go up).
+fn oracle(player: &[u8], dealer: &[u8]) -> Outcome {
+    fn value(cards: &[u8]) -> u32 {
+        let mut aces = 0;
+        let mut sum = 0;
+        for c in cards {
+            match c % 13 {
+                0 => {
+                    aces += 1;
+                    sum += 11;
+                }
+                r @ 1..=8 => sum += u32::from(r) + 1,
+                _ => sum += 10,
+            }
+        }
+        while sum > 21 && aces > 0 {
+            sum -= 10;
+            aces -= 1;
+        }
+        sum
+    }
+    let (p, d) = (value(player), value(dealer));
+    let (p_natural, d_natural) = (player.len() == 2 && p == 21, dealer.len() == 2 && d == 21);
+    match () {
+        _ if p > 21 => Outcome::Bust,
+        _ if p_natural && d_natural => Outcome::Push,
+        _ if p_natural => Outcome::Blackjack,
+        _ if d_natural => Outcome::Lose,
+        _ if d > 21 => Outcome::Win,
+        _ if p > d => Outcome::Win,
+        _ if p == d => Outcome::Push,
+        _ => Outcome::Lose,
+    }
+}
+
+#[test]
+fn every_showdown_of_up_to_three_cards_a_side_matches_the_oracle() {
+    // Every hand of one to three ranks (suits never matter: `totals_count…` checks that).
+    let mut hands: Vec<Vec<u8>> = vec![];
+    for a in 0..13u8 {
+        hands.push(vec![a]);
+        for b in 0..13u8 {
+            hands.push(vec![a, b]);
+            for c in 0..13u8 {
+                hands.push(vec![a, b, c]);
+            }
+        }
+    }
+    let mut seen: BTreeMap<u8, u64> = BTreeMap::new();
+    for player in hands.iter().filter(|h| h.len() >= 2) {
+        for dealer in &hands {
+            let got = bj_core::showdown(player, dealer);
+            assert_eq!(got, oracle(player, dealer), "{player:?} against {dealer:?}");
+            *seen.entry(got as u8).or_default() += 1;
+        }
+    }
+    assert_eq!(seen.keys().copied().collect::<Vec<_>>(), [1, 2, 3, 4, 5], "every outcome of a showdown: {seen:?}");
+    // Suits change nothing.
+    for (player, dealer) in [(vec![0u8, 12], vec![9u8, 0]), (vec![5, 6, 7], vec![9, 8]), (vec![9, 9, 9], vec![3])] {
+        for suit in 0..4u8 {
+            let lift = |h: &[u8]| h.iter().map(|c| c + 13 * suit).collect::<Vec<_>>();
+            assert_eq!(bj_core::showdown(&lift(&player), &dealer), bj_core::showdown(&player, &dealer));
+            assert_eq!(bj_core::showdown(&player, &lift(&dealer)), bj_core::showdown(&player, &dealer));
+        }
+    }
+}
+
+/// What a walk over every hand found.
+#[derive(Default)]
+struct Walk {
+    /// The most a state can still pay (of a stake of 2), by the state's key.
+    memo: BTreeMap<(u8, u8, bool, u8, u8, bool, u8), u64>,
+    ends: BTreeMap<u8, u64>,
+    longest: (u8, u8, u8),
+    /// States where a forfeit pays more than any ending the cards could still reach.
+    generous: u64,
+}
+
+/// Everything the rules can do from `hand`: every card the dealer could turn (all thirteen
+/// ranks) and both of the player's moves, each ending checked against the oracle and the bounds.
+/// Returns the most the hand can still pay for a stake of 2. States are remembered by what the
+/// rules look at (the phase, each side's hard total, whether it holds an ace, and whether it
+/// holds two cards or more), so the walk is over every reachable state, each with every move.
+fn walk(hand: Hand, w: &mut Walk) -> u64 {
+    let side = |cards: &[u8]| {
+        let hard: u8 = cards.iter().map(|c| bj_core::points(*c)).sum();
+        (hard, cards.iter().any(|c| c % 13 == 0), (cards.len() as u8).min(3))
+    };
+    let (p, d) = (side(hand.player_cards()), side(hand.dealer_cards()));
+    let key = (hand.phase as u8, p.0, p.1, p.2, d.0, d.1, d.2);
+    if let Some(most) = w.memo.get(&key) {
+        return *most;
+    }
+    // The bounds the program's records are sized by.
+    assert!(hand.n_player as usize <= MAX_PLAYER_CARDS && hand.n_dealer as usize <= MAX_DEALER_CARDS, "{hand:?}");
+    assert_eq!(hand.dealt, hand.n_player + hand.n_dealer, "{hand:?}");
+    assert!((hand.dealt as usize) < CHAIN_LEN, "an open hand always has a link left: {hand:?}");
+    w.longest = (w.longest.0.max(hand.n_player), w.longest.1.max(hand.n_dealer), w.longest.2.max(hand.dealt));
+    let most = match hand.phase {
+        Phase::Player => {
+            // The player's turn comes only below 21, and never with a card owed.
+            assert!(total(hand.player_cards()).0 < 21 && hand.n_player >= 2 && hand.n_dealer == 1, "{hand:?}");
+            assert_eq!({ hand }.deal(0), None, "no card on the player's turn");
+            let (mut hit, mut stand) = (hand, hand);
+            assert!(hit.hit() && stand.stand());
+            assert_eq!((hit.phase, stand.phase), (Phase::Hit, Phase::Dealer));
+            // A move changes whose turn it is and nothing else.
+            assert_eq!(Hand { phase: Phase::Player, ..hit }, hand);
+            assert_eq!(Hand { phase: Phase::Player, ..stand }, hand);
+            walk(hit, w).max(walk(stand, w))
+        }
+        Phase::Deal | Phase::Hit | Phase::Dealer => {
+            assert!(!{ hand }.hit() && !{ hand }.stand() && !{ hand }.seeded(), "no move while a card is owed");
+            let mut most = 0;
+            for rank in 0..13u8 {
+                let mut next = hand;
+                let step = next.deal(rank).expect("the dealer owed a card");
+                // One card, to one side, and never one taken back.
+                assert_eq!(next.dealt, hand.dealt + 1);
+                assert!(next.player_cards().starts_with(hand.player_cards()) && next.dealer_cards().starts_with(hand.dealer_cards()));
+                most = most.max(match step {
+                    Step::More => {
+                        assert!(next.phase.dealers(), "{next:?}");
+                        walk(next, w)
+                    }
+                    Step::Player => {
+                        assert_eq!(next.phase, Phase::Player);
+                        walk(next, w)
+                    }
+                    Step::Settled(outcome) => {
+                        assert_eq!(next.phase, Phase::Done);
+                        let (player, dealer) = (next.player_cards(), next.dealer_cards());
+                        assert_eq!(outcome, oracle(player, dealer), "{player:?} against {dealer:?}");
+                        // The dealer played by the book: nothing after a bust; only the hole
+                        // card against a natural, and only when the upcard could match it;
+                        // otherwise up to 17 and not a card further.
+                        let natural = player.len() == 2 && total(player).0 == 21;
+                        if outcome == Outcome::Bust {
+                            assert_eq!(dealer.len(), 1);
+                        } else if natural {
+                            assert_eq!(dealer.len(), if matches!(dealer[0] % 13, 0 | 9..=12) { 2 } else { 1 });
+                        } else {
+                            assert!(dealer.len() >= 2 && total(dealer).0 >= 17 && total(&dealer[..dealer.len() - 1]).0 < 17, "{dealer:?}");
+                        }
+                        assert_eq!({ next }.deal(0), None, "a settled hand takes no card");
+                        assert!(!{ next }.hit() && !{ next }.stand() && !{ next }.seeded());
+                        *w.ends.entry(outcome as u8).or_default() += 1;
+                        payout(2, outcome)
+                    }
+                });
+            }
+            // The dealer never gains by holding a card back: a missed deadline pays at least
+            // the most the cards could still have paid, and exactly that once the deal is done.
+            let forfeit = payout(2, hand.forfeit());
+            assert!(forfeit >= most, "{hand:?}: a forfeit pays {forfeit}, the cards could still pay {most}");
+            if hand.phase != Phase::Deal {
+                assert_eq!(forfeit, most, "{hand:?}");
+            } else if forfeit > most {
+                w.generous += 1;
+            }
+            most
+        }
+        Phase::Seed | Phase::Done => unreachable!("{hand:?}"),
+    };
+    w.memo.insert(key, most);
+    most
+}
+
+#[test]
+fn every_hand_there_is_ends_as_the_rules_say_and_a_stall_never_pays_the_dealer() {
+    let mut w = Walk::default();
+    assert_eq!(walk(Hand::new(), &mut w), payout(2, Outcome::Blackjack), "a new hand can still be a natural");
+    // Every ending the cards can give was reached, many times over.
+    assert_eq!(w.ends.keys().copied().collect::<Vec<_>>(), [1, 2, 3, 4, 5], "{:?}", w.ends);
+    assert!(w.ends.values().all(|n| *n > 50), "{:?}", w.ends);
+    // The longest hands are exactly the bounds, and together they fit the chain.
+    assert_eq!((w.longest.0 as usize, w.longest.1 as usize), (MAX_PLAYER_CARDS, MAX_DEALER_CARDS - 1), "the longest open hands");
+    assert!((w.longest.2 as usize) < CHAIN_LEN);
+    // A dealer that stalls during the deal is charged 3:2 even where the cards already out rule
+    // a natural out: more than the hand could have paid, never less.
+    assert!(w.generous > 0);
+    println!("{} states, endings {:?}, longest open hand {:?}, {} deal states where a forfeit pays above the cards' best", w.memo.len(), w.ends, w.longest, w.generous);
+}
+
+#[test]
+fn cards_come_out_evenly_whatever_the_seed_the_game_or_the_index() {
+    // 52,000 cards from the formula: each of the 52 about 1,000 times. The bound is nine
+    // standard deviations (σ ≈ 31): a formula that favoured a card would be far outside it.
+    let mut rng = Rng::new("blackjack/cards");
+    let mut counts = [0u32; 52];
+    let mut by_rank_first_two = [0u32; 13];
+    for n in 0..52_000u32 {
+        let (link, seed) = (rng.bytes32(), rng.bytes32());
+        let c = card(&link, &seed, rng.u64(), 1 + (n % CHAIN_LEN as u32) as u8);
+        assert!(c < 52);
+        counts[c as usize] += 1;
+        by_rank_first_two[(c % 13) as usize] += 1;
+    }
+    for (c, n) in counts.iter().enumerate() {
+        assert!((720..=1280).contains(n), "card {c} came out {n} times in 52,000");
+    }
+    for (r, n) in by_rank_first_two.iter().enumerate() {
+        assert!((3_500..=4_500).contains(n), "rank {r} came out {n} times in 52,000");
+    }
+    // Each input decides the card: change any one and the 32 cards of a hand change.
+    let (link, seed) = (rng.bytes32(), rng.bytes32());
+    let hand = |link: &[u8; 32], seed: &[u8; 32], id: u64| (1..=CHAIN_LEN as u8).map(|j| card(link, seed, id, j)).collect::<Vec<_>>();
+    let base = hand(&link, &seed, 7);
+    let mut other = seed;
+    other[31] ^= 1;
+    assert_ne!(hand(&link, &other, 7), base, "the player's seed");
+    let mut other = link;
+    other[0] ^= 0x80;
+    assert_ne!(hand(&other, &seed, 7), base, "the dealer's link");
+    assert_ne!(hand(&link, &seed, 8), base, "the game");
+    assert_ne!(hand(&link, &seed, 7 + (1 << 63)), base, "the game's high bits");
+    // The same link at another index is another card: a card is its place in the chain too.
+    assert!((1..CHAIN_LEN as u8).any(|j| card(&link, &seed, 7, j) != card(&link, &seed, 7, j + 1)));
+}
+
 /// The longest hand from a total, by search over every rank: `limit` is the total a hand stops
 /// drawing at (21 for a player who always hits, 17 for the dealer).
 fn longest(hard: u8, ace: bool, limit: u8, memo: &mut BTreeMap<(u8, bool), usize>) -> usize {

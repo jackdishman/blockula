@@ -1591,6 +1591,290 @@ fn deposits_are_bonded_by_the_bettor_and_come_back_when_the_hand_settles() {
     assert_eq!(trap(&t.tx("bob", "bet", [3; 32].to_vec(), FANG)), Some(TrapKind::StorageLimit));
 }
 
+// ---------------------------------------------------------------------------------- payout edges
+
+/// Every hand method, as the calls someone might send after hand `id` is over: the settling
+/// reveal again, the whole chain again, the next link, a timeout, the player's moves, the seed, a
+/// relayer's moves.
+fn late_calls(id: u64, who: &'static str, dealt: usize, seed: &[u8; 32]) -> Vec<(&'static str, &'static str, &'static str, Vec<u8>)> {
+    let links = chain_of(id);
+    let mut calls = vec![
+        ("the next link", "dealer", "reveal", reveal_input(id, &links[dealt + 1..dealt + 2])),
+        ("a link from a stranger", "stranger", "reveal", reveal_input(id, &links[1..2])),
+        ("a timeout", "stranger", "timeout", le(id)),
+        ("the player's timeout", who, "timeout", le(id)),
+        ("a hit", who, "hit", le(id)),
+        ("a stand", who, "stand", le(id)),
+        ("the seed", who, "reveal_seed", [&le(id)[..], seed].concat()),
+        ("a relayed hit", "bot", "relay_hit", [le(id), le(1)].concat()),
+        ("a relayed stand", "bot", "relay_stand", [le(id), le(2)].concat()),
+    ];
+    if dealt > 0 {
+        calls.push(("the settling reveal again", "dealer", "reveal", reveal_input(id, &links[dealt..dealt + 1])));
+        calls.push(("the whole chain again", "dealer", "reveal", reveal_input(id, &links[1..=dealt.min(12)])));
+    }
+    calls
+}
+
+#[test]
+fn a_settled_hand_takes_no_call_and_pays_once() {
+    let mut t = Table::new();
+    approve(&mut t, "bot", true);
+    t.host.height = 1_000;
+    // What must not move once a hand is over: every balance, the house, the players' records.
+    fn frozen(t: &Table) -> (u128, Vec<u64>, House, Vec<Vec<u8>>) {
+        let people = ["alice", "bob", "carol", "dealer", "stranger", "bot", "house", PROGRAM];
+        (t.host.total(), people.iter().map(|w| t.balance(w)).collect(), t.house(), ["alice", "bob", "carol"].iter().map(|w| t.player(w)).collect())
+    }
+
+    // A hand the cards settled, and paid.
+    let seed = seed_for(0, never, |o, h| o == Outcome::Win && !bj_core::natural(h.player_cards()));
+    let before = t.balance("alice");
+    let id = t.bet("alice", 10 * FANG, &seed);
+    let r = t.play_out("alice", id, &seed, never);
+    assert_eq!(r.returns[0], [Phase::Done as u8, Outcome::Win as u8]);
+    assert_eq!(t.balance("alice"), before + 10 * FANG);
+    let dealt = event(&r, "settled")[58] as usize;
+    let after = frozen(&t);
+    for wait in [0, 151, 1_801, 100_000] {
+        t.host.height += wait;
+        for (what, signer, method, input) in late_calls(id, "alice", dealt, &seed) {
+            assert_eq!(abort_code(&t.tx(signer, method, input, 0)), Some(54), "{what}, {wait} blocks after a settled hand");
+            assert_eq!(frozen(&t), after, "{what} moved something");
+        }
+    }
+
+    // A hand a timeout settled (the dealer never dealt): the dealer's late cards change nothing.
+    let seed = seed_for(1, never, |_, _| true);
+    let before = t.balance("bob");
+    let id = t.bet("bob", 10 * FANG, &seed);
+    t.host.height += 151;
+    assert_eq!(t.tx("stranger", "timeout", le(id), 0).returns[0], [Phase::Done as u8, Outcome::ForfeitDeal as u8]);
+    assert_eq!(t.balance("bob"), before + 15 * FANG, "3:2 on a hand never dealt");
+    let after = frozen(&t);
+    for (what, signer, method, input) in late_calls(id, "bob", 0, &seed) {
+        assert_eq!(abort_code(&t.tx(signer, method, input, 0)), Some(54), "{what}, after a forfeit");
+        assert_eq!(frozen(&t), after, "{what} moved something");
+    }
+    assert_eq!(abort_code(&t.reveal(id, 1, 3)), Some(54), "the deal, too late");
+    assert_eq!(frozen(&t), after);
+
+    // A hand whose seed never came: the stake is the house's once, and the seed is worth nothing after.
+    let seed = [0x5e; 32];
+    let before = (t.balance("carol"), t.house().bankroll);
+    let r = t.commit_bet("carol", 10 * FANG, &seed);
+    let id = u64_at(&r.returns[0], 0);
+    t.host.height += 301;
+    assert_eq!(t.tx("stranger", "timeout", le(id), 0).returns[0], [Phase::Done as u8, Outcome::NoSeed as u8]);
+    assert_eq!((t.balance("carol"), t.house().bankroll), (before.0 - 10 * FANG, before.1 + 10 * FANG));
+    let after = frozen(&t);
+    for (what, signer, method, input) in late_calls(id, "carol", 0, &seed) {
+        assert_eq!(abort_code(&t.tx(signer, method, input, 0)), Some(54), "{what}, after a bet without its seed ended");
+        assert_eq!(frozen(&t), after, "{what} moved something");
+    }
+
+    // An id is never used again: the next bet is the next game, and the old ids stay dead.
+    let seed = seed_for(3, never, |_, _| true);
+    assert_eq!(t.bet("alice", FANG, &seed), 3);
+    for id in 0..3 {
+        assert!(t.game(id).is_none());
+        assert_eq!(abort_code(&t.tx("stranger", "timeout", le(id), 0)), Some(54));
+    }
+    // A hand that doesn't exist yet takes no call either.
+    assert_eq!(abort_code(&t.tx("stranger", "timeout", le(4), 0)), Some(54));
+    assert_eq!(abort_code(&t.tx("dealer", "reveal", reveal_input(4, &chain_of(4)[1..4]), 0)), Some(54));
+    assert_eq!(abort_code(&t.tx("stranger", "timeout", le(u64::MAX), 0)), Some(54));
+}
+
+#[test]
+fn odd_stakes_round_the_half_drop_down_and_no_drop_is_made_or_lost() {
+    type Pick = fn(&Hand) -> bool;
+    // (how it ends, the player's policy)
+    let ends: [(Outcome, Pick); 5] = [(Outcome::Blackjack, never), (Outcome::Win, never), (Outcome::Push, never), (Outcome::Lose, never), (Outcome::Bust, below_17)];
+    for stake in [1, 2, 3, 5, 7, 999_999_999, FANG + 1, 50 * FANG - 1] {
+        let mut t = Table::new();
+        assert!(t.tx("house", "set_limits", limits_input(&[(MIN_BET, 1), (DAILY_CAP, 100_000 * FANG)]), 0).ok());
+        t.host.height = 1_000;
+        let everyone = t.host.total();
+        let reserve = stake + stake / 2;
+        assert_eq!(reserve, exposure(stake));
+        // What a hand of `stake` must do to the player and the bankroll, whatever ended it.
+        let hand = |t: &mut Table, what: &str, outcome: Outcome, run: &mut dyn FnMut(&mut Table, u64) -> Receipt| {
+            let (alice, house) = (t.balance("alice"), t.house());
+            let id = house.next_game;
+            let r = run(t, id);
+            assert_eq!(r.returns[0], [Phase::Done as u8, outcome as u8], "{what}, stake {stake}");
+            let pays = match outcome {
+                Outcome::Blackjack | Outcome::ForfeitDeal => 2 * stake + stake / 2,
+                Outcome::Win | Outcome::Forfeit => 2 * stake,
+                Outcome::Push => stake,
+                Outcome::Lose | Outcome::Bust | Outcome::NoSeed => 0,
+            };
+            assert_eq!(pays, payout(stake, outcome), "{what}, stake {stake}");
+            let ev = event(&r, "settled");
+            assert_eq!((u64_at(ev, 41), u64_at(ev, 49)), (stake, pays), "{what}, stake {stake}: the event");
+            assert_eq!(t.balance("alice"), alice - stake + pays, "{what}, stake {stake}: the player");
+            // The house loses exactly what the player gains, and never more than it set aside.
+            assert_eq!(t.house(), House { bankroll: house.bankroll + stake - pays, next_game: id + 1, ..house }, "{what}, stake {stake}: the house");
+            assert!(pays <= stake + reserve, "{what}, stake {stake}: more than the reserve");
+            assert_eq!(t.host.total(), everyone, "{what}, stake {stake}: a drop was made or lost");
+            assert_eq!(u64_at(&t.player("alice"), 123), pays, "{what}: the player's last hand");
+        };
+        for (outcome, wants) in ends {
+            hand(&mut t, "played out", outcome, &mut |t, id| {
+                let seed = seed_for(id, wants, |o, _| o == outcome);
+                assert_eq!(t.bet("alice", stake, &seed), id);
+                // While it's open, exactly the stake and its exposure are set aside.
+                let open = t.house();
+                assert_eq!((open.stakes, open.reserved), (stake, reserve), "stake {stake}: what an open hand holds");
+                t.play_out("alice", id, &seed, wants)
+            });
+        }
+        hand(&mut t, "never dealt", Outcome::ForfeitDeal, &mut |t, id| {
+            assert_eq!(t.bet("alice", stake, &[7; 32]), id);
+            t.host.height += 151;
+            t.tx("stranger", "timeout", le(id), 0)
+        });
+        hand(&mut t, "a hit never answered", Outcome::Forfeit, &mut |t, id| {
+            let seed = seed_for(id, never, |_, h| !bj_core::natural(h.player_cards()));
+            assert_eq!(t.bet("alice", stake, &seed), id);
+            assert!(t.reveal(id, 1, 3).ok());
+            assert!(t.tx("alice", "hit", le(id), 0).ok());
+            t.host.height += 151;
+            t.tx("stranger", "timeout", le(id), 0)
+        });
+        hand(&mut t, "a seed never revealed", Outcome::NoSeed, &mut |t, id| {
+            assert_eq!(u64_at(&t.commit_bet("alice", stake, &[8; 32]).returns[0], 0), id);
+            t.host.height += 301;
+            t.tx("stranger", "timeout", le(id), 0)
+        });
+    }
+}
+
+#[test]
+fn the_largest_bet_the_limits_allow_never_overflows() {
+    // The chain's whole supply, in drops: `set_limits` takes no amount above it, and the VM moves
+    // no more than it in one transfer.
+    const SUPPLY: u64 = 1_000_000_000 * FANG;
+    // The largest stake a chain could ever hold a hand of: the stake and its exposure (1.5 ×)
+    // are the whole supply, and a natural pays exactly that, the largest transfer there is.
+    let stake = SUPPLY / 5 * 2;
+    let reserve = exposure(stake);
+    assert_eq!(stake + reserve, SUPPLY);
+    assert_eq!(payout(stake, Outcome::Blackjack), SUPPLY);
+    assert_eq!(abort_code(&Table::new().tx("house", "set_limits", limits_input(&[(MAX_EXPOSURE, SUPPLY + 1)]), 0)), Some(45), "no limit is above the supply");
+
+    type Pick = fn(&Hand) -> bool;
+    let ends: [(Outcome, Pick); 5] = [(Outcome::Blackjack, never), (Outcome::Lose, never), (Outcome::Win, never), (Outcome::Push, never), (Outcome::Bust, below_17)];
+    let mut t = Table::bare();
+    // More than a real chain could hold, so the sums are the largest the program can ever make.
+    t.host.fund(addr("house"), 8 * SUPPLY);
+    t.host.fund(addr("alice"), 4 * SUPPLY);
+    let top = [(MAX_BET, SUPPLY), (DAILY_CAP, SUPPLY), (DIVISOR, 1), (MAX_EXPOSURE, reserve), (DEPOSIT_CAP, SUPPLY), (RELAY_MAX_BET, SUPPLY)];
+    assert!(t.tx("house", "set_limits", limits_input(&top), 0).ok());
+    assert!(t.tx("house", "fund", vec![], reserve + 10).ok());
+    t.commit(0, 16);
+    let everyone = t.host.total();
+    // Two drops more can't be reserved: the exposure limit holds at the very top.
+    assert_eq!(exposure(stake + 2), reserve + 3);
+    assert_eq!(abort_code(&t.tx("alice", "bet", [1; 32].to_vec(), stake + 2)), Some(69));
+    assert_eq!(abort_code(&t.tx("alice", "bet", [1; 32].to_vec(), SUPPLY)), Some(48), "more than the bankroll");
+    // No call carries more than the supply: the VM refuses it before the program runs.
+    assert!(!t.tx("alice", "bet", [1; 32].to_vec(), SUPPLY + 1).ok());
+    assert!(!t.tx("alice", "bet", [1; 32].to_vec(), u64::MAX).ok());
+    assert_eq!(t.host.total(), everyone);
+    for (n, (outcome, wants)) in ends.into_iter().enumerate() {
+        // A new day each hand: the daily cap is the supply too.
+        t.host.height = 1_000 + 43_200 * n as u64;
+        // The bankroll covers this one hand and ten drops.
+        let free = t.house().bankroll;
+        if free < reserve + 10 {
+            assert!(t.tx("house", "fund", vec![], reserve + 10 - free).ok());
+        } else if free > reserve + 10 {
+            assert!(t.tx("house", "defund", le(free - reserve - 10), 0).ok());
+        }
+        let id = t.house().next_game;
+        let seed = seed_for(id, wants, |o, _| o == outcome);
+        let (alice, house) = (t.balance("alice"), t.house());
+        assert_eq!(t.bet("alice", stake, &seed), id);
+        assert_eq!((t.house().reserved, t.house().stakes, t.house().bankroll), (reserve, stake, 10));
+        let r = t.play_out("alice", id, &seed, wants);
+        assert_eq!(r.returns[0][1], outcome as u8);
+        let pays = payout(stake, outcome);
+        assert_eq!(u64_at(event(&r, "settled"), 49), pays);
+        assert_eq!(t.balance("alice"), alice - stake + pays, "{outcome:?}");
+        assert_eq!(t.house(), House { bankroll: house.bankroll + stake - pays, next_game: id + 1, ..house }, "{outcome:?}");
+        assert_eq!(t.host.total(), everyone, "{outcome:?}");
+    }
+    // The same stake from a table balance, and a forfeit at 3:2 paid back to it.
+    let free = t.house().bankroll;
+    if free < reserve {
+        assert!(t.tx("house", "fund", vec![], reserve - free).ok());
+    }
+    approve(&mut t, "bot", true);
+    t.host.height += 43_200;
+    assert!(t.tx("alice", "deposit", vec![], stake).ok());
+    assert_eq!(abort_code(&t.tx("alice", "deposit", vec![], SUPPLY - stake + 1)), Some(62), "past the deposit cap");
+    assert!(t.tx("alice", "set_relayer", grant_input("bot", SUPPLY, SUPPLY, t.host.height + 100), 0).ok());
+    let r = relay_bet(&mut t, "bot", "alice", stake, 9);
+    assert!(r.ok(), "{:?}", r.fail);
+    let id = u64_at(&r.returns[0], 0);
+    assert_eq!(t.table_balance("alice"), 0);
+    t.host.height += 151;
+    assert_eq!(t.tx("stranger", "timeout", le(id), 0).returns[0], [Phase::Done as u8, Outcome::ForfeitDeal as u8]);
+    assert_eq!(t.table_balance("alice"), 2 * stake + stake / 2, "over the deposit cap is fine for winnings");
+    assert_eq!(t.host.total(), everyone);
+    assert!(t.tx("alice", "withdraw", le(2 * stake + stake / 2), 0).ok());
+    assert_eq!(t.house().table, 0);
+    assert_eq!(t.host.total(), everyone);
+}
+
+#[test]
+fn a_full_table_of_worst_cases_is_paid_in_full_after_the_owner_empties_the_bankroll() {
+    // Ten hands at the maximum bet (the default limits' full table and full exposure), every one
+    // of them ending the dearest way a hand can: 3:2.
+    let mut t = Table::new();
+    t.host.height = 1_000;
+    let players: Vec<String> = (0..11).map(|n| format!("player {n}")).collect();
+    for p in &players {
+        t.host.fund(addr(p), 100 * FANG);
+    }
+    let everyone = t.host.total();
+    let stake = 50 * FANG;
+    for (n, p) in players[..10].iter().enumerate() {
+        assert_eq!(t.bet(p, stake, &[n as u8; 32]), n as u64);
+    }
+    let h = t.house();
+    assert_eq!((h.open, h.stakes, h.reserved, h.bankroll), (10, 500 * FANG, 750 * FANG, 1_250 * FANG));
+    // The exposure limit and the table are both full.
+    assert_eq!(abort_code(&t.tx(&players[10], "bet", [0; 32].to_vec(), FANG)), Some(69));
+    assert!(t.tx("house", "set_limits", limits_input(&[(MAX_EXPOSURE, 10_000 * FANG)]), 0).ok());
+    assert_eq!(abort_code(&t.tx(&players[10], "bet", [0; 32].to_vec(), FANG)), Some(51));
+
+    // The owner takes everything it can: the free bankroll, to the drop, and nothing set aside.
+    let owner = t.balance("house");
+    assert_eq!(abort_code(&t.tx("house", "defund", le(1_250 * FANG + 1), 0)), Some(63));
+    assert!(t.tx("house", "defund", le(1_250 * FANG), 0).ok());
+    assert_eq!(t.balance("house"), owner + 1_250 * FANG);
+    assert_eq!(abort_code(&t.tx("house", "defund", le(1), 0)), Some(63), "the reserve isn't the owner's");
+    assert_eq!(t.balance(PROGRAM), 1_250 * FANG, "exactly the stakes and their exposure");
+    // With nothing free, no new bet is taken, however small.
+    assert!(t.tx("house", "set_limits", limits_input(&[(MAX_OPEN, 32), (MAX_EXPOSURE, 10_000 * FANG), (MIN_BET, 1)]), 0).ok());
+    assert_eq!(abort_code(&t.tx(&players[10], "bet", [0; 32].to_vec(), 1)), Some(48));
+
+    // The dealer deals nothing. Every hand is paid 3:2 from what was set aside for it.
+    t.host.height += 151;
+    for (n, p) in players[..10].iter().enumerate() {
+        let r = t.tx("stranger", "timeout", le(n as u64), 0);
+        assert_eq!(r.returns[0], [Phase::Done as u8, Outcome::ForfeitDeal as u8], "hand {n}");
+        assert_eq!(t.balance(p), 100 * FANG + 75 * FANG, "hand {n}: paid in full");
+    }
+    let h = t.house();
+    assert_eq!((h.open, h.stakes, h.reserved, h.bankroll, h.table), (0, 0, 0, 0, 0));
+    assert_eq!(t.balance(PROGRAM), 0, "the program holds nothing it doesn't owe");
+    assert_eq!(t.host.total(), everyone);
+}
+
 // ---------------------------------------------------------------------------------- views
 
 #[test]
