@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { test } from "node:test";
-import { ABORTS, DEFAULT_LIMITS, DROPS_PER_FANG, EMPTY_PLAYER, Outcome, Phase, POSTER_ALT, altText, bytesAddress, exposure, outcomeWords, payout, seedHash, snapshotOfGame, snapshotOfSettled, tableSvg } from "@blockula/blackjack";
+import { ABORTS, DEFAULT_LIMITS, DEFAULT_LIMITS_V2, DROPS_PER_FANG, EMPTY_PLAYER, Outcome, Phase, POSTER_ALT, altText, bytesAddress, exposure, outcomeWords, payout, seedHash, snapshotOfGame, snapshotOfSettled, tableSvg } from "@blockula/blackjack";
 import {
   ADULT_KEY,
   addHandTx,
@@ -268,6 +268,70 @@ test("a bet waits for its seed: step 2 of 2 while there is time, the house's onc
   // Once the seed is in, the dealer owes the deal. A relayed hand never had this step.
   assert.match(handState(gameAt(h, 0), ME, 100_000).words, /^Seed revealed\. Waiting for the dealer…/);
   assert.match(handState(gameAt(h, 0, { table: true }), ME, 100_000).words, /^Waiting for the dealer…/);
+});
+
+test("on a rules v2 table a bet waits for the dealer to open it, and an unopened one is the player's to take back", () => {
+  const h = vectors.hands.find((x) => x.moves === "HS");
+  // The bet is in: the dealer owes the opening links, and has seen no card.
+  const g = gameAt(h, 0, { phase: Phase.Open, clientSeed: null, seedHash: seedHash(ME, h.client_seed), deadline: 100_150n });
+  const mine = handState(g, ME, 100_000);
+  assert.deepEqual([mine.mine, mine.waitsFor, mine.unopened, mine.seedLate, mine.canMove, mine.canClaim, mine.idle], [true, "dealer", true, false, false, false, false]);
+  assert.equal(mine.words, "Bet placed. Waiting for the dealer to open the hand… It has 150 blocks (about 3 min) left. Then you reveal your seed (step 2 of 2). If the dealer doesn't open it, your stake comes back.");
+  assert.equal(handState(g, ME, 100_149).canClaim, false);
+  // Past the deadline no link is taken any more: the stake comes back, and nothing else.
+  const late = handState(g, ME, 100_150);
+  assert.deepEqual([late.canClaim, late.unopened, late.canMove], [true, true, false]);
+  assert.equal(late.words, "The dealer didn't open the hand in time. Your stake can be taken back: nothing else is paid, and no card was dealt.");
+  assert.match(handState(g, OTHER, 100_150).words, /The stake can be taken back/);
+  assert.match(handState(g, null, 100_000).words, /^The bet is placed\. The dealer has 150 blocks/);
+  // A v1 hand, and a v2 hand once it's opened, are never "unopened".
+  assert.equal(handState(gameAt(h, 0), ME, 100_150).unopened, false);
+  const opened = { ...g, phase: Phase.Seed, dealt: 3, link: h.links[2], deadline: 100_300n };
+  const seedStep = handState(opened, ME, 100_000);
+  assert.deepEqual([seedStep.waitsFor, seedStep.unopened, seedStep.canClaim], ["seed", false, false]);
+  assert.match(seedStep.words, /Now reveal your seed to be dealt \(step 2 of 2\)/);
+
+  // The check: nothing to check while the hand is being opened, under the table's own rules only.
+  const kept = { seed: h.client_seed, seedHash: seedHash(ME, h.client_seed), commit: h.commit, txs: [], at: 0 };
+  for (const hand of [g, { ...g, dealt: 2, link: h.links[1] }, opened]) {
+    const c = checkOpenHand(hand, kept, 2);
+    assert.deepEqual([c.ok, c.unrevealed, c.seed, c.commitCheck, c.steps], [true, true, "yours", "matches", []]);
+    assert.match(c.verdict, /Nothing to check yet/);
+  }
+  assert.equal(checkOpenHand(opened, kept).ok, false, "a v1 table never has a link before its seed");
+  assert.equal(checkOpenHand(opened, { ...kept, commit: "00".repeat(32) }, 2).ok, false, "the links must hash down to the commitment the bet took");
+  // A refund: no cards, the stake back, and nothing else.
+  const stake = BigInt(h.stake);
+  const refund = { game: BigInt(h.game_id), outcome: Outcome.Refund, dealt: 2, nPlayer: 0, stake, payout: stake, clientSeed: null, seedHash: kept.seedHash, link: h.links[1] };
+  const ok = checkSettledHand(refund, kept, ME, 2);
+  assert.deepEqual([ok.ok, ok.unrevealed, ok.forfeited, ok.commitCheck, ok.player], [true, true, false, "matches", []]);
+  assert.equal(ok.verdict, "Verified. No cards were dealt: the dealer never opened the hand, so the stake came back.");
+  assert.equal(checkSettledHand({ ...refund, payout: stake + 1n }, kept, ME, 2).ok, false);
+  assert.equal(checkSettledHand({ ...refund, payout: 0n }, kept, ME, 2).ok, false);
+  assert.equal(checkSettledHand({ ...refund, outcome: Outcome.ForfeitDeal, payout: payout(stake, Outcome.ForfeitDeal) }, kept, ME, 2).ok, false, "an unopened hand never pays 3:2");
+  assert.equal(checkSettledHand({ ...refund, dealt: 3, link: h.links[2] }, kept, ME, 2).ok, false, "an opened hand whose seed never came isn't refunded");
+  assert.equal(checkSettledHand(refund, kept, ME).ok, false, "a v1 table has no refund");
+  // An opened hand whose seed never came: the house's, as on a v1 table.
+  const lost = { ...refund, outcome: Outcome.NoSeed, dealt: 3, link: h.links[2], payout: 0n };
+  assert.match(checkSettledHand(lost, kept, ME, 2).verdict, /seed was never revealed, so the bet went to the house/);
+  // A played hand verifies the same under either rules.
+  assert.equal(checkSettledHand(lastOf(h), kept, ME, 2).ok, true);
+  assert.equal(payoutWords(stake, stake).length > 0, true);
+  assert.match(outcomeWords(Outcome.Refund), /stake is back/);
+
+  // What the page says about it: the table's own time limits, and a tripped table.
+  const rules = strings(rulesText(DEFAULT_LIMITS_V2)).join("\n");
+  assert.match(rules, /the dealer has 150 blocks \(about 3 min\) to open your hand/);
+  assert.match(rules, /your bet comes back, and nothing else is paid/);
+  assert.match(rules, /two and a half times your bet if you hold blackjack, and twice your bet if not/);
+  assert.doesNotMatch(rules, /if blackjack was still possible/);
+  assert.doesNotMatch(strings(rulesText(DEFAULT_LIMITS)).join("\n"), /open your hand/, "a v1 table's rules say nothing of it");
+  assert.match(tableProblem(ctx({ house: house({ paused: true, tripped: true }) })), /the dealer missed a deadline/);
+  assert.equal(tableProblem(ctx({ house: house({ paused: true }) })), "New bets are paused. Open hands play on.");
+  assert.equal(logLine({ name: "opened", game: 7n, player: ME, first: 1, links: [], phase: Phase.Seed, deadline: 0n }, ME), "The dealer opened the hand. No card is dealt until the seed is revealed.");
+  assert.equal(logLine({ name: "opened", game: 7n, player: ME, first: 1, links: [], phase: Phase.Open, deadline: 0n }, ME), null);
+  assert.equal(logLine({ name: "tripped", game: 7n, outcome: Outcome.Forfeit }, ME), null);
+  for (const s of [mine.words, late.words, ok.verdict, rules, COPY.moves.refund, COPY.moves.refundDoes, outcomeWords(Outcome.Refund), ABORTS[73], tableProblem(ctx({ house: house({ paused: true, tripped: true }) }))]) assert.doesNotMatch(s, BANNED, s);
 });
 
 test("the seed of a bet is found again by the hash the bet carried, and only by the browser that holds it", () => {

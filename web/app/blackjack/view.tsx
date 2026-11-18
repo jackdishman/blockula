@@ -19,7 +19,7 @@
 // details".
 import "@/app/explorer.css";
 import "./blackjack.css";
-import { Phase, call, eventNamed, eventsOf, fang, outcomeWords, seedHash, snapshotOfGame, snapshotOfSettled, type Game, type LastHand, type TableEvent } from "@blockula/blackjack";
+import { Phase, call, eventNamed, eventsOf, fang, outcomeWords, seedHash, snapshotOfGame, snapshotOfSettled, type Game, type LastHand, type Rules, type TableEvent } from "@blockula/blackjack";
 import { checkReceipt } from "@blockula/sdk";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
@@ -300,7 +300,7 @@ function TablePage({ address }: { address: string }) {
         ) : (
           <>
             <div className={last ? "cols bj-hand" : "bj-hand"}>
-              {last && <LastHandView last={last} kept={lastKept} myName={myName} me={me} />}
+              {last && <LastHandView last={last} kept={lastKept} myName={myName} me={me} rules={s.rules} />}
               <div className="stack">
                 {!last && <p className="m0 dim" data-testid="bj-no-hand">{COPY.hand.none}</p>}
                 {/* A new form for each settled hand: it starts from that hand's stake. */}
@@ -332,14 +332,14 @@ function TablePage({ address }: { address: string }) {
         </summary>
         <div className="stack-lg bj-more-body">
           <p className="m0 dim">{COPY.details.lede}</p>
-          {me && open ? <OpenHandDetails game={open} me={me} kept={openKept} tick={s} program={address} /> : me && last ? <LastHandDetails last={last} kept={lastKept} me={me} /> : null}
+          {me && open ? <OpenHandDetails game={open} me={me} kept={openKept} tick={s} program={address} rules={s.rules} /> : me && last ? <LastHandDetails last={last} kept={lastKept} me={me} rules={s.rules} /> : null}
           <div className="stack">
             <h3 className="bj-rule">{COPY.details.table}</h3>
             <div className="figures" data-testid="bj-house">
               <Stat v={fang(s.house.bankroll)} k="FANG in the house's bankroll" />
               <Stat v={`${s.house.open} of ${s.limits.maxOpenGames}`} k="hands open" />
               <Stat v={`${fang(s.limits.minBet)} to ${fang(most < s.limits.minBet ? s.limits.maxBet : most)}`} k="FANG a bet, right now" />
-              <Stat v={s.house.paused ? "paused" : "open"} k="new bets" />
+              <Stat v={s.house.tripped ? "stopped" : s.house.paused ? "paused" : "open"} k="new bets" />
             </div>
             <p className="card-note m0" data-testid="bj-table">
               The table is the program <span className="mono break">{address}</span>. <Link href={to.deployed(address)}>See the program&apos;s record</Link>
@@ -565,8 +565,13 @@ function OpenHand({ game, me, myName, height, blockMs, adult, signer, kept, stor
             </>
           )}
           {hs.canClaim && (
-            <button className="btn primary" disabled={disabled} onClick={() => move("timeout", `${COPY.moves.claim}: ${COPY.moves.claimDoes.toLowerCase()}`)} data-testid="bj-claim">
-              {COPY.moves.claim}
+            <button
+              className="btn primary"
+              disabled={disabled}
+              onClick={() => (hs.unopened ? move("timeout", `${COPY.moves.refund}: ${COPY.moves.refundDoes.toLowerCase()}`) : move("timeout", `${COPY.moves.claim}: ${COPY.moves.claimDoes.toLowerCase()}`))}
+              data-testid={hs.unopened ? "bj-refund" : "bj-claim"}
+            >
+              {hs.unopened ? COPY.moves.refund : COPY.moves.claim}
             </button>
           )}
         </div>
@@ -581,7 +586,7 @@ function OpenHand({ game, me, myName, height, blockMs, adult, signer, kept, stor
 }
 
 /** The open hand's check and its log, for "Fairness & details". */
-function OpenHandDetails({ game, me, kept, tick, program }: { game: Game; me: string; kept: StoredHand | null; tick: unknown; program: string }) {
+function OpenHandDetails({ game, me, kept, tick, program, rules }: { game: Game; me: string; kept: StoredHand | null; tick: unknown; program: string; rules: Rules }) {
   const [checking, setChecking] = useState(false);
   const events = useHandEvents(program, kept?.txs ?? [], tick);
   return (
@@ -592,7 +597,7 @@ function OpenHandDetails({ game, me, kept, tick, program }: { game: Game; me: st
         </button>
         <span className="dim small">{COPY.verify.lede}</span>
       </div>
-      {checking && <VerifyView check={checkOpenHand(game, kept)} mine={game.player === me} />}
+      {checking && <VerifyView check={checkOpenHand(game, kept, rules)} mine={game.player === me} />}
       <div data-testid="bj-log">
         <h3 className="bj-rule">{COPY.log.title}</h3>
         {events.length === 0 ? (
@@ -611,9 +616,9 @@ function OpenHandDetails({ game, me, kept, tick, program }: { game: Game; me: st
 }
 
 /** The last hand on the table: its cards and how it ended. */
-function LastHandView({ last, kept, myName, me }: { last: LastHand; kept: StoredHand | null; myName?: string; me: string | null }) {
+function LastHandView({ last, kept, myName, me, rules }: { last: LastHand; kept: StoredHand | null; myName?: string; me: string | null; rules: Rules }) {
   // The record keeps no cards: they are recomputed here, which is the check itself.
-  const check = useMemo(() => checkSettledHand(last, kept, me ?? undefined), [last, kept, me]);
+  const check = useMemo(() => checkSettledHand(last, kept, me ?? undefined, rules), [last, kept, me, rules]);
   const snapshot = useMemo(() => (check.ok ? snapshotOfSettled(last, { player: check.player, dealer: check.dealer }, { player: myName, txId: kept?.betTx }) : null), [check, last, myName, kept?.betTx]);
   return (
     <div className="stack" data-testid="bj-last-hand">
@@ -626,9 +631,9 @@ function LastHandView({ last, kept, myName, me }: { last: LastHand; kept: Stored
 }
 
 /** The last hand's check, for "Fairness & details". */
-function LastHandDetails({ last, kept, me }: { last: LastHand; kept: StoredHand | null; me: string | null }) {
+function LastHandDetails({ last, kept, me, rules }: { last: LastHand; kept: StoredHand | null; me: string | null; rules: Rules }) {
   const [checking, setChecking] = useState(false);
-  const check = useMemo(() => checkSettledHand(last, kept, me ?? undefined), [last, kept, me]);
+  const check = useMemo(() => checkSettledHand(last, kept, me ?? undefined, rules), [last, kept, me, rules]);
   return (
     <div className="stack" data-testid="bj-hand-details">
       <div className="row-gap">

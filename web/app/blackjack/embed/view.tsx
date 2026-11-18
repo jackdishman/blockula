@@ -47,7 +47,7 @@ function Watch({ table, player, game }: { table: string; player: string | null; 
   else if (s.player?.last) {
     // A settled hand's record keeps no cards: they are recomputed here from its last link and its seed.
     const last = s.player.last;
-    const check = checkSettledHand(last);
+    const check = checkSettledHand(last, undefined, undefined, s.rules);
     if (check.ok) snapshot = snapshotOfSettled(last, { player: check.player, dealer: check.dealer });
     words = check.ok ? `${outcomeWords(last.outcome)}. ${payoutWords(last.stake, last.payout)}` : check.verdict;
   }

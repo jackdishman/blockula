@@ -3,7 +3,7 @@
 // The table's records, read from the node's storage route through the wallet's own API helper
 // (lib/explorer/node.ts: the selected node, or the page's origin in the served wallet), and kept
 // fresh: every few seconds while the tab is visible, and at once after the page's own transactions.
-import { Table, type Game, type House, type Limits, type PlayerRecord } from "@blockula/blackjack";
+import { Table, type Game, type House, type Limits, type PlayerRecord, type Rules } from "@blockula/blackjack";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { nodeGet } from "@/lib/explorer/node";
 
@@ -13,6 +13,11 @@ export const POLL_MS = 4000;
 export interface TableState {
   house: House & { height: number };
   limits: Limits;
+  /**
+   * The rules the table runs: 1, or 2 (a `blackjack2` table: the dealer opens a hand before its
+   * seed is owed, and a hand it never opens is refunded). A table's rules never change.
+   */
+  rules: Rules;
   /** The dealer has a commitment waiting for the next hand. */
   commitmentReady: boolean;
   /** The watched player's record (`null`: nobody is watched). */
@@ -36,22 +41,31 @@ export function useTable(address: string, watch: { player?: string | null; gameI
   const [error, setError] = useState<string | null>(null);
   const { player, gameId } = watch;
   const run = useRef(0);
+  // Read once a table: its rules are fixed when it is created. A read that failed is tried again.
+  const rulesOf = useMemo(() => {
+    let known: Promise<Rules> | null = null;
+    return () =>
+      (known ??= table.rules().catch((e) => {
+        known = null;
+        throw e;
+      }));
+  }, [table]);
 
   const reload = useCallback(async () => {
     const mine = ++run.current;
     try {
-      const [house, limits] = await Promise.all([table.house(), table.limits()]);
+      const [house, limits, rules] = await Promise.all([table.house(), table.limits(), rulesOf()]);
       const [commitment, record] = await Promise.all([house.nextGame < house.nextCommit ? table.commitment(house.nextGame) : null, player ? table.player(player) : null]);
       const id = gameId ?? record?.openGame ?? null;
       const game = id === null ? null : await table.game(id);
       if (mine !== run.current) return;
-      setState({ house, limits, commitmentReady: commitment !== null, player: record, game });
+      setState({ house, limits, rules, commitmentReady: commitment !== null, player: record, game });
       setError(null);
     } catch (e) {
       if (mine !== run.current) return;
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [table, player, gameId]);
+  }, [table, rulesOf, player, gameId]);
 
   useEffect(() => {
     setState(null);

@@ -78,6 +78,9 @@ export const COPY = {
     hitDoes: "Take one more card",
     standDoes: "Take no more cards and let the dealer play",
     claimDoes: "The dealer missed its deadline, so this settles the hand in the player's favor",
+    // Rules v2: a hand the dealer never opened.
+    refund: "Take the stake back",
+    refundDoes: "The dealer didn't open the hand in time, so this ends it and returns the stake",
     relayed: "This hand was bet from your table balance. What it returns goes back there.",
   },
   hand: {
@@ -208,19 +211,32 @@ export function rulesText(limits: Limits, blockMs = 1000): { title: string; body
     },
     {
       title: "Time limits",
-      body: [
-        `After your bet is in a block you have ${blocksWords(limits.seedBlocks, blockMs)} to reveal your seed. This page asks for it right away. If the seed isn't revealed in time, the bet goes to the house and no card is dealt.`,
-        "That rule costs an honest player nothing. Until you reveal your seed nobody can know a single card, you included, so holding it back is never a way out of a bad hand. Without the rule, anyone could take up seats and use up the dealer's commitments for free.",
-        `You have ${blocksWords(limits.idleBlocks, blockMs)} to move. After that your hand stands by itself. Anyone can trigger that, and the dealer then finishes the hand.`,
-        `The dealer has ${blocksWords(limits.revealBlocks, blockMs)} to reveal each card it owes. If it doesn't, you can claim the hand. It then returns two and a half times your bet if blackjack was still possible, and twice your bet if not.`,
-      ],
+      // A table that says how long the dealer has to open a hand runs rules v2: the dealer opens
+      // each hand before its seed is owed, and a hand it never opens is refunded.
+      body:
+        limits.openBlocks !== undefined
+          ? [
+              `After your bet is in a block the dealer has ${blocksWords(limits.openBlocks, blockMs)} to open your hand: it reveals the first three links of its chain, which deal nothing until your seed is known. If it doesn't, your bet comes back, and nothing else is paid. A dealer that is down costs you nothing and pays you nothing.`,
+              `Once the hand is opened you have ${blocksWords(limits.seedBlocks, blockMs)} to reveal your seed. This page asks for it right away. Your seed deals your two cards and the dealer's first card at once. If the seed isn't revealed in time, the bet goes to the house.`,
+              "That rule costs an honest player nothing. Your seed was fixed by its hash when you bet, so you can't change it once the dealer has opened the hand, and holding it back loses the bet: it is never a way out of a bad hand. Without the rule, anyone could take up seats and use up the dealer's commitments for free.",
+              `You have ${blocksWords(limits.idleBlocks, blockMs)} to move. After that your hand stands by itself. Anyone can trigger that, and the dealer then finishes the hand.`,
+              `After your seed, the dealer has ${blocksWords(limits.revealBlocks, blockMs)} to reveal each card it owes. If it doesn't, you can claim the hand. It then returns two and a half times your bet if you hold blackjack, and twice your bet if not. New bets then stop until the table's owner allows them again.`,
+            ]
+          : [
+              `After your bet is in a block you have ${blocksWords(limits.seedBlocks, blockMs)} to reveal your seed. This page asks for it right away. If the seed isn't revealed in time, the bet goes to the house and no card is dealt.`,
+              "That rule costs an honest player nothing. Until you reveal your seed nobody can know a single card, you included, so holding it back is never a way out of a bad hand. Without the rule, anyone could take up seats and use up the dealer's commitments for free.",
+              `You have ${blocksWords(limits.idleBlocks, blockMs)} to move. After that your hand stands by itself. Anyone can trigger that, and the dealer then finishes the hand.`,
+              `The dealer has ${blocksWords(limits.revealBlocks, blockMs)} to reveal each card it owes. If it doesn't, you can claim the hand. It then returns two and a half times your bet if blackjack was still possible, and twice your bet if not.`,
+            ],
     },
     {
       title: "Why the cards are fair",
       body: [
         "Before any bet, the dealer picks a secret and hashes it 32 times. It publishes only the last hash, the commitment. That fixes the whole chain.",
         "When you bet, your browser makes 32 random bytes of its own, your seed. Each card is made from the next link of the dealer's chain and your seed together, so neither side can choose a card.",
-        "A bet is two steps. First the bet goes in with only a hash of your seed, and it takes the dealer's next commitment. Then your seed is revealed. The house can't get ahead of your bet, because your seed stays hidden until your bet already holds its commitment. By the time anyone can see the seed, nothing about the hand can be changed.",
+        limits.openBlocks !== undefined
+          ? "A bet is two steps. First the bet goes in with only a hash of your seed, and it takes the dealer's next commitment. The dealer then opens the hand without having seen your seed, so it opens every hand alike, whatever its cards will be. Then your seed is revealed. By the time anyone can see the seed, nothing about the hand can be changed."
+          : "A bet is two steps. First the bet goes in with only a hash of your seed, and it takes the dealer's next commitment. Then your seed is revealed. The house can't get ahead of your bet, because your seed stays hidden until your bet already holds its commitment. By the time anyone can see the seed, nothing about the hand can be changed.",
         "The hash is tied to your account, so nobody can copy it into a bet of their own and open it.",
         "To deal a card the dealer reveals a link. The program checks that it hashes to the link before it. The dealer's hidden card is a link nobody has seen until you stand.",
         "“Check this hand” redoes all of it in your browser: the links, the cards, the outcome and what it returned.",

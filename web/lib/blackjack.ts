@@ -26,6 +26,7 @@ import {
   type LastHand,
   type Limits,
   type PlayerRecord,
+  type Rules,
   type TableEvent,
 } from "@blockula/blackjack";
 import { blocksToHuman } from "./format.ts";
@@ -127,6 +128,7 @@ export function maxBetNow(limits: Limits, house: House): bigint {
 
 /** Why no bet can be placed right now, whatever its size; null when one can. In the order the program checks. */
 export function tableProblem(c: BetContext): string | null {
+  if (c.house.tripped) return "New bets are paused: the dealer missed a deadline, and the table waits for its owner. Open hands play on.";
   if (c.house.paused) return "New bets are paused. Open hands play on.";
   if (maxBetNow(c.limits, c.house) < c.limits.minBet) return "The house's bankroll can't cover a bet right now.";
   if (BigInt(c.house.open) >= c.limits.maxOpenGames) return "The table is full. Try again when a hand finishes.";
@@ -213,6 +215,11 @@ export interface HandState {
   canMove: boolean;
   /** The dealer's deadline passed: anyone may claim the hand for the player. */
   canClaim: boolean;
+  /**
+   * Rules v2: the hand waits for the dealer to open it (its first three links, before the seed).
+   * A claim then takes the stake back, and nothing more: the dealer had seen no card.
+   */
+  unopened: boolean;
   /** The player's deadline passed: the hand stands by itself, and anyone may trigger that. */
   idle: boolean;
   countdown: Countdown;
@@ -232,7 +239,18 @@ export function handState(game: Game, me: string | null, height: number, blockMs
       : mine
         ? `Bet placed. Now reveal your seed to be dealt (step 2 of 2). You have ${cd.words} left. If the seed isn't revealed in time, the bet goes to the house.`
         : `The bet is placed. The player has ${cd.words} left to reveal their seed. Then the dealer deals.`;
-    return { mine, waitsFor: "seed", seedLate, canMove: false, canClaim: false, idle: false, countdown: cd, words };
+    return { mine, waitsFor: "seed", seedLate, canMove: false, canClaim: false, unopened: false, idle: false, countdown: cd, words };
+  }
+  if (game.phase === Phase.Open) {
+    // A v2 table: the dealer opens the hand before the seed is owed. Past its deadline the
+    // program takes no opening link any more, and the stake is the player's to take back.
+    const late = cd.passed;
+    const words = late
+      ? `The dealer didn't open the hand in time. ${mine ? "Your stake" : "The stake"} can be taken back: nothing else is paid, and no card was dealt.`
+      : mine
+        ? `Bet placed. Waiting for the dealer to open the hand… It has ${cd.words} left. Then you reveal your seed (step 2 of 2). If the dealer doesn't open it, your stake comes back.`
+        : `The bet is placed. The dealer has ${cd.words} left to open the hand. Then the player reveals their seed.`;
+    return { mine, waitsFor: "dealer", seedLate: false, canMove: false, canClaim: late, unopened: true, idle: false, countdown: cd, words };
   }
   const waitsFor = game.phase === Phase.Player ? "player" : "dealer";
   const canClaim = waitsFor === "dealer" && cd.passed;
@@ -244,7 +262,7 @@ export function handState(game: Game, me: string | null, height: number, blockMs
     else words = `${game.phase === Phase.Deal && !game.table ? "Seed revealed. " : ""}Waiting for the dealer… It has ${cd.words} left to reveal ${game.phase === Phase.Deal ? "the deal" : "the next card"}.`;
   } else if (idle) words = `${mine ? "Your" : "The player's"} time to move ran out. The hand stands by itself: anyone can trigger that, and the dealer then finishes it.${mine ? " Until someone does, you can still move." : ""}`;
   else words = `${mine ? "Your move: hit or stand. You have" : "The player's move. They have"} ${cd.words} left. After that the hand stands by itself.`;
-  return { mine, waitsFor, seedLate: false, canMove, canClaim, idle, countdown: cd, words };
+  return { mine, waitsFor, seedLate: false, canMove, canClaim, unopened: false, idle, countdown: cd, words };
 }
 
 /** What the table shows for a player, from their record and their open hand's. */
@@ -549,6 +567,8 @@ interface CheckInput {
   payout?: bigint;
   /** The cards the record shows, for an open hand: they must be the ones the links give. */
   shown?: { player: readonly number[]; dealer: readonly number[] };
+  /** The rules the hand's table runs (`TableState.rules`); 1 when left out. */
+  rules?: Rules;
 }
 
 function check(input: CheckInput, stored: StoredHand | null | undefined): HandCheck {
@@ -557,7 +577,7 @@ function check(input: CheckInput, stored: StoredHand | null | undefined): HandCh
   const hash = input.clientSeed === null ? (input.seedHash ?? null) : (kept?.seedHash ?? null);
   const base = { game: input.game, clientSeed: input.clientSeed, seedHash: hash, unrevealed: input.clientSeed === null, seed: kept ? ("yours" as const) : ("unknown" as const), stake: input.stake, outcome: input.outcome ?? null, payout: input.payout ?? null };
   try {
-    const v = verifyHand({ game: input.game, clientSeed: input.clientSeed, seedHash: kept?.seedHash, player: input.player, link: input.link, dealt: input.dealt, nPlayer: input.nPlayer, commit: kept?.commit, outcome: input.outcome, stake: input.outcome !== undefined ? input.stake : undefined, payout: input.payout });
+    const v = verifyHand({ game: input.game, clientSeed: input.clientSeed, seedHash: kept?.seedHash, player: input.player, link: input.link, dealt: input.dealt, nPlayer: input.nPlayer, commit: kept?.commit, outcome: input.outcome, stake: input.outcome !== undefined ? input.stake : undefined, payout: input.payout, rules: input.rules });
     if (input.shown && !(same(v.player, input.shown.player) && same(v.dealer, input.shown.dealer))) throw new Error("the cards on the table aren't the ones the links give");
     const commitCheck = kept?.commit ? "matches" : "unknown";
     const seedCheck = v.seedChecked ? "matches" : "unknown";
@@ -566,7 +586,9 @@ function check(input: CheckInput, stored: StoredHand | null | undefined): HandCh
       verdict =
         input.outcome === undefined
           ? "Nothing to check yet. No card is dealt until the seed is revealed. So far the chain holds only the seed's hash."
-          : "Verified. No cards were dealt: the seed was never revealed, so the bet went to the house.";
+          : v.refunded
+            ? "Verified. No cards were dealt: the dealer never opened the hand, so the stake came back."
+            : "Verified. No cards were dealt: the seed was never revealed, so the bet went to the house.";
     else if (commitCheck === "matches") verdict = `Verified. Every card comes from the dealer's commitment and ${kept ? "your" : "the player's"} seed.${seedCheck === "matches" ? " The seed is the one the bet committed to." : ""}`;
     else verdict = "The cards fit the links and the seed. This browser doesn't hold the commitment from the bet, so that last step isn't checked here.";
     return { ...base, seedCheck, ok: true, problem: null, commit: v.commit, commitCheck, steps: stepsOf(v.links, v.cards, v.player.length), player: v.player, dealer: v.dealer, playerTotal: v.playerTotal, dealerTotal: v.dealerTotal, forfeited: v.forfeited, verdict };
@@ -577,17 +599,19 @@ function check(input: CheckInput, stored: StoredHand | null | undefined): HandCh
 }
 
 /** The check of an open hand, from its record: every card so far recomputed and held to the cards the record shows. */
-export function checkOpenHand(game: Game, stored?: StoredHand | null): HandCheck {
-  return check({ game: game.id, player: game.player, clientSeed: game.clientSeed, seedHash: game.seedHash, link: game.link, dealt: game.dealt, nPlayer: game.playerCards.length, stake: game.stake, shown: { player: game.playerCards, dealer: game.dealerCards } }, stored);
+export function checkOpenHand(game: Game, stored?: StoredHand | null, rules: Rules = 1): HandCheck {
+  return check({ game: game.id, player: game.player, clientSeed: game.clientSeed, seedHash: game.seedHash, link: game.link, dealt: game.dealt, nPlayer: game.playerCards.length, stake: game.stake, shown: { player: game.playerCards, dealer: game.dealerCards }, rules }, stored);
 }
 
 /**
  * The check of a settled hand, from the player's record of it: the cards, the outcome they give
  * and what it pays. `player` is the account whose record it is. A hand whose seed never came has
- * no cards: the check is that nothing was dealt and nothing was paid.
+ * no cards: the check is that nothing was dealt and nothing was paid. `rules` are the table's
+ * (`TableState.rules`): on a v2 table a hand the dealer never opened has no cards either, and the
+ * check is that the stake came back.
  */
-export function checkSettledHand(last: LastHand, stored?: StoredHand | null, player?: string): HandCheck {
-  return check({ game: last.game, player, clientSeed: last.clientSeed, seedHash: last.seedHash, link: last.link, dealt: last.dealt, nPlayer: last.nPlayer, stake: last.stake, outcome: last.outcome, payout: last.payout }, stored);
+export function checkSettledHand(last: LastHand, stored?: StoredHand | null, player?: string, rules: Rules = 1): HandCheck {
+  return check({ game: last.game, player, clientSeed: last.clientSeed, seedHash: last.seedHash, link: last.link, dealt: last.dealt, nPlayer: last.nPlayer, stake: last.stake, outcome: last.outcome, payout: last.payout, rules }, stored);
 }
 
 /** "A♠ 10♥ (blackjack)" style: a hand's cards as text. */
@@ -618,6 +642,9 @@ export function logLine(e: TableEvent, me: string | null): string | null {
   switch (e.name) {
     case "bet":
       return `${who(e.player)} bet ${fangText(e.stake)}. Hand ${e.game}.`;
+    case "opened":
+      // Rules v2: links before the seed. They deal no card until the seed is revealed.
+      return e.phase === Phase.Seed ? "The dealer opened the hand. No card is dealt until the seed is revealed." : null;
     case "seed":
       return e.player === me ? "You revealed your seed." : "The player revealed their seed.";
     case "hit":
