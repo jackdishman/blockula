@@ -12,7 +12,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "tsc --noEmit -p tsconfig.test.json && tsx test/rules.ts && tsx test/codec.ts && tsx test/svg.ts",
+    "test": "tsc --noEmit -p tsconfig.test.json && tsx test/rules.ts && tsx test/codec.ts && tsx test/svg.ts && tsx test/properties.ts",
     "test:live": "tsx test/live.ts"
   },
   "license": "MIT",
