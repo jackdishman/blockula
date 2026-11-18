@@ -17,7 +17,7 @@ import { loadConfig, parseArgs, type DealerConfig } from "./config.js";
 import { Dealer, inspect, type Health } from "./dealer.js";
 import { checkPrivate, createDealerKey, createStoreKey, keychainStoreKey, readDealerSeed, readStoreKey } from "./keys.js";
 import { errorText, jsonLogger } from "./log.js";
-import { SeedStore } from "./store.js";
+import { SeedStore, StoreError } from "./store.js";
 
 const USAGE = `blackjack-dealer <init | run | status> [options]
 
@@ -44,6 +44,20 @@ function drops(text: string): bigint {
 
 function client(cfg: DealerConfig): Client {
   return new Client(cfg.rpc, { chainId: cfg.chainId, genesisHash: cfg.genesisHash });
+}
+
+/**
+ * The chain the node at `cfg.rpc` is on, and a client pinned to it. With `chainId` and
+ * `genesisHash` set, the node must report those. Without them (a local node), the chain the node
+ * reports now is pinned for as long as the daemon runs: a node that is later on another chain (a
+ * dev chain made again under a running daemon) is refused for every transaction, instead of
+ * being dealt to from a store that holds the old chain's secrets.
+ */
+async function pinned(cfg: DealerConfig): Promise<{ client: Client; genesisHash: string }> {
+  const status = await client(cfg).status();
+  const genesisHash = String(status.genesis_hash ?? "").toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(genesisHash) || typeof status.chain_id !== "string") throw new StoreError(`${cfg.rpc} reports no chain id and genesis hash: the dealer can't tell which chain this is`);
+  return { client: new Client(cfg.rpc, { chainId: status.chain_id, genesisHash }), genesisHash };
 }
 
 function storeKey(cfg: DealerConfig): Buffer {
@@ -80,20 +94,6 @@ async function run(cfg: DealerConfig): Promise<void> {
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
 
-  const c = client(cfg);
-  const wallet = Wallet.fromSeed(seed, c);
-  const table = Table.at(cfg.rpc, cfg.table);
-  const dealer = new Dealer(table, new WalletSender(wallet, c, cfg.table), store, log, {
-    lowWater: cfg.lowWater,
-    target: cfg.target,
-    batch: cfg.batch,
-    dryRun: cfg.dryRun,
-    keepSettled: cfg.keepSettled,
-    lowBalance: drops(cfg.lowBalance),
-    txValidBlocks: cfg.txValidBlocks,
-    fullFuel: cfg.fullFuel,
-  });
-
   // A node that isn't up yet (or a table that isn't created yet) is waited for, not a reason to exit.
   let fails = 0;
   const wait = async (what: string, e: unknown) => {
@@ -101,16 +101,42 @@ async function run(cfg: DealerConfig): Promise<void> {
     log.warn(what, { error: errorText(e), fails });
     await sleep(Math.min(cfg.pollMs * 2 ** Math.min(fails, 6), 5_000));
   };
-  for (let started = false; !started && !stopping; ) {
+  let started: Dealer | undefined;
+  while (started === undefined && !stopping) {
     try {
+      // The chain first: the store is this chain's or it isn't used, and every transaction is
+      // signed against this chain or not at all.
+      const { client: c, genesisHash } = await pinned(cfg);
+      if (store.bindChain(genesisHash)) log.info("store_bound", { chain: genesisHash.slice(0, 12), stored: store.size });
       await c.addressPrefix();
-      await dealer.start();
-      started = true;
+      const wallet = Wallet.fromSeed(seed, c);
+      const d = new Dealer(Table.at(cfg.rpc, cfg.table), new WalletSender(wallet, c, cfg.table), store, log, {
+        lowWater: cfg.lowWater,
+        target: cfg.target,
+        batch: cfg.batch,
+        dryRun: cfg.dryRun,
+        keepSettled: cfg.keepSettled,
+        lowBalance: drops(cfg.lowBalance),
+        txValidBlocks: cfg.txValidBlocks,
+        fullFuel: cfg.fullFuel,
+      });
+      await d.start();
+      started = d;
       fails = 0;
     } catch (e) {
+      // A store that is another chain's is never waited out: nothing would change it.
+      if (e instanceof StoreError) {
+        store.close();
+        throw e;
+      }
       await wait("start_failed", e);
     }
   }
+  if (started === undefined) {
+    store.close();
+    process.exit(0);
+  }
+  const dealer = started;
   while (!stopping) {
     try {
       await dealer.tick();
@@ -150,7 +176,9 @@ async function status(cfg: DealerConfig, json: boolean): Promise<void> {
   // The private files first: a key others can read is refused before anything else happens.
   const seed = readDealerSeed(cfg.keyFile);
   const store = SeedStore.open({ path: cfg.storePath, backupPath: cfg.backupPath, key: storeKey(cfg), table: cfg.table, readOnly: true });
-  const c = client(cfg);
+  const { client: c, genesisHash } = await pinned(cfg);
+  // Read only: a store that is another chain's is refused here too, and nothing is written.
+  store.bindChain(genesisHash);
   await c.addressPrefix();
   const wallet = Wallet.fromSeed(seed, c);
   const sender = new WalletSender(wallet, c, cfg.table);
