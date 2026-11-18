@@ -116,7 +116,7 @@ try {
   // ---- a configuration that ran before still runs, and is told what it trusts
   const remote = ["run", "--table", TABLE, "--allow-remote", ...PIN];
   c = load([...remote, "--rpc", "https://node.example"]);
-  assert.equal(readsText(c), "the node's word");
+  assert.match(readsText(c), /^the node's word {3}⚠ another machine's node.*--witnesses/);
   assert.deepEqual(trustNotes(c).map((n) => [n.level, n.action]), [["warn", "unproven_remote_node"]]);
   c = load([...remote, "--rpc", "http://10.0.0.5:7070"]);
   assert.deepEqual(trustNotes(c).map((n) => [n.level, n.action]), [["warn", "unproven_remote_node"], ["warn", "insecure_rpc"]]);

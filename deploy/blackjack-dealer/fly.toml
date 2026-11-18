@@ -34,6 +34,10 @@ kill_timeout = 30 # the dealer waits up to 10 s for what it sent to come back
   BJ_DEALER_ALLOW_REMOTE = "true"
   BJ_DEALER_CHAIN_ID = "blockula-demo-2"
   BJ_DEALER_GENESIS_HASH = "e712d9376917f0c9d10c164fa7c1a53fef7c8dc1c24100e7924037d0250f705e"
+  # Not set: the dealer takes the node above at its word for every hand. Once there is a second,
+  # independent node of this chain, name it here and every record is proven instead
+  # (services/blackjack/dealer/README.md, "Whom the dealer trusts"):
+  # BJ_DEALER_WITNESSES = "https://…"
 
 [mounts]
   source = "data"

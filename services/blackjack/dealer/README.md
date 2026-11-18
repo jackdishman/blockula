@@ -14,7 +14,7 @@ FANG has no value. This is a game.
 
 ## What it needs
 
-- A node of the table's chain **on this machine** (`--rpc http://127.0.0.1:…`). The daemon refuses another machine's node unless you set `allowRemote` and pin the chain (below).
+- A node of the table's chain **on this machine** (`--rpc http://127.0.0.1:…`). The daemon refuses another machine's node unless you set `allowRemote` and pin the chain (below). If the node is another machine's, name **witnesses** too ("Whom the dealer trusts", below): without them that node can have cards sent to it that nobody is owed yet.
 - The table's address (the program's `boo1…` address).
 - Its own account, named as the table's `dealer` by the owner, holding some FANG: every reveal pays a fee, and every stored commitment bonds a small deposit (about 0.02 FANG) until a bet takes it. On a local chain 1,000 hands cost the dealer under 10 FANG in all. `status` warns when the balance is under `lowBalance`.
 - Node 22 or newer.
@@ -78,6 +78,9 @@ Each setting can be a flag, an environment variable, or a key in a JSON file (`-
 | `allowRemote` | `--allow-remote` | `BJ_DEALER_ALLOW_REMOTE` | false | Let `rpc` be another machine's node. Needs `chainId` and `genesisHash`. |
 | `chainId` | `--chain-id` | `BJ_DEALER_CHAIN_ID` | not pinned | The chain id the node must report. |
 | `genesisHash` | `--genesis-hash` | `BJ_DEALER_GENESIS_HASH` | not pinned | The genesis hash the node must report. |
+| `witnesses` | `--witnesses` | `BJ_DEALER_WITNESSES` | none | Other nodes of the same chain, with commas between them (a list in the JSON file). With any, every record the dealer acts on is read with its Merkle proof and its state root must be confirmed by them ("Whom the dealer trusts"). Not the node itself, none twice; one on another machine must be `https` and needs the chain pinned. |
+| `witnessQuorum` | `--witness-quorum` | `BJ_DEALER_WITNESS_QUORUM` | all of them | How many witnesses must confirm each state root. One that reports a *different* root stops the read whatever this is. |
+| `proofMaxLagBlocks` | `--proof-max-lag-blocks` | `BJ_DEALER_PROOF_MAX_LAG_BLOCKS` | 10 | How far behind the witnesses' newest block a proof may be before it is refused as old. |
 | `keychain` | `--keychain` | `BJ_DEALER_KEYCHAIN` | false | macOS: read the store's key from the keychain instead of `secretFile`. |
 | `keychainService` | `--keychain-service` | `BJ_DEALER_KEYCHAIN_SERVICE` | `blockula-blackjack-dealer` | The keychain item's service. |
 | `keychainAccount` | `--keychain-account` | `BJ_DEALER_KEYCHAIN_ACCOUNT` | the table's address | The keychain item's account. |
@@ -85,6 +88,33 @@ Each setting can be a flag, an environment variable, or a key in a JSON file (`-
 How many commitments to keep: a bet is refused (abort 53) when none is left, so `lowWater` should cover the bets the table can take while the daemon is down or a batch is on its way. Each unused commitment holds a small deposit of the dealer's.
 
 Pin the chain (`chainId`, `genesisHash`) whenever the node isn't a throwaway local one: the daemon then refuses a node that reports another chain.
+
+## Whom the dealer trusts
+
+The daemon reveals the links a hand's record says it is owed, and a link is public the moment it is sent. So whoever answers the daemon's reads decides what it reveals. A node that lies ("the player stood", "the seed is revealed", "someone bet on the next commitment") is sent cards nobody is owed yet, in a transaction it can simply keep: the hole card, the next draw, or the whole deal of a hand not yet bet, for which it can then pick the seed that wins. [docs/proposals/blackjack-card-privacy.md](../../../docs/proposals/blackjack-card-privacy.md) has the detail; the tests in `test/privacy.ts` do it.
+
+An honest node learns nothing early. This is about a node that lies: its operator, whoever took it over, or with plain `http` anyone on the path.
+
+Two ways to be safe from it:
+
+1. **Run the node on the dealer's machine.** This is the default (the daemon refuses any other), and it needs nothing else. Your node checks every block as it syncs.
+2. **Name witnesses.** When the node is another machine's (`allowRemote`), give the daemon other nodes of the same chain:
+
+   ```bash
+   blackjack-dealer run --rpc https://node.example --allow-remote --chain-id … --genesis-hash … \
+     --witnesses https://witness-one.example,https://witness-two.example
+   ```
+
+   Every record is then read with its Merkle proof (`GET /api/proof/69/…`), and the proof's state root must be the one each witness reports for that block (`GET /api/block/{height}`). A record that isn't proven that way is never acted on, so a lying node needs every witness to lie with it. A witness is asked only for its height and for block headers: it learns nothing about the table.
+
+What to know about witnesses:
+
+- **They must really be someone else's, or somewhere else.** A node you run on another machine is a fine witness (a home machine is enough). Two addresses of one machine are no witness at all; the daemon can only refuse a witness with the node's own address.
+- **If they can't confirm, the dealer deals nothing.** A witness that is down or behind for more than a few seconds fails the read (`tick_failed`), and it is tried again. While that lasts no hand is dealt, and a hand past its deadline pays its player. With three witnesses and `witnessQuorum` 2, one may be down.
+- **A witness that disagrees stops everything**, whatever the quorum, and the log says `node_disagreement` at level `error`. The node or that witness is wrong: find out which before trusting either.
+- **What it doesn't cover.** The node can still drop the dealer's transactions (the hand then times out in the player's favour); a transaction's status and the dealer's balance are still the node's word, which can cost time but can't cause a reveal.
+
+Without witnesses the daemon behaves exactly as it did. On a remote node it now says so once at its start (`unproven_remote_node`, and `insecure_rpc` over plain `http`); `status` shows how reads are trusted on its `reads` line.
 
 ## The seed store, and backing it up
 
@@ -159,7 +189,10 @@ One JSON object a line on standard output: `time`, `level`, `action`, and what i
 | `timeout` with `turn: "player"`, `stood: "idle"` | A player let their time to move pass; the hand was stood and is dealt to its end. |
 | `past_deadline` (warn) | A hand the dealer owes cards on is past its deadline. It is still dealt if nobody has called `timeout` yet. Find out why the daemon was late. |
 | `low_balance` (warn) | Send the dealer FANG. |
-| `tick_failed`, `start_failed` (warn) | The node didn't answer. Retried, with a wait of at most 5 seconds. |
+| `tick_failed`, `start_failed` (warn) | The node didn't answer. Retried, with a wait of at most 5 seconds. With witnesses: also a root the witnesses couldn't confirm in time (one is down or behind), or a proof that is too old. Nothing is revealed until a read succeeds. |
+| `proven_reads` | At the start, with witnesses: how many, the quorum, and `max_lag_blocks`. |
+| `unproven_remote_node`, `insecure_rpc` (warn) | At the start: the node is another machine's and no witness is named, or it is reached over plain `http`. See "Whom the dealer trusts". |
+| `node_disagreement` (error) | With witnesses: the node's proof didn't check (`kind: "bad_proof"`), or a witness has another state root for that block (`kind: "disagreement"`). Nothing was made of the answer and nothing was revealed. Someone is lying or broken: look. |
 | `lost_secrets`, `hand_without_secret`, `secrets_mismatch` (error) | The store lacks secrets the table holds commitments for: see "If the store is lost for good". |
 | `hand_without_seed` (error) | A hand the dealer owes cards on shows no seed. The program never stores one that way: the node's answer is wrong. Nothing is revealed for it. |
 | `not_the_dealer` (error) | The key isn't the table's dealer: the owner calls `set_dealer`. |
@@ -180,7 +213,7 @@ One JSON object a line on standard output: `time`, `level`, `action`, and what i
 - [ ] The key file, the secret file and the backup path are backed up off the machine, and a restore has been tried (`status` shows no ⚠).
 - [ ] `backupPath` is on another disk than `storePath`.
 - [ ] `status` shows the address is the table's dealer, a balance well over `lowBalance`, and `unused` ≥ `lowWater`.
-- [ ] The chain is pinned (`chainId`, `genesisHash`), and `rpc` is a node on this machine that you run.
+- [ ] The chain is pinned (`chainId`, `genesisHash`), and `rpc` is a node on this machine that you run. If it can't be: `witnesses` names at least one node that is independent of it, `status` shows `reads  proven`, and the start of the log has `proven_reads` and no `unproven_remote_node`.
 - [ ] `pollMs` is under the block time; the table's `reveal_blocks` leaves room for a restart (a restart takes a few seconds; the default 150 blocks is minutes).
 - [ ] The daemon runs under a supervisor that restarts it (launchd, systemd), with its output kept. One daemon a table.
 - [ ] Something watches the log for `level: "error"`, `past_deadline` and `low_balance`, the process for restarts, and the table's `settled` events for outcomes 6 and 7 (the dealer missed a deadline). Outcome 8 (a seed that never came) is no alarm.
@@ -197,7 +230,7 @@ One JSON object a line on standard output: `time`, `level`, `action`, and what i
 | `Dockerfile`, `Dockerfile.dockerignore` | Builds the SDK, `@blockula/blackjack` and this package from the checkout; the image holds the built JS and the locked production dependencies, and the dealer runs as `node`. |
 | `entrypoint.sh` | Starts as root only to own `/data`, puts the first boot's secrets into files, waits at the start gate, then runs `blackjack-dealer run` as `node`. |
 
-The node is another machine's, so the chain is pinned and `allowRemote` is set (see "Settings"). Everything lives on the volume: `/data/dealer-key.json`, `/data/store-secret.json`, `/data/seeds.enc.json` and its backup `/data/seeds.enc.json.backup`. The backup is on the same disk as the store there, so **copy the key file, the secret file and the backup off the machine yourself** (the backup after every batch, or on a schedule): a lost volume is a lost store.
+The node is another machine's, so the chain is pinned and `allowRemote` is set (see "Settings"). As deployed it names no witness, so it takes that node's word for every hand: set `BJ_DEALER_WITNESSES` in `fly.toml`'s `[env]` once there is a second node of the chain to name ("Whom the dealer trusts"). Everything lives on the volume: `/data/dealer-key.json`, `/data/store-secret.json`, `/data/seeds.enc.json` and its backup `/data/seeds.enc.json.backup`. The backup is on the same disk as the store there, so **copy the key file, the secret file and the backup off the machine yourself** (the backup after every batch, or on a schedule): a lost volume is a lost store.
 
 **The start gate.** The entrypoint deals nothing until `/data/ready` exists; until then it logs `waiting for /data/ready` every 15 seconds. That is what lets a table move here without two dealers ever running on it:
 
@@ -238,7 +271,8 @@ fly secrets unset -a blockula-blackjack-dealer --stage DEALER_KEY_JSON STORE_SEC
 ## Tests
 
 ```bash
-npm test -w @blockula/blackjack-dealer          # offline: the store, the configuration, the dealer against a table in memory
+npm test -w @blockula/blackjack-dealer          # offline: the store, the configuration, the dealer against a table in memory, and a node that lies (test/privacy.ts)
 TEST=live scripts/blackjack-e2e.sh              # the daemon as a child process on a local chain: 30 hands, SIGKILL mid-hand, a seed that never comes
+TEST=live WITNESSES=1 scripts/blackjack-e2e.sh  # the same with proven reads: proofs from one validator, the others as witnesses
 HANDS=60 scripts/blackjack-e2e.sh               # the soak on 4 local validators (1,000 hands by default)
 ```

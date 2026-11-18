@@ -88,6 +88,14 @@ try {
   assert.ok(!r.out.includes(seed));
   r = run(["status"], { BJ_DEALER_DIR: home, BJ_DEALER_TABLE: TABLE, BJ_DEALER_RPC: "http://10.1.2.3:7070", BJ_DEALER_ALLOW_REMOTE: "true" });
   assert.match(r.out, /needs the chain pinned/);
+  // Witnesses are checked before anything is touched, as flags or from the environment.
+  r = run(["run", ...base, "--rpc", "http://127.0.0.1:38399", "--witnesses", "http://127.0.0.1:38399/"]);
+  assert.equal(r.code, 1);
+  assert.match(r.out, /the dealer's own node/);
+  r = run(["status", ...base, "--rpc", "http://127.0.0.1:38399"], { BJ_DEALER_WITNESSES: "http://10.1.2.3:7070" });
+  assert.equal(r.code, 1);
+  assert.match(r.out, /must be https/);
+  assert.match(run([]).out, /--witnesses URLS/);
   // No command: the usage, and a non-zero exit for one it doesn't know.
   assert.match(run([]).out, /blackjack-dealer <init \| run \| status>/);
   assert.equal(run(["deal"]).code, 2);

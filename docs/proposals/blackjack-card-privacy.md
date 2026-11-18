@@ -1,7 +1,8 @@
 # Blackjack: card privacy from the dealer's node (audit finding M-4)
 
 Status: proposed, and implemented behind a setting that is off by default (`witnesses`).
-Nothing on a chain changes: not the table program, not consensus, not any wire format.
+Nothing on a chain changes: not the table program, not consensus, not any wire format. The
+offline tests and the node's tests pass; the live run in section 7 has not been run yet.
 
 ## 1. The problem
 
@@ -227,9 +228,13 @@ A disagreement still stops everything.
 
 ### 4.6 The sender
 
-The `Client` the dealer signs with is given the same witnesses, so the SDK proves the program's
-record (the version digest a call binds) and refuses a signing height ahead of the witnesses'
-heads. Neither is about cards; both come free with the setting.
+The sender is unchanged: the dealer still signs against, and submits to, its one node. The SDK
+could be given the same witnesses (it would then prove the program's record and refuse a signing
+height ahead of theirs), and it is left out on purpose. Neither check is about cards: a wrong
+version digest only gets the call refused, and a reveal held back and released late carries
+links that were owed when it was signed. And the SDK needs every witness to answer every time,
+which would quietly undo `witnessQuorum`: with one of three down, reads would pass and every
+send would fail.
 
 ### 4.7 Settings (all new, all optional)
 
@@ -281,7 +286,7 @@ nothing a deployed dealer does.
 Offline, in `npm test -w @blockula/blackjack` and `npm test -w @blockula/blackjack-dealer`:
 
 - **The reader** (`core/test/proven.ts`): a record and an absence are read from proofs made by
-  an independent prover; an altered value, an altered root, a proof for another key, another
+  an independent prover (`@blockula/blackjack/testing`, written from the tree's definition); an altered value, an altered root, a proof for another key, another
   program or another namespace, a malformed stored entry and a stale proof are each refused;
   witnesses that are behind are waited for, a quorum is honoured, a disagreeing witness is never
   outvoted, roots are confirmed once per height.
@@ -300,18 +305,33 @@ Offline, in `npm test -w @blockula/blackjack` and `npm test -w @blockula/blackja
   including the errors a bad proof produces.
 - **Configuration**: the new settings, their refusals and the two warnings.
 
+Against the node's own code, in `cargo test`: the reader depends on two things the node
+defines, and each is pinned by a test on the node's side.
+
+- **The stored entry and its tree key.** `programs::state::tests` writes and checks
+  `services/blackjack/core/test/storage-vectors.json`: what `/api/proof` answers for two program
+  storage entries and an absent one. `core/test/proven.ts` reads them through `ProvenTable`. If
+  the node's encoding of an entry changes, the Rust test fails and says the reader must change.
+- **What a block's `state_root` is the root of.** The node's API test
+  (`proofs_verify_against_the_state_root`) now asserts that a proof's root is the `state_root`
+  of the block at the proof's height, which is what a witness is asked for.
+
 Live, on a local chain of real nodes (`TEST=live WITNESSES=1 scripts/blackjack-e2e.sh`): the
 daemon as a child process reading proofs from one validator with the others as witnesses, the
-same 30 hands, kill and restart, and timeouts as the existing live test. This is what holds the
-stored-entry format and the meaning of a block's `state_root` to the real node.
+same 30 hands, kill and restart, and timeouts as the existing live test; and while the hands
+are played, every record read both ways at one height must be equal.
 
 ## 8. Rollout
 
-1. Merge: nothing changes for a running dealer.
+0. Before merging: run `TEST=live WITNESSES=1 scripts/blackjack-e2e.sh` (about three minutes;
+   it needs the node built, `cargo build --release` in `node/`).
+1. Merge. A running dealer deals as it did; one on a remote node logs `unproven_remote_node`
+   once at its next start.
 2. Stand up or choose a witness for the table's chain. For the demo chain, a full node on any
    machine the owner controls (`blockula join`), reachable over `https`.
 3. `status --witnesses …` against the live table: it reads everything through proofs and sends
-   nothing. Then `run --dry-run --witnesses …` beside the running dealer for a while (a dry run
-   takes no lock on the live store only if pointed at its own directory; use a copy).
+   nothing. Then `run --dry-run --witnesses …` for a while, from another directory holding a
+   copy of the key and secret files (a dry run sends nothing and writes no secret, but the live
+   store is locked by the running dealer).
 4. Set `BJ_DEALER_WITNESSES` on the deployed dealer and restart it at a quiet moment.
 5. Watch for `node_disagreement` (an alarm) and `tick_failed` (a witness that is down).

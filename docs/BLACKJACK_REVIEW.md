@@ -373,6 +373,15 @@ to run that node yourself. Executed state on this chain is final, so a truthful 
 doesn't revert. With the fix the daemon never reveals for a hand whose seed isn't on the
 chain (`services/blackjack/dealer/src/dealer.ts:357`). **Accepted.**
 
+*Later (audit M-4).* The deployed dealer talks to another machine's node, where this is no
+longer only informational: besides the phase, a node can report a hand on a commitment nobody
+has bet on, be sent its first links, and then choose the seed that wins.
+[proposals/blackjack-card-privacy.md](proposals/blackjack-card-privacy.md) has the cases, and
+the daemon now has an answer that is off unless asked for: with `witnesses`, every record it
+acts on is read with its Merkle proof against a state root that other nodes confirm
+(`services/blackjack/core/src/proven.ts`; `services/blackjack/dealer/test/privacy.ts` shows the
+leak without it and none with it).
+
 ### BJ-12 (Info): the seed lives in the browser
 
 Between the two transactions the seed's secrecy matters, and it sits in the page's

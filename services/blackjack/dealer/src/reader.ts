@@ -21,7 +21,7 @@ export function tableReader(cfg: DealerConfig, node: Client): Table {
 /** How the reads are trusted, for `status` and the log. */
 export function readsText(cfg: DealerConfig): string {
   const n = cfg.witnesses.length;
-  if (n === 0) return isLocalRpc(cfg.rpc) ? "the node's word (a node on this machine)" : "the node's word";
+  if (n === 0) return isLocalRpc(cfg.rpc) ? "the node's word (a node on this machine)" : "the node's word   ⚠ another machine's node, and nothing it says is checked: name witnesses (--witnesses)";
   return `proven: each record's Merkle proof, its state root confirmed by ${cfg.witnessQuorum ?? n} of ${n} witness${n === 1 ? "" : "es"}`;
 }
 
