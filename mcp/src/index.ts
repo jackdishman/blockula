@@ -55,7 +55,7 @@ import { PIN_FILE, REPO, RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVeri
 import { SignedTxs, onChain, type SignedTx } from "./signed.js";
 import { SpendLedger, chainKey } from "./spend.js";
 import { MULTISIG_NOTE, boundedTransfer, cliApprove, parseMultisig, paysAddress, pendingView, reviewUrl, sharedView, votedProposal, type Pending, type Shared } from "./multisig.js";
-import { PROGRAM_NOTE, SERVER_INSTRUCTIONS, UNTRUSTED_NOTE, chainData, clean, codeView, programView, provenDifferences, viewView } from "./untrusted.js";
+import { PROGRAM_NOTE, SERVER_INSTRUCTIONS, UNTRUSTED_NOTE, chainData, clean, codeView, programView, provenDifferences, txFacts, viewView } from "./untrusted.js";
 
 const HOME = process.env.BLOCKULA_HOME ?? join(homedir(), ".blockula");
 const WALLET_FILE = join(HOME, "agent-wallet.json");
@@ -324,12 +324,22 @@ const BAD_NONCE = /bad nonce: expected (\d+), got (\d+)/i;
  * it's one tx, so at most one copy runs. A nonce another tx really took gets the same refusal
  * each time, and that one is answered.
  */
+/**
+ * Whether the node said it refused a request: a 4xx answer, except 408. A node answers 408 when
+ * its own request timeout fires, which on a full node is after it admitted the tx and while it
+ * was still forwarding it to a validator: such a tx may run, so it is never "refused" (the SDK
+ * draws the same line).
+ */
+function refusedByNode(e: unknown): e is ApiError {
+  return e instanceof ApiError && e.status >= 400 && e.status < 500 && e.status !== 408;
+}
+
 async function submitPatiently(client: Client, tx: Tx) {
   for (let attempt = 1; ; attempt++) {
     try {
       return await client.submit(tx, false);
     } catch (e) {
-      const m = e instanceof ApiError && e.status >= 400 && e.status < 500 ? BAD_NONCE.exec(e.message) : null;
+      const m = refusedByNode(e) ? BAD_NONCE.exec(e.message) : null;
       if (!m || Number(m[2]) !== tx.nonce || Number(m[1]) <= tx.nonce || attempt >= 4) throw e;
       await new Promise((r) => setTimeout(r, 300 * attempt));
     }
@@ -395,7 +405,7 @@ async function submitCapped(w: Wallet, action: Action, spend: Spend, memo = ""):
       // The node says it refused it. An honest node then never relayed it, but a lying one can say
       // so and relay it anyway, so the reservation stays: the next tx this MCP signs with the same
       // nonce (after a real refusal, the node's next nonce didn't move) takes the slot over.
-      if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
+      if (refusedByNode(e)) {
         NONCES.settled(lockKey, tx.nonce);
         // Signed past the node's nonce, and refused for it: the node is behind, or a tx this MCP
         // counted on was dropped. Its view is used next time.
@@ -526,8 +536,11 @@ const recipientView = (r: Recipient, role: string) =>
   r.name === null ? {} : r.byChain ? { [`${role}_signed_as`]: r.signed, [`${role}_owner_now_unproven`]: r.address, name_resolution: clean(r.how, 400) } : { [`${role}_address`]: r.address, name_resolution: clean(r.how, 300) };
 
 /** A tx tool's answer: the tx's summary and links, or the in-flight notice. */
-const txResult = (r: any, extra: Record<string, unknown> = {}) =>
-  isInFlight(r) ? r : { summary: clean(String(r.summary ?? "")), fee: r.fee_display, tx_id: r.id, block: r.height, ...extra, explorer: explorer(`tx/${r.id}`) };
+const txResult = (r: any, extra: Record<string, unknown> = {}) => {
+  if (isInFlight(r)) return r;
+  const facts = txFacts(r);
+  return { summary: clean(String(r.summary ?? "")), ...facts, ...extra, explorer: explorer(`tx/${facts.tx_id ?? ""}`) };
+};
 
 const server = new McpServer({ name: "blockula", version: VERSION }, { instructions: SERVER_INSTRUCTIONS });
 
@@ -790,8 +803,9 @@ function inBlock(tx: any, link: string): Record<string, unknown> {
   const status = String(tx.status);
   const summary = clean(String(tx.summary ?? ""));
   const error = tx.error ? { error: clean(String(tx.error)) } : {};
-  if (status === "finalized") return { status, summary, ...error, block: tx.height, fee: tx.fee_display, explorer: link };
-  return { status, summary, ...error, block: tx.height, fee: tx.fee_display, next: `It ran${typeof tx.height === "number" ? ` in block ${tx.height}` : ""} and failed, so its fee was charged and nothing else happened. That's final.`, explorer: link };
+  const { block, fee } = txFacts(tx);
+  if (status === "finalized") return { status, summary, ...error, block, fee, explorer: link };
+  return { status, summary, ...error, block, fee, next: `It ran${block !== undefined ? ` in block ${block}` : ""} and failed, so its fee was charged and nothing else happened. That's final.`, explorer: link };
 }
 
 /**
@@ -1477,14 +1491,12 @@ tool(
       status: "finalized",
       summary: clean(String(r.summary ?? "")),
       ...called,
-      fee: r.fee_display,
-      tx_id: r.id,
-      block: r.height,
+      ...txFacts(r),
       receipt: chainData(r.program ?? null),
       receipt_checked: checked,
       receipt_is: "facts (outcome, balance changes, storage, fuel, fee) are what the chain applied; claims (untrusted_data, untrusted_method, untrusted_name) are what the program says, which the chain checks none of",
       note: `${PROGRAM_NOTE} ${NO_PROMPTED_CALLS}`,
-      explorer: explorer(`tx/${r.id}`),
+      explorer: explorer(`tx/${txFacts(r).tx_id ?? ""}`),
     };
   },
 );
@@ -1608,7 +1620,7 @@ tool("vote", "Vote on a governance proposal for the account this agent acts for.
   }
   const voted_on = { untrusted_title: clean(String(p.title ?? ""), 200), does: clean(describeKind(p.kind, { freeText: false }), 600), kind: chainData(p.kind), proposal_digest };
   const r = await submitCapped(w, { type: "vote", proposal_id, aye: vote === "aye", amount: drops.toString(), conviction, proposal_digest }, { amount: 0n, perCall: drops, what: "the vote's amount" });
-  return isInFlight(r) ? { ...r, voted_on } : { summary: clean(String(r.summary ?? "")), fee: r.fee_display, tx_id: r.id, voted_on, explorer: explorer(`proposal/${proposal_id}`) };
+  return isInFlight(r) ? { ...r, voted_on } : { summary: clean(String(r.summary ?? "")), fee: txFacts(r).fee, tx_id: txFacts(r).tx_id, voted_on, explorer: explorer(`proposal/${proposal_id}`) };
 });
 
 // ---- shared accounts (the chain's M-of-N multisig; docs/GOVERNANCE.md "Multisig accounts") ----
@@ -1832,14 +1844,14 @@ tool("link_github", "Link a GitHub handle to the account this agent acts for, so
   const r = await submitCapped(w, { type: "link_github", handle, gist_id }, { amount: 0n });
   if (isInFlight(r)) return r;
   const check = await w.client.github(handle).catch(() => null);
-  return { summary: clean(String(r.summary ?? "")), tx_id: r.id, verified: check?.verified === true, ...(check?.verified === true ? {} : { next: `The link is on chain, but this node can't verify the gist yet${check?.reason ? ` (${clean(String(check.reason), 200)})` : ""}. Validators check it for every contribution claim, so fix it before submit_contribution.` }), explorer: explorer(`tx/${r.id}`) };
+  return { summary: clean(String(r.summary ?? "")), tx_id: txFacts(r).tx_id, verified: check?.verified === true, ...(check?.verified === true ? {} : { next: `The link is on chain, but this node can't verify the gist yet${check?.reason ? ` (${clean(String(check.reason), 200)})` : ""}. Validators check it for every contribution claim, so fix it before submit_contribution.` }), explorer: explorer(`tx/${txFacts(r).tx_id ?? ""}`) };
 });
 
 tool("fund_hunt", described(`Add FANG to an open Hunt's bounty (crowdfunding). Refunded to you if the hunt is cancelled.`), { hunt_id: z.number().int().min(0), amount: z.string() }, async ({ hunt_id, amount }) => {
   const drops = amountArg(amount);
   if (drops <= 0n) throw new Error("fund more than 0");
   const r = await submitCapped(await requireWallet(), { type: "fund_hunt", hunt_id, amount: drops.toString() }, { amount: drops, outflow: drops });
-  return isInFlight(r) ? r : { summary: clean(String(r.summary ?? "")), fee: r.fee_display, tx_id: r.id, explorer: explorer(`hunt/${hunt_id}`) };
+  return isInFlight(r) ? r : { summary: clean(String(r.summary ?? "")), fee: txFacts(r).fee, tx_id: txFacts(r).tx_id, explorer: explorer(`hunt/${hunt_id}`) };
 });
 
 tool("contribution_pool", described(`Blockula's contribution pool (Proof of Contribution): its balance, which GitHub repos earn from it, the rules, and the Séance (review jury) that's open now. Merged PRs to pool repos can be claimed for a share; payouts are judged by human juries, rate a sponsor's claims in a Séance together (one pooled win rate; each next a quarter of the one before), and vest over ~90 days.`), {}, async () => {
@@ -1879,7 +1891,7 @@ tool(
     if (isInFlight(r)) return r;
     const claims = await w.client.claims({ account: w.account }).catch(() => null);
     const claim = (Array.isArray(claims?.claims) ? claims.claims : []).find((c: { repo: string; pr: number }) => c.repo === repo.toLowerCase() && c.pr === pr);
-    return { summary: clean(String(r.summary ?? "")), tx_id: r.id, claim_id: claim?.id, status: claim ? clean(String(claim.status)) : undefined, next: "Validators check GitHub within a minute or two; then it waits for the revert window and the next Séance. Track it with my_contributions.", note: NO_VALUE, explorer: explorer(`claim/${claim?.id ?? ""}`) };
+    return { summary: clean(String(r.summary ?? "")), tx_id: txFacts(r).tx_id, claim_id: safeInt(claim?.id), status: claim ? clean(String(claim.status)) : undefined, next: "Validators check GitHub within a minute or two; then it waits for the revert window and the next Séance. Track it with my_contributions.", note: NO_VALUE, explorer: explorer(`claim/${safeInt(claim?.id) ?? ""}`) };
   },
 );
 

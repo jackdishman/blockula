@@ -19,7 +19,7 @@
 // the sum over every chain, and `chains` holds each chain's part. What `spent` holds beyond the
 // chains' parts (a 0.5.1 file, or one 0.5.1 wrote back without `chains`) can't be placed on a
 // chain, so it counts toward every chain's total: migrating never under-counts today's spend.
-import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { formatFang } from "@blockula/sdk";
 import { CHAIN_ID } from "./network.js";
@@ -62,6 +62,30 @@ interface Day {
 /** A lock older than this is a crashed server's: it's taken over. */
 const STALE_LOCK_MS = 10_000;
 const sleep = new Int32Array(new SharedArrayBuffer(4));
+
+/**
+ * Removes the ledger's lock file `lock` if it is older than `staleMs` (its holder died), and only
+ * then. Two servers can judge the same dead lock at once: the first removes it and a third makes
+ * a fresh one, and deleting by name would then delete that fresh lock, leaving two servers
+ * rewriting the ledger at once (one reservation lost, the day's limit under-counted). So the lock
+ * is moved aside first (one rename of it succeeds; a lock that's gone throws, and the caller
+ * tries again), and what was moved is looked at: a lock that isn't old is put back. As in
+ * `locks.ts` (`takeOver`). Returns whether a stale lock was removed.
+ */
+export function takeOverStale(lock: string, staleMs: number): boolean {
+  const grave = `${lock}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.stale`;
+  renameSync(lock, grave);
+  try {
+    if (Date.now() - statSync(grave).mtimeMs > staleMs) return true;
+    // A live lock: back where it was, unless another one was made meanwhile.
+    linkSync(grave, lock);
+  } catch {
+    /* a new lock is there already: this one is dropped with the grave */
+  } finally {
+    rmSync(grave, { force: true });
+  }
+  return false;
+}
 
 const slotKey = (s: NonceSlot) => {
   if (!s.account || !Number.isSafeInteger(s.nonce) || s.nonce < 0) throw new Error("a nonce slot needs an account and a whole-number nonce");
@@ -150,7 +174,7 @@ export class SpendLedger {
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
         try {
-          if (Date.now() - statSync(lock).mtimeMs > STALE_LOCK_MS) rmSync(lock, { force: true });
+          if (Date.now() - statSync(lock).mtimeMs > STALE_LOCK_MS) takeOverStale(lock, STALE_LOCK_MS);
         } catch {
           /* it went away */
         }
