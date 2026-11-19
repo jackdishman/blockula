@@ -3641,39 +3641,77 @@ mod http_tests {
 
     /// Readers hammering the API don't hold up execution: blocks keep executing at their own
     /// pace while four threads read as fast as they can.
+    ///
+    /// Nothing here races the clock. The measurement starts only once every reader has answered
+    /// a request, and it goes on (40 blocks at least) until every reader has answered again and
+    /// the readers have answered `MIN_READS` requests between them inside the measured window, so
+    /// the blocks that are timed really were executed alongside reads however fast they execute.
     #[test]
     fn heavy_reads_dont_slow_block_execution() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        const URIS: [&str; 4] = ["/api/status", "/api/blocks", "/api/mempool", "/api/validators"];
+        // Blocks measured at least, and reads the readers must complete while they're measured.
+        const MIN_BLOCKS: usize = 40;
+        const MIN_READS: usize = 40;
+        // Bounds on the waits, so a reader that never reads fails the test instead of hanging it.
+        const MAX_BLOCKS: usize = 20_000;
+        const PATIENCE: Duration = Duration::from_secs(10);
+        // Stops the readers however the test ends, so a failure leaves none hammering the node.
+        struct StopOnDrop(Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
         let (root, n) = node("hammer");
         let stop = Arc::new(AtomicBool::new(false));
-        let reads = Arc::new(AtomicUsize::new(0));
+        let _stopper = StopOnDrop(stop.clone());
+        let reads: Vec<Arc<AtomicUsize>> = URIS.iter().map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let counts = || reads.iter().map(|r| r.load(Ordering::Relaxed)).collect::<Vec<_>>();
         let mut threads = vec![];
-        for i in 0..4 {
+        for (uri, reads) in URIS.into_iter().zip(&reads) {
             let (n, stop, reads) = (n.clone(), stop.clone(), reads.clone());
             threads.push(std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 while !stop.load(Ordering::Relaxed) {
-                    let uri = ["/api/status", "/api/blocks", "/api/mempool", "/api/validators"][i];
                     let (s, _, _) = rt.block_on(call(&n, "GET", uri, None, "127.0.0.1:1"));
                     assert_eq!(s, StatusCode::OK);
                     reads.fetch_add(1, Ordering::Relaxed);
                 }
             }));
         }
-        let mut took = vec![];
-        for _ in 0..40 {
+        // Every reader is up and answering before anything is measured.
+        let waiting = Instant::now();
+        while counts().contains(&0) {
+            assert!(!threads.iter().any(|t| t.is_finished()), "a reader stopped before the measurement: reads per reader {:?}", counts());
+            assert!(waiting.elapsed() < PATIENCE, "the readers didn't all answer within {PATIENCE:?}: reads per reader {:?}", counts());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Measure every block until the readers have provably read alongside them.
+        let before = counts();
+        let during = || counts().iter().zip(&before).map(|(now, then)| now - then).collect::<Vec<_>>();
+        let overlapped = |d: &[usize]| d.iter().all(|r| *r > 0) && d.iter().sum::<usize>() >= MIN_READS;
+        let (mut took, measuring) = (vec![], Instant::now());
+        while took.len() < MIN_BLOCKS || (!overlapped(&during()) && took.len() < MAX_BLOCKS && measuring.elapsed() < PATIENCE) {
             let t = Instant::now();
             n.chain.lock().produce_block_with(vec![]).unwrap();
             took.push(t.elapsed());
         }
+        // Counted before the readers are told to stop: these reads finished inside the window.
+        let (during, window) = (during(), measuring.elapsed());
         stop.store(true, Ordering::Relaxed);
         for t in threads {
             t.join().unwrap();
         }
         took.sort();
-        let (median, worst) = (took[took.len() / 2], *took.last().unwrap());
-        println!("40 blocks under {} concurrent reads: median {median:?}, worst {worst:?}", reads.load(Ordering::Relaxed));
-        assert!(reads.load(Ordering::Relaxed) >= 40, "the readers ran alongside execution");
+        let (blocks, median, worst) = (took.len(), took[took.len() / 2], *took.last().unwrap());
+        let total: usize = during.iter().sum();
+        println!("{blocks} blocks under {total} concurrent reads ({during:?} per reader, in {window:?}): median {median:?}, worst {worst:?}");
+        assert!(
+            overlapped(&during),
+            "the readers didn't run alongside execution: {total} reads (per reader {during:?}) while {blocks} blocks executed in {window:?}; \
+             every reader must complete one and all of them {MIN_READS}"
+        );
         assert!(worst < Duration::from_secs(2), "a block took {worst:?} to execute under read load");
         std::fs::remove_dir_all(root).ok();
     }
