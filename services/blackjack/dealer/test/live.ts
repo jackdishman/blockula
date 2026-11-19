@@ -12,7 +12,8 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_LIMITS, DROPS_PER_FANG, Outcome, Phase, Table, call, createTable, dealers } from "@blockula/blackjack";
+import { DEFAULT_LIMITS, DROPS_PER_FANG, Outcome, Phase, Table, call, createTable, dealers, storageKey } from "@blockula/blackjack";
+import { ProvenTable } from "@blockula/blackjack/proven";
 import { Client, Wallet } from "@blockula/sdk";
 import { Daemon, Watcher, abortOf, cli, guest, localRpc, placeBet, playHand, playOut, sleep, sure, until, waitPast, type Play, type Played, type Seat } from "./harness.js";
 
@@ -38,7 +39,12 @@ try {
   const [owner, alice, bob, carol, stranger] = await Promise.all([wallet(4), wallet(1), wallet(1), wallet(1), wallet(1)]);
 
   // ---- `init` makes the key and the secret and prints the address; the owner creates the table for it
-  const o = { dir: join(dir, "dealer"), rpc: RPC, table: "" };
+  // WITNESSES=1: the daemon reads the table through Merkle proofs from this node, with the
+  // chain's other nodes (BJ_RPCS) as witnesses (docs/proposals/blackjack-card-privacy.md).
+  const witnesses = process.env.WITNESSES ? (process.env.BJ_RPCS ?? "").split(",").filter((u) => u !== "" && u !== RPC) : [];
+  if (process.env.WITNESSES) assert.ok(witnesses.length >= 1, "WITNESSES needs other nodes of the chain in BJ_RPCS (run scripts/blackjack-e2e.sh with VALIDATORS of 2 or more)");
+  const proving: Record<string, string> = witnesses.length ? { BJ_DEALER_WITNESSES: witnesses.join(",") } : {};
+  const o = { dir: join(dir, "dealer"), rpc: RPC, table: "", env: proving };
   const printed = cli(o, "init");
   const dealerAddress = /^dealer address: (\S+)$/m.exec(printed)?.[1];
   assert.ok(dealerAddress, "init prints the dealer's address");
@@ -57,7 +63,7 @@ try {
   await sure(client, program, owner, call.fund(300n * FANG));
 
   const play: Play = { client, table, program, watcher };
-  const env = { BJ_DEALER_POLL_MS: "150", BJ_DEALER_LOW_WATER: "8", BJ_DEALER_TARGET: "24", BJ_DEALER_KEEP_SETTLED: "4" };
+  const env = { BJ_DEALER_POLL_MS: "150", BJ_DEALER_LOW_WATER: "8", BJ_DEALER_TARGET: "24", BJ_DEALER_KEEP_SETTLED: "4", ...proving };
   daemon = new Daemon({ ...o, env });
 
   // ---- a dry run reads the table and sends nothing
@@ -76,6 +82,40 @@ try {
   assert.deepEqual([status.address, status.unused, status.servable, status.missing, status.backup_current, status.isDealer, status.low_balance], [dealerAddress, 24, 24, [], true, true, false]);
   assert.match(cli(o, "status"), /commitments {6}24 unused/);
   console.log("✓ the daemon committed 24 chains ahead; status reads the same from the chain and the store");
+
+  // ---- proven reads against the real node: the same bytes the storage route gives, block for block
+  /** Records read both ways at the same height and found equal, while the hands below are played. */
+  let compared = 0;
+  let comparing = witnesses.length > 0;
+  let comparer: Promise<void> | undefined;
+  if (witnesses.length) {
+    assert.ok(daemon.log().some((l) => l.action === "proven_reads" && l.witnesses === witnesses.length), "the daemon said it reads through proofs");
+    assert.equal((status as unknown as { proven: boolean }).proven, true);
+    assert.match(cli(o, "status"), /reads {12}proven: .* confirmed by \d+ of \d+ witness/);
+    const proven = new ProvenTable(program, client, witnesses.map((u) => new Client(u)));
+    assert.deepEqual({ ...(await proven.house()), height: 0 }, { ...(await table.house()), height: 0 });
+    assert.deepEqual(await proven.limits(), limits);
+    assert.equal(await proven.game(1_000_000n), null, "a hand that never was is proven absent");
+    assert.equal(await proven.commitment(0n), await table.commitment(0n));
+    // A stored entry in the node's format, the tree key, and what a block's state root is the root of: all the node's own.
+    const same = async (key: string): Promise<void> => {
+      const [a, b] = await Promise.all([proven.entry(key), table.entry(key)]);
+      if (a.height !== b.height) return; // A block went by between the two reads.
+      assert.equal(a.value, b.value, `the proven value of ${key} at block ${a.height} isn't the storage route's`);
+      compared++;
+    };
+    comparer = (async () => {
+      while (comparing) {
+        const house = await table.house();
+        const keys = [storageKey.house, storageKey.limits, storageKey.open, storageKey.commitment(house.nextGame), storageKey.commitment(house.nextCommit - 1n)];
+        for (let id = house.nextGame; id >= 0n && id + 4n > house.nextGame; id--) keys.push(storageKey.game(id));
+        for (const key of keys) await same(key);
+        await sleep(100);
+      }
+    })();
+    comparer.catch(() => undefined);
+    console.log(`✓ proven reads from ${RPC}, confirmed by ${witnesses.length} witness(es), give what the storage route gives`);
+  }
 
   // ---- hands from three accounts at once, with a SIGKILL in the middle of one
   const seats: Seat[] = [
@@ -182,6 +222,12 @@ try {
   assert.equal([...watcher.settled.values()].filter((s) => s.outcome === Outcome.Forfeit || s.outcome === Outcome.ForfeitDeal).length, 0, "no hand was forfeited by the dealer");
   assert.equal([...watcher.settled.values()].filter((s) => s.outcome === Outcome.NoSeed).length, 1, "one bet's seed never came");
   assert.equal(await daemon.stop(), 0);
+  if (comparer) {
+    comparing = false;
+    await comparer;
+    assert.ok(compared > 100, `${compared} records were read both ways at one height`);
+    console.log(`✓ ${compared} records read through proofs while the hands were played were the storage route's, byte for byte`);
+  }
   const lines = daemon.log();
   assert.ok(lines.filter((l) => l.action === "started").length >= 3, "the daemon started three times");
   if (watcher.settled.size >= 48) assert.ok(lines.some((l) => l.action === "pruned"), "settled secrets were pruned");

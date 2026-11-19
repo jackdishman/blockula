@@ -403,7 +403,11 @@ Before a table takes bets on any chain people use:
    kept, and an alert fires when unused commitments run low, when a hand's deadline is close, and
    when a `settled` event shows a forfeit by the dealer (outcome 6 or 7). Outcome 8 (a seed that
    never came) is a player's, not the dealer's; many of them from different accounts mean
-   players' reveals aren't reaching the chain, which is the table's problem to find.
+   players' reveals aren't reaching the chain, which is the table's problem to find. The dealer
+   reveals what its node says a hand is owed, so its node is one on its own machine, or it is
+   given witnesses (`BJ_DEALER_WITNESSES`: every record is then proven, and a node that lies
+   about a hand is sent nothing). [proposals/blackjack-card-privacy.md](proposals/blackjack-card-privacy.md)
+   has why; the dealer's README, "Whom the dealer trusts", has how.
 6. **The page.** The 18+ self-attest is in place, the note "FANG has no value and can't be bought;
    no prizes." is visible, and the rules on the page match the limits on the chain. A bet's two
    steps have been tried on the wallets players use, a reload between them included, and

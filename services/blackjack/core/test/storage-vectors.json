@@ -1,0 +1,85 @@
+{
+  "absent": {
+    "answer": {
+      "height": 0,
+      "key": "07070707070707070707070707070707070707070707070707070707070707076e6f7065",
+      "namespace": 69,
+      "proof": {
+        "leaf": {
+          "key": "cd9a6cab67e494e4b71f66d0fdb1a630275bb6e9e94aaccf06a05edda507aa2e",
+          "value": "639cc14987a5610683a1613455629eceb64ffc2fe005139e1e19c759b50a2e51"
+        },
+        "siblings": [
+          "452ffcbd9b14e536756e90a7e6097ad0e90bf394f760b3bac196832b01892c60",
+          "6430804209c92b27d2a359ef586d0c9bbf3223d9558f94ba1c104e273d527128",
+          "fe95c52ae5d03d82909251be540d7fce479d43bfad07c76a19151b6f84d46ab6"
+        ]
+      },
+      "root": "c17612a18408a562e12aab72c298b48e7e9e1e32405a06163d1108a3f714aa27",
+      "value": null
+    },
+    "key": "6e6f7065"
+  },
+  "description": "Program storage through /api/proof (node/src/programs/state/tests.rs) for services/blackjack/core/src/proven.ts: each entry's key and value as the program wrote them, and the node's answer for namespace 69, key = the program's 32 address bytes ‖ the key. Regenerate: cargo test --manifest-path node/Cargo.toml programs::state::tests::write_storage_vectors -- --ignored",
+  "entries": [
+    {
+      "answer": {
+        "height": 0,
+        "key": "07070707070707070707070707070707070707070707070707070707070707077370",
+        "namespace": 69,
+        "proof": {
+          "leaf": {
+            "key": "a4574170ebdfbdb54ec0ab97965e8325641826b09536218114b30bdf659499d6",
+            "value": "0a2e06fb3b7d6fa0e6f13795581e2b35111a8f424c3140585d22d0e31619f3f0"
+          },
+          "siblings": [
+            "452ffcbd9b14e536756e90a7e6097ad0e90bf394f760b3bac196832b01892c60",
+            "6462d9b841617b37dff16d9fd109681f67b8484184334e177989da5252e812ab",
+            "4ebc15aa2c6f70b91947eb5576e9f8fe437541f4719de18ac42445e23d3fb71c",
+            "979acb5f0934b3f47fdeb5cf53ee59c0d8c5d8e4addc9dd5518eafec71017be9",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "f2b9f27a005f896eb765f1db4d8a0f2dd4b8aa0df4aa9f8796c22ffbf1d565cc"
+          ]
+        },
+        "root": "c17612a18408a562e12aab72c298b48e7e9e1e32405a06163d1108a3f714aa27",
+        "value": "0164000000abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab0707070707070707070707070707070707070707070707070707070707070707d00700000000000000010000"
+      },
+      "capacity": 256,
+      "deposit": "2000",
+      "key": "7370",
+      "payer": "0707070707070707070707070707070707070707070707070707070707070707",
+      "value": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+    },
+    {
+      "answer": {
+        "height": 0,
+        "key": "070707070707070707070707070707070707070707070707070707070707070763",
+        "namespace": 69,
+        "proof": {
+          "leaf": {
+            "key": "73844b474e5ea010383374e0403b77fe4f30c7daaeeb0c982d1a7b46e2a74227",
+            "value": "84b742a5413bacdd5dbd836618d789c404514cf6c039ac2c525e483b8df65f32"
+          },
+          "siblings": [
+            "49c01ffaf7db4cbbeeec443fadcbfce2def4340f4e8a6ccfc01cb014ec7086ba",
+            "30847b8348c8d68e8ee66587fe107755044208404437d12221c3eac16af81495",
+            "21f60f5a5e49ceff93c45bc6f4880d3530455bb93fe0b2834937c27802320389",
+            "33ceeb01b4f19208e85c8defb78df46e56ba144d62fb8acb78dfb05978ed9ff3"
+          ]
+        },
+        "root": "c17612a18408a562e12aab72c298b48e7e9e1e32405a06163d1108a3f714aa27",
+        "value": "01080000000500000000000000177c577d91cf59f1008512a5960e280ffc1889d74e10966fa6d6b9d12fbecc3ce80300000000000080000000"
+      },
+      "capacity": 128,
+      "deposit": "1000",
+      "key": "63",
+      "payer": "177c577d91cf59f1008512a5960e280ffc1889d74e10966fa6d6b9d12fbecc3c",
+      "value": "0500000000000000"
+    }
+  ],
+  "program": "boo1qurswpc8qurswpc8qurswpc8qurswpc8qurswpc8qurswpc8qursz6hc9p"
+}

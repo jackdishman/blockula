@@ -32,6 +32,8 @@
 #   scripts/blackjack-e2e.sh                 # 1,000 hands, about 10 minutes
 #   HANDS=60 scripts/blackjack-e2e.sh        # a quick run, about 3 minutes
 #   TEST=live scripts/blackjack-e2e.sh       # the dealer's live test (test/live.ts) on the same chain, 30 hands
+#   TEST=live WITNESSES=1 scripts/blackjack-e2e.sh   # the same, the daemon reading through Merkle proofs from
+#                                            # one validator with the others as witnesses (docs/proposals/blackjack-card-privacy.md)
 #   KEEP=1 scripts/blackjack-e2e.sh          # keep the directory (it's printed) and every log
 #   HOLD=1 scripts/blackjack-e2e.sh          # only start the chain and wait (Ctrl-C stops it)
 #   BIN=… BLOCK_MS=400 BASE_PORT=38300 VALIDATORS=4 scripts/blackjack-e2e.sh
@@ -155,6 +157,7 @@ fi
 
 # ------------------------------------------------------------------------------- the table
 export BLOCKULA_RPC="$RPC" BJ_RPCS="$RPCS" BJ_DIR="$DIR" HANDS BLOCK_MS
+[[ -z "${WITNESSES:-}" ]] || export WITNESSES
 STARTED=$(date +%s)
 case "$TEST" in
   soak) node --import tsx "$DEALER/test/soak.ts" 2>&1 | tee "$DIR/driver.log" || fail "the soak failed (its output is above)" ;;

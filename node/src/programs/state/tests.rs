@@ -741,3 +741,78 @@ fn storage_and_blob_keys() {
     assert_eq!(blob_key(BLOB_INTERFACE, &[9; 32]).0, [&[1u8][..], &[9u8; 32][..]].concat());
     assert!(blob_key(BLOB_CODE, &[0xff; 32]) < blob_key(BLOB_INTERFACE, &[0; 32]), "every code reference sorts before every interface's");
 }
+
+// ---- vectors for readers of program storage through /api/proof ----
+//
+// `services/blackjack/core/test/storage-vectors.json`, which that package's `test/proven.ts`
+// checks: what `/api/proof/69/{program's 32 address bytes ‖ key}` answers for the populated
+// state's two entries and for an absent one. The dealer's proven table reader
+// (`services/blackjack/core/src/proven.ts`) takes a program's value out of the stored entry
+// (format byte, value, payer, deposit, capacity), so the entry's encoding here and its reading
+// there must stay in step. Regenerate with
+// `cargo test --manifest-path node/Cargo.toml programs::state::tests::write_storage_vectors -- --ignored`.
+
+fn storage_vectors_file() -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let name = "services/blackjack/core/test/storage-vectors.json";
+    dir.ancestors().map(|d| d.join(name)).find(|p| p.exists()).unwrap_or_else(|| dir.join("..").join(name))
+}
+
+fn storage_vectors() -> serde_json::Value {
+    use serde_json::json;
+    let (st, _) = populated();
+    let root = st.root_hash();
+    // As `api::proof` answers (the state after block 0 here).
+    let answer = |key: &[u8]| {
+        let record_key = [PROGRAM.as_slice(), key].concat();
+        let value = st.record(ns::PROGRAM_STORAGE, &record_key);
+        let proof = st.prove(ns::PROGRAM_STORAGE, &record_key).unwrap();
+        assert!(crate::state::tree::verify(&root, ns::PROGRAM_STORAGE, &record_key, value.as_deref(), &proof));
+        json!({ "namespace": ns::PROGRAM_STORAGE, "key": hex::encode(&record_key), "value": value.as_deref().map(hex::encode), "proof": proof, "root": hex::encode(root), "height": 0 })
+    };
+    let entry = |key: &[u8]| {
+        let e = &st.programs.storage.get(&storage_key(&PROGRAM, key)).expect("the populated state's entry").0;
+        json!({ "key": hex::encode(key), "value": hex::encode(&e.value), "payer": hex::encode(e.payer), "deposit": e.deposit.to_string(), "capacity": e.capacity, "answer": answer(key) })
+    };
+    json!({
+        "description": "Program storage through /api/proof (node/src/programs/state/tests.rs) for services/blackjack/core/src/proven.ts: each entry's key and value as the program wrote them, and the node's answer for namespace 69, key = the program's 32 address bytes ‖ the key. Regenerate: cargo test --manifest-path node/Cargo.toml programs::state::tests::write_storage_vectors -- --ignored",
+        "program": program(),
+        "entries": [entry(KEY_OWN), entry(KEY_SIGNER)],
+        "absent": { "key": hex::encode(b"nope"), "answer": answer(b"nope") },
+    })
+}
+
+/// The file's entries are encoded as this binary encodes them, and its proofs check with the
+/// node's tree code. The root follows the whole state's encoding, which changes whenever any
+/// module adds a record or a scalar: a different root is only reported.
+#[test]
+fn storage_proof_vectors_match_the_node() {
+    use crate::state::tree::{verify, Proof};
+    let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(storage_vectors_file()).expect("services/blackjack/core/test/storage-vectors.json")).unwrap();
+    let fresh = storage_vectors();
+    let regen = "regenerate services/blackjack/core/test/storage-vectors.json (see node/src/programs/state/tests.rs)";
+    assert_eq!(file["program"], fresh["program"]);
+    let answers = |v: &serde_json::Value| -> Vec<serde_json::Value> { v["entries"].as_array().unwrap().iter().map(|e| e["answer"].clone()).chain([v["absent"]["answer"].clone()]).collect() };
+    for (f, n) in file["entries"].as_array().unwrap().iter().zip(fresh["entries"].as_array().unwrap()) {
+        for field in ["key", "value", "payer", "deposit", "capacity"] {
+            assert_eq!(f[field], n[field], "{regen}");
+        }
+    }
+    for (f, n) in answers(&file).iter().zip(answers(&fresh)) {
+        // The tree key and the stored entry's bytes: what a reader depends on.
+        assert_eq!((&f["namespace"], &f["key"], &f["value"]), (&n["namespace"], &n["key"], &n["value"]), "a stored entry's encoding or its tree key changed: the proven reader must change with it; {regen}");
+        let root: [u8; 32] = hex::decode(f["root"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let proof: Proof = serde_json::from_value(f["proof"].clone()).unwrap();
+        let value = f["value"].as_str().map(|v| hex::decode(v).unwrap());
+        assert!(verify(&root, ns::PROGRAM_STORAGE, &hex::decode(f["key"].as_str().unwrap()).unwrap(), value.as_deref(), &proof), "the file's proof doesn't check with the node's tree code");
+    }
+    if file != fresh {
+        eprintln!("note: the state encoding changed since services/blackjack/core/test/storage-vectors.json was written (another root); {regen}");
+    }
+}
+
+#[test]
+#[ignore = "generator, run by hand (see the comment above)"]
+fn write_storage_vectors() {
+    std::fs::write(storage_vectors_file(), serde_json::to_string_pretty(&storage_vectors()).unwrap() + "\n").unwrap();
+}

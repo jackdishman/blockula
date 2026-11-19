@@ -9,3 +9,4 @@ export * from "./keys.js";
 export * from "./config.js";
 export * from "./log.js";
 export * from "./chain.js";
+export * from "./reader.js";
