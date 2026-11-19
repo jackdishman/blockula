@@ -30,7 +30,7 @@ async function refused(p: Promise<unknown>, kind: ProofFailure, what: string): P
 // ---- the table whose storage these tests read ----
 const chain = chainFromTop("11".repeat(32));
 const chain2 = chainFromTop("22".repeat(32));
-const house: House = { owner: A(1), dealer: A(2), bankroll: 500n, reserved: 30n, stakes: 20n, table: 7n, nextCommit: 12n, nextGame: 10n, paused: false, open: 2 };
+const house: House = { owner: A(1), dealer: A(2), bankroll: 500n, reserved: 30n, stakes: 20n, table: 7n, nextCommit: 12n, nextGame: 10n, paused: false, tripped: false, open: 2 };
 const waiting: Game = { id: 8n, player: A(3), stake: 10n, clientSeed: null, seedHash: "5a".repeat(32), link: chain[0], deadline: 140n, postId: 0n, phase: Phase.Seed, table: false, dealt: 0, playerCards: [], dealerCards: [], playerTotal: 0, dealerTotal: 0 };
 const playing: Game = { id: 9n, player: A(4), stake: 10n, clientSeed: "c1".repeat(32), seedHash: null, link: chain2[3], deadline: 150n, postId: 77n, phase: Phase.Player, table: true, dealt: 3, playerCards: [9, 20], dealerCards: [5], playerTotal: 18, dealerTotal: 6 };
 const commitments = new Map<bigint, string>([
