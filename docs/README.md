@@ -37,6 +37,7 @@
 | [RANDOMNESS.md](RANDOMNESS.md) | Randomness for programs: the beacon's host functions (protocol v3, preview), the safe pattern and its limits |
 | [BLACKJACK.md](BLACKJACK.md) | Blackjack, a game played with FANG: the program, the dealer, the table page and the X bot in dry run, for whoever runs a table (experimental) |
 | [BLACKJACK_REVIEW.md](BLACKJACK_REVIEW.md) | A security review of the blackjack program by an AI agent: findings, what was fixed, what is still open (it doesn't replace an audit by people) |
+| [proposals/blackjack-dealer-outage.md](proposals/blackjack-dealer-outage.md) | A proposal: blackjack rules v2, so that a dealer outage pays for nothing it didn't deal (a separate program, `blackjack2`: built and tested, not deployed) |
 | [GHOST-MODE.md](GHOST-MODE.md) | Ghost Mode shielded transfers (built, off until governance activates it) |
 
 ## Design history

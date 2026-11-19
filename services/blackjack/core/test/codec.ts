@@ -73,7 +73,7 @@ assert.equal(storageKey.relayer(bot), "72" + b);
 
 // ---- records ----
 const houseHex = h + b + le(100) + le(15) + le(10) + le(7) + le(40) + le(33) + "01" + "02";
-assert.deepEqual(decodeHouse(houseHex, "boo"), { owner: house, dealer: bot, bankroll: 100n, reserved: 15n, stakes: 10n, table: 7n, nextCommit: 40n, nextGame: 33n, paused: true, open: 2 });
+assert.deepEqual(decodeHouse(houseHex, "boo"), { owner: house, dealer: bot, bankroll: 100n, reserved: 15n, stakes: 10n, table: 7n, nextCommit: 40n, nextGame: 33n, paused: true, tripped: false, open: 2 });
 assert.throws(() => decodeHouse(houseHex + "00", "boo"));
 assert.deepEqual(decodeLimits(input.setLimits(DEFAULT_LIMITS)), DEFAULT_LIMITS);
 const cards20 = "0c1a" + "00".repeat(18);
@@ -86,7 +86,8 @@ assert.throws(() => decodeGame(33n, gameHex.slice(2), "boo"));
 const waitingHex = a + le(2_000_000_000) + s1 + s2 + le(900) + le(0) + "00" + "00" + "00" + "00" + "00" + "00".repeat(32);
 const waiting = decodeGame(34n, waitingHex, "boo");
 assert.deepEqual([waiting.phase, waiting.clientSeed, waiting.seedHash, waiting.dealt], [Phase.Seed, null, s1, 0]);
-assert.throws(() => decodeGame(34n, waitingHex.slice(0, 240) + "06" + waitingHex.slice(242), "boo"), /phase/);
+// (Phase 6 is rules v2's, a hand being opened: test/rules2.ts.)
+assert.throws(() => decodeGame(34n, waitingHex.slice(0, 240) + "07" + waitingHex.slice(242), "boo"), /phase/);
 const lastHex = le(32) + "02" + "05" + "03" + le(2_000_000_000) + le(4_000_000_000) + s1 + s2;
 const playerHex = le(5) + le(9) + le(3_000_000_000) + le(34) + b + le(11) + le(12) + le(13) + le(9) + le(14) + lastHex;
 assert.deepEqual(decodePlayer(playerHex, "boo"), {
@@ -107,8 +108,9 @@ assert.throws(() => viewBytes(le(4, 4) + "010203"));
 assert.deepEqual(decodeStep("0502"), { phase: Phase.Done, outcome: Outcome.Win });
 assert.deepEqual(decodeStep("0200"), { phase: Phase.Player, outcome: null });
 assert.deepEqual(decodeStep("0508"), { phase: Phase.Done, outcome: Outcome.NoSeed });
-assert.throws(() => decodeStep("0509"));
-assert.throws(() => decodeStep("0600"));
+// (Outcome 9 and phase 6 are rules v2's: test/rules2.ts.)
+assert.throws(() => decodeStep("050a"));
+assert.throws(() => decodeStep("0700"));
 assert.equal(decodeGameId(le(1n << 60n)), 1n << 60n);
 
 // ---- events ----
@@ -143,7 +145,7 @@ assert.deepEqual(decodeEvent("paused", "01", "boo"), { name: "paused", on: true 
 assert.equal(decodeEvent("something_else", "00", "boo"), null);
 assert.throws(() => decodeEvent("hit", le(33) + a, "boo"), /too short/);
 assert.throws(() => decodeEvent("hit", le(33) + a + le(260) + "00", "boo"), /left over/);
-assert.throws(() => decodeEvent("settled", le(33) + a + "09" + le(2) + le(5) + "01" + "03" + "02" + s1 + s2 + "15" + "0a", "boo"), /outcome/);
+assert.throws(() => decodeEvent("settled", le(33) + a + "0a" + le(2) + le(5) + "01" + "03" + "02" + s1 + s2 + "15" + "0a", "boo"), /outcome/);
 // Only the table's own events are read from a receipt.
 const receipt = { claims: { return_data: [], omitted: null, events: [{ program: house, untrusted_name: "paused", data: "01" }, { program: alice, untrusted_name: "paused", data: "00" }, { program: house, untrusted_name: "nonsense", data: "ff" }] } };
 assert.deepEqual(eventsOf(receipt, house), [{ name: "paused", on: true }]);

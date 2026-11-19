@@ -371,8 +371,13 @@ The longest reveal there can be (a hit to 21 and an eleven-card dealer hand) is 
   is left it changes nothing and still succeeds (BJ-08, fixed). A link that is neither held nor
   the chain's next is refused as before. Keep `reveal_blocks` well above 12 all the same: it is
   the dealer's whole margin for a slow node or a full block.
-- **A table needs a live dealer.** A dealer that is down pays every open hand as a player's win.
-  Run one dealer, watch it, and pause the table before maintenance.
+- **A table needs a live dealer.** A dealer that is down pays every open hand as a player's win,
+  and every bet placed against the commitments it left on the chain too, 3:2 each, until the
+  owner pauses. Run one dealer, watch it, and pause the table before maintenance.
+  [proposals/blackjack-dealer-outage.md](proposals/blackjack-dealer-outage.md) proposes rules v2
+  for this (a separate program, `blackjack2`, built and tested but not deployed: the dealer
+  opens each hand before it can know a card, a hand it never opens is refunded, and a forfeit
+  stops new bets until the owner looks). This guide describes v1, the program that is deployed.
 - **Views are optional.** Clients read the program's storage through the node's storage route,
   which every node serves; the `game`, `player`, `house`, `limits`, `open_games` and `commitment`
   views exist for wallets that read through the interface.

@@ -7,7 +7,7 @@
  */
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bech32m } from "@scure/base";
-import { Outcome, Phase, hexBytes, isOutcome, seedHashOf, toHex, total } from "./rules.js";
+import { Outcome, Phase, hexBytes, isOutcome, seedHashOf, toHex, total, type Rules } from "./rules.js";
 
 export const DROPS_PER_FANG = 1_000_000_000n;
 export const MAX_REVEAL_LINKS = 12;
@@ -140,8 +140,10 @@ export interface Limits {
   relayMaxBet: bigint;
   /** The longest a relayer grant may last, in blocks. */
   grantMaxBlocks: bigint;
-  /** Blocks a player has, from the bet, to reveal the seed it committed to. */
+  /** Blocks a player has to reveal the seed their bet committed to: from the bet (v1), or from the deadline the dealer had to open the hand by, whenever it opened (v2). */
   seedBlocks: bigint;
+  /** Rules v2 only (a fourteenth limit): blocks the dealer has, from the bet, to open a hand. Past them the stake is refunded. */
+  openBlocks?: bigint;
 }
 
 /** The fewest blocks the program lets an owner give a player to move or to reveal a seed. */
@@ -168,6 +170,9 @@ export const DEFAULT_LIMITS: Limits = Object.freeze({
   seedBlocks: 300n,
 });
 
+/** The limits a v2 table's `init` writes: v1's, and 150 blocks for the dealer to open a hand. */
+export const DEFAULT_LIMITS_V2: Limits & { openBlocks: bigint } = Object.freeze({ ...DEFAULT_LIMITS, openBlocks: 150n });
+
 function counted(head: Writer, items: readonly string[], max: number, what: string): string {
   if (items.length < 1 || items.length > max) throw new Error(`${what}: 1 to ${max} at a time, not ${items.length}`);
   head.u32(items.length);
@@ -180,7 +185,11 @@ export const input = {
   init: (dealer: string) => new Writer().address(dealer).hex(),
   fund: () => "",
   defund: (amount: bigint) => new Writer().u64(amount).hex(),
-  setLimits: (l: Limits) => LIMIT_KEYS.reduce((w, k) => w.u64(u64(l[k])), new Writer()).hex(),
+  /** Thirteen limits for a v1 table; with `openBlocks`, the fourteen a v2 table takes (each refuses the other's length). */
+  setLimits: (l: Limits) => {
+    const w = LIMIT_KEYS.reduce((w, k) => w.u64(u64(l[k])), new Writer());
+    return (l.openBlocks === undefined ? w : w.u64(u64(l.openBlocks))).hex();
+  },
   pause: (on: boolean) => new Writer().bool(on).hex(),
   setDealer: (dealer: string) => new Writer().address(dealer).hex(),
   approveRelayer: (relayer: string, on: boolean) => new Writer().address(relayer).bool(on).hex(),
@@ -238,6 +247,8 @@ export const storageKey = {
   house: toHex(new TextEncoder().encode("H")),
   limits: toHex(new TextEncoder().encode("C")),
   open: toHex(new TextEncoder().encode("O")),
+  /** The rules' version: `02` on a v2 table, absent on a v1 one. */
+  version: toHex(new TextEncoder().encode("V")),
   commitment: (k: bigint) => keyed("c", le8(k)),
   game: (id: bigint) => keyed("g", le8(id)),
   player: (account: string) => keyed("p", addressBytes(account)),
@@ -259,25 +270,49 @@ export interface House {
   table: bigint;
   nextCommit: bigint;
   nextGame: bigint;
+  /** No new bet is taken: the owner paused the table, or (rules v2) a forfeit tripped its breaker. */
   paused: boolean;
+  /**
+   * Rules v2: the pause is the circuit breaker's. A hand ended by the dealer's missed deadline at
+   * the house's cost, and no bet is taken until the owner calls `pause(false)`. Always false on
+   * a v1 table.
+   */
+  tripped?: boolean;
   open: number;
 }
 
 export const HOUSE_BYTES = 114;
 export const LIMITS_BYTES = 104;
+/** A v2 table's limits: v1's thirteen and `openBlocks`. */
+export const LIMITS_BYTES_V2 = 112;
 export const GAME_BYTES = 157;
 export const PLAYER_BYTES = 195;
 
 export function decodeHouse(hex: string, prefix: string): House {
   const r = new Reader(hexBytes(hex, HOUSE_BYTES), "the house record");
-  return { owner: r.address(prefix), dealer: r.address(prefix), bankroll: r.u64(), reserved: r.u64(), stakes: r.u64(), table: r.u64(), nextCommit: r.u64(), nextGame: r.u64(), paused: r.u8() !== 0, open: r.u8() };
+  const head = { owner: r.address(prefix), dealer: r.address(prefix), bankroll: r.u64(), reserved: r.u64(), stakes: r.u64(), table: r.u64(), nextCommit: r.u64(), nextGame: r.u64() };
+  // 0 bets are taken, 1 the owner paused, 2 (v2) tripped by a forfeit.
+  const paused = r.u8();
+  if (paused > 2) throw new Error(`${paused} isn't a pause`);
+  return { ...head, paused: paused !== 0, tripped: paused === 2, open: r.u8() };
 }
 
+/** The limits record: v1's 104 bytes, or v2's 112 (then `openBlocks` is set). */
 export function decodeLimits(hex: string): Limits {
-  const r = new Reader(hexBytes(hex, LIMITS_BYTES), "the limits");
-  const out = {} as Record<(typeof LIMIT_KEYS)[number], bigint>;
+  const bytes = hexBytes(hex);
+  if (bytes.length !== LIMITS_BYTES && bytes.length !== LIMITS_BYTES_V2) throw new Error(`the limits are ${LIMITS_BYTES} or ${LIMITS_BYTES_V2} bytes, not ${bytes.length}`);
+  const r = new Reader(bytes, "the limits");
+  const out = {} as Record<(typeof LIMIT_KEYS)[number], bigint> & { openBlocks?: bigint };
   for (const k of LIMIT_KEYS) out[k] = r.u64();
+  if (r.left) out.openBlocks = r.u64();
   return out;
+}
+
+/** The rules a table runs, from its stored version record (`storageKey.version`): absent on a v1 table. */
+export function decodeRules(valueHex: string | null): Rules {
+  if (valueHex === null) return 1;
+  if (valueHex === "02") return 2;
+  throw new Error(`this table says its rules are version 0x${valueHex}, which this code doesn't know`);
 }
 
 /** An open hand. */
@@ -287,18 +322,18 @@ export interface Game {
   stake: bigint;
   /** The player's seed, once revealed (a relayed hand: from the bet). `null` while the hand waits for it. */
   clientSeed: string | null;
-  /** What the bet committed to, while the seed isn't revealed (`Phase.Seed`); `null` after. */
+  /** What the bet committed to, while the seed isn't revealed (`Phase.Seed`, and v2's `Phase.Open`); `null` after. */
   seedHash: string | null;
   /** The newest link revealed (the commitment before any is). */
   link: string;
-  /** The block after which `timeout` works: the player's deadline (the seed, a move) or the dealer's. */
+  /** The block after which `timeout` works: the player's deadline (the seed, a move) or the dealer's (v2: the opening too). */
   deadline: bigint;
   /** The X post a relayed bet came from; 0 for a bet from an account. */
   postId: bigint;
   phase: Phase;
   /** Played from the table balance: the payout goes back there. */
   table: boolean;
-  /** Cards dealt: the chain index of `link`. */
+  /** Links revealed: the chain index of `link`. Each is a card, except a v2 hand's opening links before its seed. */
   dealt: number;
   playerCards: number[];
   dealerCards: number[];
@@ -307,9 +342,12 @@ export interface Game {
 }
 
 function phase(n: number): Phase {
-  if (!Number.isInteger(n) || n < 0 || n > 5) throw new Error(`${n} isn't a hand's phase`);
+  if (!Number.isInteger(n) || n < 0 || n > 6) throw new Error(`${n} isn't a hand's phase`);
   return n as Phase;
 }
+
+/** Whether a hand in phase `p` still holds its seed's hash where the seed will go. */
+const unseeded = (p: Phase): boolean => p === Phase.Seed || p === Phase.Open;
 
 export function decodeGame(id: bigint, hex: string, prefix: string): Game {
   const r = new Reader(hexBytes(hex, GAME_BYTES), "a hand's record");
@@ -321,8 +359,8 @@ export function decodeGame(id: bigint, hex: string, prefix: string): Game {
   const postId = r.u64();
   const ph = phase(r.u8());
   // The same 32 bytes hold the seed's hash until the seed is revealed, and the seed after.
-  const clientSeed = ph === Phase.Seed ? null : seedField;
-  const seedHash = ph === Phase.Seed ? seedField : null;
+  const clientSeed = unseeded(ph) ? null : seedField;
+  const seedHash = unseeded(ph) ? seedField : null;
   const flags = r.u8();
   const dealt = r.u8();
   const nPlayer = r.u8();
@@ -344,17 +382,17 @@ export interface LastHand {
   nPlayer: number;
   stake: bigint;
   payout: bigint;
-  /** The player's seed. `null` for a hand whose seed was never revealed (`Outcome.NoSeed`). */
+  /** The player's seed. `null` for a hand whose seed was never revealed (`Outcome.NoSeed`, v2's `Outcome.Refund`). */
   clientSeed: string | null;
-  /** For `Outcome.NoSeed`: what the bet committed to. `null` otherwise. */
+  /** For `Outcome.NoSeed` and `Outcome.Refund`: what the bet committed to. `null` otherwise. */
   seedHash: string | null;
   /** The last link revealed (the commitment, when none was). */
   link: string;
 }
 
-/** The seed field of a settled hand, by its outcome: the seed, or for a hand whose seed never came the hash it committed to. */
+/** The seed field of a settled hand, by its outcome: the seed, or for a hand whose seed never became public the hash it committed to. */
 function settledSeed(outcome: number, field: string): { clientSeed: string | null; seedHash: string | null } {
-  return outcome === Outcome.NoSeed ? { clientSeed: null, seedHash: field } : { clientSeed: field, seedHash: null };
+  return outcome === Outcome.NoSeed || outcome === Outcome.Refund ? { clientSeed: null, seedHash: field } : { clientSeed: field, seedHash: null };
 }
 
 export interface Grant {
@@ -435,6 +473,10 @@ export type TableEvent =
   /** The player revealed the seed their bet committed to: the dealer owes the deal by `deadline`. */
   | { name: "seed"; game: bigint; player: string; clientSeed: string; deadline: bigint }
   | { name: "cards"; game: bigint; player: string; first: number; cards: { link: string; card: number }[]; phase: Phase; playerTotal: number; dealerTotal: number; deadline: bigint }
+  /** Rules v2: the dealer revealed opening links `first`… of a hand, which deal no card yet. `phase` is `Open` while more are owed, `Seed` once the player owes the seed (by `deadline`). */
+  | { name: "opened"; game: bigint; player: string; first: number; links: string[]; phase: Phase; deadline: bigint }
+  /** Rules v2: hand `game` ended by the dealer's missed deadline at the house's cost, and the table takes no bet until the owner allows them. */
+  | { name: "tripped"; game: bigint; outcome: Outcome }
   | { name: "hit"; game: bigint; player: string; deadline: bigint }
   | { name: "stand"; game: bigint; player: string; deadline: bigint; idle: boolean }
   | { name: "settled"; game: bigint; player: string; outcome: Outcome; stake: bigint; payout: bigint; toTable: boolean; dealt: number; nPlayer: number; clientSeed: string | null; seedHash: string | null; link: string; playerTotal: number; dealerTotal: number }
@@ -485,6 +527,20 @@ export function decodeEvent(name: string, dataHex: string, prefix: string): Tabl
       const n = r.u8();
       const cards = Array.from({ length: n }, () => ({ link: r.hash(), card: r.u8() }));
       return done({ name, game, player, first, cards, phase: phase(r.u8()), playerTotal: r.u8(), dealerTotal: r.u8(), deadline: r.u64() });
+    }
+    case "opened": {
+      const game = r.u64();
+      const player = r.address(prefix);
+      const first = r.u8();
+      const n = r.u8();
+      const links = Array.from({ length: n }, () => r.hash());
+      return done({ name, game, player, first, links, phase: phase(r.u8()), deadline: r.u64() });
+    }
+    case "tripped": {
+      const game = r.u64();
+      const outcome = r.u8();
+      if (outcome !== Outcome.Forfeit && outcome !== Outcome.ForfeitDeal) throw new Error(`outcome ${outcome} doesn't trip a table`);
+      return done({ name, game, outcome });
     }
     case "hit":
       return done({ name, game: r.u64(), player: r.address(prefix), deadline: r.u64() });
@@ -596,6 +652,7 @@ export const ABORTS: Readonly<Record<number, string>> = Object.freeze({
   70: "That hand isn't waiting for a seed.",
   71: "That isn't the seed the bet was placed with.",
   72: "The time to reveal that bet's seed has passed.",
+  73: "The time to open that hand has passed: its stake can be taken back.",
 });
 
 /** What an abort code means, in the table's words. */

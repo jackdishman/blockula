@@ -6,8 +6,8 @@
  * program's stored bytes, decoded here.
  */
 import type { ProgramCallOptions, ProgramReceipt, ProgramTxResult, Wallet } from "@blockula/sdk";
-import { DROPS_PER_FANG, EMPTY_PLAYER, MAX_OPEN_GAMES, decodeEvent, decodeGame, decodeHouse, decodeLimits, decodeOpenList, decodePlayer, input, prefixOf, storageKey, type Game, type House, type Limits, type PlayerRecord, type TableEvent } from "./codec.js";
-import { hexBytes, toHex } from "./rules.js";
+import { DROPS_PER_FANG, EMPTY_PLAYER, MAX_OPEN_GAMES, decodeEvent, decodeGame, decodeHouse, decodeLimits, decodeOpenList, decodePlayer, decodeRules, input, prefixOf, storageKey, type Game, type House, type Limits, type PlayerRecord, type TableEvent } from "./codec.js";
+import { hexBytes, toHex, type Rules } from "./rules.js";
 
 /** A GET under the node's `/api`, answering parsed JSON (and throwing on anything but 2xx). */
 export type ApiGet = (path: string) => Promise<unknown>;
@@ -68,6 +68,14 @@ export class Table {
     const { value, height } = await this.entry(storageKey.house);
     if (value === null) throw new Error(`${this.program} isn't a blackjack table that's set up`);
     return { ...decodeHouse(value, this.prefix), height };
+  }
+
+  /**
+   * The rules the table runs: 1 (`blackjack`) or 2 (`blackjack2`, whose dealer opens a hand
+   * before the seed and refunds one it never opens). A table is one or the other for life.
+   */
+  async rules(): Promise<Rules> {
+    return decodeRules((await this.entry(storageKey.version)).value);
   }
 
   async limits(): Promise<Limits> {

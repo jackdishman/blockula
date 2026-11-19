@@ -1,0 +1,18 @@
+[package]
+name = "bj2-core"
+description = "Blackjack rules v2 for the `blackjack2` guest: bj-core's cards and showdown, with a hand the dealer opens before it can know a card, a refund when it doesn't, and a forfeit that pays exactly what the cards on the table still allow (docs/proposals/blackjack-dealer-outage.md). no_std."
+# Written out, not inherited from the guests' workspace: node/vm's tests build this crate too
+# (a dev-dependency by path), and a dependency reads no other workspace's package table.
+edition = "2024"
+version = "0.0.0"
+license = "MIT"
+publish = false
+
+[lib]
+# An rlib only: the guest links it, and node/vm's tests build it for the host.
+crate-type = ["rlib"]
+
+[dependencies]
+# Rules v1, untouched: the hash, the chain, the card formula, totals and the showdown are its own
+# code, so a card and a finished hand are the same under both versions by construction.
+bj-core = { path = "../bj-core" }

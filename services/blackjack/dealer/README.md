@@ -10,6 +10,8 @@ Blackjack on Blockula is a game played with FANG ([docs/BLACKJACK.md](../../../d
 
 If the dealer misses a reveal deadline, anyone may call `timeout` and the player is paid as if they had won. So the daemon is built to be restarted at any moment: everything it does is decided from the chain and from its seed store, and nothing else.
 
+**On a rules v2 table** (the `blackjack2` program, [docs/proposals/blackjack-dealer-outage.md](../../../docs/proposals/blackjack-dealer-outage.md): built and tested, not deployed) the daemon also **opens** each hand bet from an account: as soon as the bet is on the chain it reveals the chain's first three links, before the player's seed exists there. Those links deal no card until the seed does, so the daemon opens every hand alike. It never sends a fourth link before the seed, and never an opening link that could land past the opening's deadline (the program refuses one); a hand it missed it refunds itself with `timeout` (outcome 9, `refund`: the stake goes back, nothing else is paid). So on a v2 table a daemon that was down costs the house nothing for the bets placed meanwhile. A reveal it misses *after* a seed still pays the player, and then the table takes no new bet until the owner calls `pause(false)`: the daemon logs `table_tripped` until that happens. There is no setting for any of this: a hand's phase says what it is owed, and a v1 table never shows the phase.
+
 FANG has no value. This is a game.
 
 ## What it needs

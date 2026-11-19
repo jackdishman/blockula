@@ -106,6 +106,8 @@ export function stampWords(o: Outcome): string {
       return "Bust";
     case Outcome.NoSeed:
       return "No seed";
+    case Outcome.Refund:
+      return "Refunded";
   }
 }
 

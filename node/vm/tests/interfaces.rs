@@ -31,7 +31,7 @@ use blockula_vm::meter::SCHEDULE_V0;
 use blockula_vm::testing::{MemHost, addr};
 use blockula_vm::validate::validate;
 
-const GUESTS: &[&str] = &["counter", "token", "escrow", "router", "dice", "blackjack"];
+const GUESTS: &[&str] = &["counter", "token", "escrow", "router", "dice", "blackjack", "blackjack2"];
 
 fn method(name: &str, kind: MethodKind, payable: bool, args: &[(&str, Type)], returns: Option<Type>) -> Method {
     let args = args.iter().map(|(name, ty)| Arg { name: name.to_string(), ty: ty.clone() }).collect();
@@ -43,7 +43,7 @@ fn guests() -> Vec<(&'static str, Interface)> {
     use MethodKind::{Call, Init, View};
     use Type::{Address, U8, U32, U64};
     let hops = Type::Vec { of: Box::new(Address), max: 8 };
-    vec![
+    let mut guests = vec![
         ("counter", Interface { methods: vec![method("get", View, false, &[], Some(U64)), method("increment", Call, false, &[], Some(U64))] }),
         (
             "token",
@@ -156,7 +156,24 @@ fn guests() -> Vec<(&'static str, Interface)> {
                 ],
             }
         }),
-    ]
+    ];
+    // Blackjack, rules v2 (docs/proposals/blackjack-dealer-outage.md): a separate program with
+    // `blackjack`'s interface but for a fourteenth limit (`open_blocks`), a `reveal_seed` that
+    // deals the first three cards and so returns phase ‖ outcome like `reveal`, and a `version`
+    // view, which also keeps the two interfaces from fitting each other's code.
+    let mut v2 = guests.last().expect("blackjack").1.clone();
+    for m in &mut v2.methods {
+        match m.name.as_str() {
+            "limits" => m.returns = Some(Type::Bytes { max: 112 }),
+            "reveal_seed" => m.returns = Some(Type::U16),
+            "set_limits" => m.args.push(Arg { name: "open_blocks".into(), ty: U64 }),
+            _ => {}
+        }
+    }
+    v2.methods.push(method("version", View, false, &[], Some(U8)));
+    v2.methods.sort_by(|a, b| a.name.cmp(&b.name));
+    guests.push(("blackjack2", v2));
+    guests
 }
 
 fn dir() -> PathBuf {
