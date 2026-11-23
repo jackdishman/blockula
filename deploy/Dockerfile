@@ -3,7 +3,7 @@
 # (scripts/check-pins.sh). Bump both deliberately: `docker buildx imagetools inspect <image:tag>`.
 # The served wallet uses exactly the Node.js image used by the release wallet build
 # (WALLET_IMAGE in scripts/reproduce-release.sh; scripts/check-pins.sh checks parity).
-FROM node:22.21.1-bookworm@sha256:b84d52cd45bfe261096ccbf886955d431b8b9ed01b72eaef588e8886bda09e78 AS wallet
+FROM node:26.13.1-bookworm@sha256:b7087bc4d973034b30854b378ba107f9fab622b47514cb7e2592e41b8bab8d49 AS wallet
 WORKDIR /src
 COPY package.json package-lock.json ./
 # npm ci resolves all three workspace manifests, but no MCP source is needed here.
