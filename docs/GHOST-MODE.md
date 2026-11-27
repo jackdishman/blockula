@@ -577,8 +577,8 @@ Measured with the release binary on a MacBook Pro (Mac16,6, Apple M4 Max, 2026-1
 
 | | |
 |---|---|
-| Prove, per action (witness check included, the prover's default threads) | 56–109 ms, median 70 ms over 12 actions |
-| Shield (tag 50, signed: its ML-DSA-65 key and signature are ~5.3 KB of it) | 137,937–141,362 bytes on the wire |
+| Prove, per action (witness check included, the prover's default threads) | 52–109 ms, median 67 ms over 18 actions |
+| Shield (tag 50, signed: its ML-DSA-65 key and signature are ~5.3 KB of it) | 137,937–141,394 bytes on the wire |
 | Private transfer and unshield (tags 51, 52, unsigned) | 132,029–136,830 bytes on the wire |
 | Canonical fee on the dev chain | 0.004 FANG (0.104 FANG for an unshield that opens its recipient's account) |
 | The whole script (a new chain, three wallets, six actions, each waiting for a 1-second block) | 13 s |
