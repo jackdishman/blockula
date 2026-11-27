@@ -1149,8 +1149,13 @@ pub(crate) mod tests {
 
     /// A node with an API on a summoned chain of one validator, making blocks in the background.
     pub(crate) fn local_node(tag: &str) -> (PathBuf, Vec<PathBuf>, std::sync::Arc<parking_lot::Mutex<crate::chain::Chain>>, tokio::runtime::Runtime, String) {
+        local_node_with(tag, crate::chain::SummonOpts::new(tag, 1))
+    }
+
+    /// [`local_node`] on a chain summoned with `opts` (one validator).
+    pub(crate) fn local_node_with(tag: &str, opts: crate::chain::SummonOpts) -> (PathBuf, Vec<PathBuf>, std::sync::Arc<parking_lot::Mutex<crate::chain::Chain>>, tokio::runtime::Runtime, String) {
         let root = std::env::temp_dir().join(format!("blockula-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()));
-        let homes = crate::chain::Chain::summon(&root, &crate::chain::SummonOpts::new(tag, 1)).unwrap();
+        let homes = crate::chain::Chain::summon(&root, &opts).unwrap();
         let chain = std::sync::Arc::new(parking_lot::Mutex::new(crate::chain::Chain::open(&homes[0]).unwrap()));
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let url = rt.block_on(async {

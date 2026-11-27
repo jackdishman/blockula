@@ -14,6 +14,7 @@ mod econ;
 mod epochs;
 mod genesis_builder;
 mod ghost;
+mod ghost_cli;
 mod github;
 mod gov_cli;
 mod governance;
@@ -174,8 +175,8 @@ enum Cmd {
         #[arg(long)]
         programs: bool,
         /// Start a new dev chain with Ghost Mode (shielded transfers) on from block 1: the `ghost`
-        /// feature in its genesis and a pool cap of 1,000,000 FANG, for local testing of
-        /// shielded transfers. A chain already made without it keeps its genesis: add
+        /// feature in its genesis and a pool cap of 1,000,000 FANG, to shield, send privately and
+        /// unshield with `blockula ghost`. A chain already made without it keeps its genesis: add
         /// --reset. Ghost Mode is NOT AUDITED and for local testing only: a chain made with it now
         /// may need to be recreated after an update
         #[arg(long)]
@@ -349,6 +350,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: program_cli::ProgramCmd,
     },
+    /// 👻 Ghost Mode: shield, send privately, unshield and scan (on a chain that has it on; not audited)
+    Ghost {
+        #[command(subcommand)]
+        cmd: ghost_cli::GhostCmd,
+    },
     /// 🥩 Stake: delegate to validator pools, unbond, withdraw
     Stake {
         #[command(subcommand)]
@@ -473,7 +479,7 @@ fn main() -> Result<()> {
                 anyhow::bail!("the dev chain at {} was made without Ghost Mode, and a chain's genesis can't change; start a new one with `blockula dev --ghost --reset`", home.display());
             }
             if ghost_on {
-                println!("👻 Ghost Mode is on from block 1: Ghost Mode is NOT AUDITED: use it on local test chains only, and a chain made with it now may need to be recreated after an update");
+                println!("👻 Ghost Mode is on from block 1: `blockula ghost --help` shields, sends privately, unshields and scans. Ghost Mode is NOT AUDITED: use it on local test chains only, and a chain made with it now may need to be recreated after an update");
             }
             if programs_on {
                 println!("🧩 Programs are on from block 1: `blockula program --help` uploads, creates, calls and views them. Programs are experimental and not yet audited: a chain made with them now may need to be recreated after an update");
@@ -608,6 +614,7 @@ fn main() -> Result<()> {
         Cmd::Multisig { cmd } => gov_cli::multisig(cmd, &blockula_dir()),
         Cmd::Name { cmd } => contrib_cli::name(cmd, &blockula_dir()),
         Cmd::Program { cmd } => program_cli::program(cmd, &blockula_dir()),
+        Cmd::Ghost { cmd } => ghost_cli::ghost(cmd, &blockula_dir()),
         Cmd::Stake { cmd } => contrib_cli::stake(cmd, &blockula_dir()),
         Cmd::Keygen { prefix } => {
             anyhow::ensure!(crypto::is_prefix(&prefix), "prefix must be one of {:?}", crypto::KNOWN_PREFIXES);
@@ -760,6 +767,7 @@ mod cli_tests {
             super::Cmd::Dev { ghost, .. } => assert!(!ghost, "off unless asked"),
             _ => unreachable!(),
         }
+        assert!(parse(&["ghost", "balance", "--rpc", "http://localhost:7171"]).is_ok());
         let root = std::env::temp_dir().join(format!("blockula-devghost-{}-{}", crate::chain::now_ms(), std::process::id()));
         let opts = crate::chain::SummonOpts::new("devghost", 1).with_programs().with_ghost(super::DEV_GHOST_POOL_CAP);
         let homes = crate::chain::Chain::summon(&root, &opts).unwrap();
