@@ -1,0 +1,46 @@
+[package]
+name = "blockula-ghost-wasm"
+version = "0.1.0"
+edition = "2024"
+description = "Ghost Mode for wallets: the blockula-ghost keys, notes, tree and Action prover as WebAssembly (wasm-bindgen). NOT AUDITED."
+license = "MIT"
+publish = false
+
+# Its own workspace, like blockula-ghost: nothing here is in the node's build or its lockfile, and
+# no pin of the node's or the crate's changes for it. It adds no cryptography of its own: every key,
+# note, path and proof comes from blockula-ghost, by path.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+blockula-ghost = { path = "../ghost" }
+# The glue generator (`wasm-bindgen-cli`) must be this exact version: scripts/build-ghost-wasm.sh
+# reads it from here.
+wasm-bindgen = "=0.2.129"
+# OS randomness in a browser or Node: `crypto.getRandomValues`, through getrandom's wasm_js backend.
+# blockula-ghost's own draws (rand's SysRng) resolve to the same crate, so the feature covers them.
+getrandom = { version = "=0.4.3", features = ["wasm_js"] }
+rand_core = "=0.10.1"
+zeroize = { version = "=1.9.1", default-features = false }
+
+# What blockula-ghost was tested with (overflow checks on, in it and in Plonky3), optimized for
+# speed: proving is the slow part. WebAssembly aborts on a panic, which is fine for a wallet (the
+# crate's catch_unwind matters to `verify` in a node).
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+overflow-checks = true
+strip = true
+
+# Tests prove; see node/ghost/Cargo.toml.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.p3-uni-stark]
+debug-assertions = false
+
+[profile.test]
+opt-level = 2
