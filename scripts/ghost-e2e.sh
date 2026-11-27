@@ -38,7 +38,7 @@ fail() { echo "❌ FAIL: $*" >&2; if [[ -f "$DIR/node.log" ]]; then echo "--- no
 json() { python3 -I -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 api() { curl -fsS -m 5 "$RPC/api$1"; }
 
-[[ -x "$BIN" ]] || fail "$BIN isn't built: cargo build --release --manifest-path node/Cargo.toml"
+[[ -x "$BIN" ]] || fail "$BIN isn't built: cargo build --locked --release --manifest-path node/Cargo.toml"
 # The ports other things on a developer's machine use, and anything already listening.
 case "$PORT" in 7070|3000|30300) fail "port $PORT is left alone: pick another (PORT=7171)";; esac
 if curl -s -m 1 -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null || nc -z 127.0.0.1 "$PORT" 2>/dev/null; then fail "something is already listening on port $PORT: pick another (PORT=…)"; fi
