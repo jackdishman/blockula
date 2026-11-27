@@ -13,7 +13,8 @@ pairings, no elliptic curves.
 This document is the design contract for MAINNET-DESIGN.md §6 (DEC-2). Its library is the
 `blockula-ghost` crate in `node/ghost/` (P-GHOST-CORE). The node integrates it in
 `node/src/ghost.rs` (P-GHOST-INT: tags 50–54, state, turnstile, fees, pause), switched off until
-governance activates it; section 8 describes what was built. Background, prior art and the
+governance activates it; section 8 describes what was built, and its first client, the CLI
+(`blockula ghost`, on a local `blockula dev --ghost` chain). Background, prior art and the
 choice of stack: `.context/research/ghost-mode.md`.
 
 | | |
@@ -498,6 +499,90 @@ address}`: a published address and its fingerprint. Tx JSON shows ghost bundles 
 proof (its size and hash instead) but with the commitments and ciphertexts wallets scan; an
 unsigned tx's summary is "👻 a ghost transaction happened".
 
+**Wallet sync.** `GET /api/ghost/commitments?from=<position>&limit=<n ≤ 256>` pages the commitment
+tree's leaves in order. Each entry has its `position`, the commitment `cm`, the output's
+ciphertexts `enc` and `out`, the block `height` and the `tx` that appended it (`index`: which of
+the tx's two outputs it is), and `nullifier`: the same action's spend of that index. The nullifier
+has nothing to do with the output beside it; it's listed so that a wallet that has paged every
+leaf has seen every spend, and can mark its own notes spent without another endpoint. `next` is
+the cursor (`null` at the end), and `frontier_size` and `root` are the tree's size and the anchor
+as of block `height`: a wallet that appended every leaf through `frontier_size` holds that root,
+and checks it. It's read-only and adds no state: the commitments are namespace 48, which block
+appended which leaves follows from the nullifier records (every applied action spends two
+nullifiers at its height and appends two leaves; `ghost::commitment_blocks`, computed at most once
+per block view), and the ciphertexts are read from those blocks. So a node that pruned a block
+answers `410` `pruned` for its leaves, as `/api/block` does: wallets sync from an archive node, or
+from one that still holds the blocks since their last scan. A pending tx's outputs aren't listed.
+
+**The CLI** (`node/src/ghost_cli.rs`): `blockula ghost`, the first client. It needs a chain with
+the feature on, and the only one there is today is a local test chain:
+
+```sh
+blockula dev --ghost            # a new dev chain: `ghost` in its genesis features, ghost_pool_cap 1,000,000 FANG
+                                # (--reset replaces a dev chain made without it; a genesis can't change)
+blockula wallet new && blockula wallet faucet
+blockula ghost address --publish        # SetGhostAddress (tag 53): others can now send to your name or address
+blockula ghost shield 40                # tag 50: 40 FANG into a note of your own
+blockula ghost balance                  # scans, then lists your unspent notes
+blockula ghost send vlad.boo 12.5 --memo "for the garlic"   # tag 51, to vlad.boo's published address
+blockula ghost unshield mina.boo 3      # tag 52: the amount and recipient are public
+blockula ghost export-viewing-key --incoming    # or --full, --outgoing: hex on stdout
+```
+
+Every command takes `--rpc` and the chain pin (`--network`, `--chain-id`, `--genesis-hash`) like
+the rest of the CLI, and `--key <file>` for a wallet other than `~/.blockula/wallet.json`.
+
+- **Keys.** The ghost key is `SpendingKey::from_master(<the wallet's 32-byte seed>, 0)`: the seed
+  the account's ML-DSA key expands from is the master seed of its ghost keys, through
+  `BLAKE3-KDF("blockula ghost v1 account", seed ‖ 0)`, so there's no second secret to back up and
+  neither key says anything about the other (`ghost_cli::ghost_key`). Account 0 only.
+- **Scanning.** `scan` and `balance` page `/api/ghost/commitments` from where the last scan
+  stopped, append every leaf to a `FullTree`, trial-decrypt every output with `TrialDecryptor`,
+  and mark the wallet's notes spent where their nullifier shows up. Nothing is kept unless the
+  leaves hash to the node's own anchor. The result is the note store,
+  `~/.blockula/ghost/<instance hex>.json` (mode 600; a `--key` wallet's has the start of its owner
+  digest in the name too): the leaves, and the wallet's notes with their secrets. It's a cache:
+  deleting it loses nothing, and the next scan rebuilds it from the chain.
+- **Building a transaction.** `shield`, `send` and `unshield` read `/api/ghost` for the chain
+  `instance`, the anchor and the fee rule, build an `ActionWitness` with the crate (dummies where
+  there's nothing real: a shield is two dummy spends, a note for the wallet and a dummy output),
+  prove, and post the wire bytes as `application/octet-stream`. Unsigned txs (51, 52) pay the
+  canonical fee (`canonical_fee`, or `canonical_fee_new_account` when an unshield opens its
+  recipient's account), tip 0, with `valid_until` = the height + `max_tx_validity_blocks`; the
+  anchor is the root of the wallet's own tree, which must be the node's. A shield is a signed tx,
+  so its fee is the usual byte-fee ceiling, priced for the largest proof there is (the fee is in
+  the sighash, so it's fixed before the proof's size is known; the block charges for the real
+  size), plus `ghost_verify_fee`. Each command waits for its tx to be final and scans again.
+- **More than two notes.** An action spends at most two notes. When a payment needs more, the CLI
+  first merges notes two at a time with private transfers to the wallet itself, each paying the
+  fee, then pays: it says how many actions that is before it starts, and each waits for the one
+  before it. (A bundle of several actions in one tx is still not built.)
+- **What's the node's word.** The recipient's address comes from
+  `/api/ghost/address/{name or address}`, unproven: `send` prints its fingerprint and asks, or
+  takes `--fingerprint` (as the recipient read it out) and refuses another. The fee is the node's
+  quote too: more than `--max-fee` (1 FANG by default) is refused. A wrong anchor or instance
+  can't cost more than a refused tx.
+- **Secrets.** No command prints a seed, a spending key or a note's secrets, and the types that
+  hold them have no `Debug` (the crate's print `Type(..)`). `export-viewing-key` prints the key
+  it was asked for, and says on stderr what its holder will see.
+
+`node/src/ghost_cli/tests.rs` runs the commands against a node over HTTP (shield, scan, a private
+send to a second wallet that takes a merge first, the recipient's scan, unshields to a new and to
+an existing account, and the wallets, the pool and `/api/ghost` adding up), and
+`scripts/ghost-e2e.sh` does the same with the binary against `blockula dev --ghost`, two wallets
+and a `.boo` name.
+
+Measured with the release binary on a MacBook Pro (Mac16,6, Apple M4 Max, 2026-11-26; two runs, six actions each), by `scripts/ghost-e2e.sh`
+(each line of a command's output has them: "proved in N ms · B bytes on the wire"):
+
+| | |
+|---|---|
+| Prove, per action (witness check included, the prover's default threads) | 56–109 ms, median 70 ms over 12 actions |
+| Shield (tag 50, signed: its ML-DSA-65 key and signature are ~5.3 KB of it) | 137,937–141,362 bytes on the wire |
+| Private transfer and unshield (tags 51, 52, unsigned) | 132,029–136,830 bytes on the wire |
+| Canonical fee on the dev chain | 0.004 FANG (0.104 FANG for an unshield that opens its recipient's account) |
+| The whole script (a new chain, three wallets, six actions, each waiting for a 1-second block) | 13 s |
+
 **Tests** (`node/src/ghost/tests.rs`, real proofs from the crate's prover, through the mempool
 and blocks, with the incremental root checked against a rebuild and the invariants after every
 block): shield → private transfer (found by trial decryption) → unshield, with a restart, a
@@ -514,12 +599,18 @@ proof-checked by every verifier and executed to the same root), consensus `verif
 and bound tests and shared Rust/TypeScript vectors in `types.rs`, and the `ghost_tx` fuzz target
 with real-proof seeds (`node/fuzz`).
 
-**Not built yet.** Clients: the CLI (`blockula ghost shield|send|unshield|scan|export-viewing-key`),
-`@blockula/sdk/ghost` on a WASM build of the crate (the SDK encodes ghost txs and their sighash but
-can't prove), the MCP tools (`ghost_balance`, `ghost_send`, capped by `BLOCKULA_MAX_SEND`), and the
-explorer's ghost view. No delegated proving by default (the prover sees the witness). Also open:
-a withdraw-only mode and the migration path, `/api/ghost` commitment paging for wallet sync, and
-2-in/2-out only (no multi-action bundles).
+**Not built yet.** The other clients: `@blockula/sdk/ghost` on a WASM build of the crate (the SDK
+encodes ghost txs and their sighash but can't prove), the MCP tools (`ghost_balance`,
+`ghost_send`, capped by `BLOCKULA_MAX_SEND`), the web wallet, and the explorer's ghost view. No
+delegated proving by default (the prover sees the witness). Also open: a withdraw-only mode and
+the migration path, and 2-in/2-out only (no multi-action bundles: the CLI chains actions). In the
+CLI: witnesses for the recipient's address and the pool's status (it trusts one RPC, and prints
+what it took on trust); sync from a pruning node past its window (a node-side index of the
+ciphertexts would lift that, and the per-block pass over the nullifier records with it); recovery
+of sent notes with the outgoing viewing key (the crate has `try_decrypt_outgoing`; the CLI doesn't
+scan with it); scanning with an exported viewing key; ghost accounts other than 0; a tip when the
+mempool's ghost share is full (the CLI always tips 0, and reports the node's refusal); and a note
+store that scales (it holds every leaf as hex in one JSON file, rewritten each scan).
 
 ## 9. Activation gates
 
