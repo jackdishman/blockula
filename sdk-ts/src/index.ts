@@ -457,6 +457,9 @@ export interface SendOptions extends TxOptions {
   onSigned?: (tx: Tx, id: string) => void | Promise<void>;
 }
 
+/** The last step of building a tx (`BuildOptions.finish`, `Wallet.submitFinished`): the action to sign, given the tx it's in (its nonce, fee and validity are final). */
+export type FinishAction = (tx: UnsignedTx) => Action | Promise<Action>;
+
 /** The most `feeHeadroom` a tx may ask for: 100 × the base fee. */
 export const MAX_FEE_HEADROOM = 100;
 
@@ -467,6 +470,12 @@ export const MIN_NEW_ACCOUNT = 10_000_000n;
 export interface BuildOptions extends TxOptions {
   /** `Client.resolution`s of names in `action`'s address fields (refused on mainnet unless proven). */
   resolutions?: Resolution[];
+  /**
+   * Called with the unsigned tx once its nonce, fee and validity are final, for the action to
+   * sign in place of the draft: the same type, and no larger than the draft the fee was priced on.
+   * For a `shield`, whose Action proof is bound to those fields (`@blockula/sdk/ghost`).
+   */
+  finish?: FinishAction;
 }
 
 /**
@@ -690,7 +699,7 @@ export class Wallet {
    * (the helpers' resolutions of names in fields that need an address) or the account `actAs`
    * found that way (audit gap-7-1). Checked against the very status the tx is signed for.
    */
-  private async buildChecked(action: Action | ((height: number) => Action), memo: string, opts: TxOptions & { reserved?: FuelReservation }, unproven: Resolution[]): Promise<Tx> {
+  private async buildChecked(action: Action | ((height: number) => Action), memo: string, opts: TxOptions & { reserved?: FuelReservation; finish?: FinishAction }, unproven: Resolution[]): Promise<Tx> {
     await this.client.addressPrefix(); // so `this.account` uses the chain's prefix
     const [status, account, fees] = await Promise.all([this.client.status(), this.client.account(this.account).catch(() => null), this.client.fees()]);
     if (!Number.isSafeInteger(status.height) || status.height < 0) throw new Error(`${this.client.rpc} doesn't report its height`);
@@ -722,6 +731,13 @@ export class Wallet {
       const multiple = fees.tip_cap_multiple ?? DEFAULT_TIP_CAP_MULTIPLE;
       const cap = maxTip(unsigned, fees.lowest ?? fees.suggested, multiple) + BigInt(multiple) * fuel.floor;
       if (tip > cap) throw new Error(`tip too high: at most ${multiple}× the base fee, ${cap} drops for this transaction now`);
+    }
+    // What depends on the tx's own fields (a shield's proof is bound to its nonce, fee and validity) goes in last.
+    if (opts.finish) {
+      const finished = await opts.finish(unsigned);
+      if (finished.type !== act.type) throw new Error(`the finished action is a ${finished.type}, not the ${act.type} that was priced. Nothing was signed`);
+      if (signingBytes({ ...unsigned, action: finished }).length > signingBytes(unsigned).length) throw new Error("the finished action is larger than the one its fee was priced for. Nothing was signed");
+      unsigned.action = finished;
     }
     return this.sign(unsigned);
   }
@@ -784,7 +800,7 @@ export class Wallet {
    * misjudge a correct nonce for a moment), then the node's next nonce is used. Anything else
    * (a timeout, a 5xx, a broken connection) may have been admitted, so its nonce isn't reused.
    */
-  private async submitQueued(action: Action | ((height: number) => Action), memo: string, opts: TxOptions & { wait?: boolean; onSigned?: SendOptions["onSigned"]; reserved?: FuelReservation }, unproven: Resolution[], retry: RetryBusy = NO_RETRY): Promise<any> {
+  private async submitQueued(action: Action | ((height: number) => Action), memo: string, opts: TxOptions & { wait?: boolean; onSigned?: SendOptions["onSigned"]; reserved?: FuelReservation; finish?: FinishAction }, unproven: Resolution[], retry: RetryBusy = NO_RETRY): Promise<any> {
     const { tx, id } = await this.enqueue(async () => {
       const tx = await this.buildChecked(action, memo, opts, unproven);
       // Stored before it leaves (store first, then send); a store that fails submits nothing.
@@ -1174,6 +1190,29 @@ export class Wallet {
   /** Submits one action (the shared tail of the helpers below); `unproven`: see `buildChecked`. */
   private async act(action: Action, opts: TxOptions & { wait?: boolean; memo?: string } = {}, unproven: Resolution[] = []) {
     return this.submitQueued(action, opts.memo ?? "", opts, unproven);
+  }
+
+  // ---- 👻 Ghost Mode (tags 50, 53; `@blockula/sdk/ghost` proves and calls these). Off unless the chain turned it on. ----
+
+  /**
+   * Publishes the account's Ghost Mode address (tag 53, `set_ghost_address`): 1,216 bytes, hex or
+   * raw, filed under the account so wallets find it under each of its `.boo` names. Owner keys
+   * only. `GhostWallet.publishAddress` calls this with its own address.
+   */
+  async setGhostAddress(address: string | Uint8Array, opts: TxOptions & { wait?: boolean } = {}) {
+    return this.act({ type: "set_ghost_address", address: typeof address === "string" ? address.trim().toLowerCase() : bytesToHex(address) }, opts);
+  }
+
+  /**
+   * Builds `draft`, hands the unsigned tx to `finish` for its final action, then signs and submits
+   * it in this wallet's queue. For an action that depends on the tx's own nonce, fee and validity:
+   * a `shield`, whose Action proof is bound to them through `ghostSighash`. The fee is priced on
+   * `draft` (give it a proof of the largest size, so the fee covers any real one) and `finish`
+   * must return an action of the same type and no larger (`BuildOptions.finish`).
+   * `GhostWallet.shield` is its caller.
+   */
+  async submitFinished(draft: Action, finish: FinishAction, opts: TxOptions & { wait?: boolean; onSigned?: SendOptions["onSigned"] } = {}) {
+    return this.submitQueued(draft, "", { ...opts, finish }, []);
   }
 
   /**
@@ -2837,6 +2876,13 @@ export class Client {
   /** A multisig account: owners, threshold, open proposals and their approvals. */
   multisig(account: string) { return this.call(`/multisig/${encodeURIComponent(account)}`); }
 
+  /** 👻 Ghost Mode's status (`/api/ghost`): on or off, paused, the pool and its cap, the anchor, the chain `instance`, the circuit id and the fee rule. The node's word: `@blockula/sdk/ghost` checks what it uses. */
+  ghost() { return this.call("/ghost"); }
+  /** A page of the Ghost Mode commitment tree's leaves from position `from` (at most 256), for wallet sync: `commitments`, `next`, `frontier_size`, `root`, `height`. */
+  ghostCommitments(from = 0, limit = 256) { return this.call(`/ghost/commitments?from=${wholeNumber(from, "from")}&limit=${wholeNumber(limit, "limit")}`); }
+  /** The Ghost Mode address an account (a name or an address) published, and its fingerprint: the node's word, so compare the fingerprint with its owner. A 404 `ApiError` when it published none. */
+  ghostAddress(account: string): Promise<{ account: unknown; address: string; fingerprint: string }> { return this.call(`/ghost/address/${encodeURIComponent(account)}`); }
+
   // ---- programs (protocol v2, docs/PROGRAMS-V0.md §8.2, §8.4): third-party WebAssembly. Every answer is checked
   // before it's used (programs.ts), and what a program or its deployer chose is kept as `untrusted_*`. ----
 
@@ -3078,7 +3124,9 @@ export class Client {
    * runs at most once. As JSON, or in its wire form with `wireTxs`. Errors as `submit`'s.
    */
   async post(tx: Tx): Promise<{ id: string }> {
-    const r = await this.call("/tx", this.wireTxs ? txBytes(tx) : tx);
+    // Ghost txs carry a ~130 KiB proof: they travel in their wire form (docs/GHOST-MODE.md section 8).
+    const ghost = tx.action.type === "shield" || tx.action.type === "private_transfer" || tx.action.type === "unshield";
+    const r = await this.call("/tx", this.wireTxs || ghost ? txBytes(tx) : tx);
     if (typeof r?.id !== "string") throw new Error(`${this.rpc} answered the submission without the transaction's id: it may or may not have been admitted`);
     return { id: r.id };
   }
