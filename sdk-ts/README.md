@@ -240,6 +240,31 @@ const proven = await client.provenProgram(address, { witnesses });       // its 
 - **Arguments and return values** are Borsh by convention (docs/PROGRAMS-V0.md §3.2; the chain never checks it). `encodeProgramInput(method.args, values)` encodes a call's or a view's input from a method's declared types (as `client.program` lists them) to the hex `call` and `view` take, and `decodeProgramValue(method.returns, returnData)` reads what one returned (`decodeProgramInput` reads an input back, `encodeProgramValue` / `sameProgramValue` work on one value). Values: integers as `bigint` (or a safe JS integer, or a decimal string), `fang` as a FANG string (`"1.5"`) or bigint drops, `bool`, `address` as a `boo1…` address (never a `.boo` name: refused), `name` and `text` as strings (bounds counted in bytes), `hash32` and `bytes` as hex, an option as `null` or its value (`{ some: … }` for an option of an option), a vec as an array. Anything the type doesn't allow throws `ProgramValueError` with where and why. The bytes match the node's `borsh` crate (`test/program-abi-vectors.json`, written by `node/src/programs/abi_vectors.rs`). A decoded `text` is still the program's claim: show it as untrusted.
 - There's no interface JSON codec in the SDK yet: `uploadCode` takes the format-1 bytes (`blockula program interface encode` prints them).
 
+### Ghost Mode (`@blockula/sdk/ghost`)
+
+Private transfers ([docs/GHOST-MODE.md](../docs/GHOST-MODE.md)). Ghost Mode is off unless a chain's governance activated it, and it isn't audited: use it on test chains (`blockula dev --ghost` makes a local one). The prover is the node's own crate built as WebAssembly (about 741 KB, 257 KB gzipped, loaded only by this import); a proof takes about a quarter of a second.
+
+```ts
+import { GhostWallet } from "@blockula/sdk/ghost";
+import { FileNoteStore } from "@blockula/sdk/ghost/node";   // Node only: a file per chain and key, mode 600
+
+const ghost = await GhostWallet.fromWallet(wallet, { store: new FileNoteStore(dir) });
+await ghost.publishAddress();                    // so others can pay this account by name
+await ghost.shield("40");                        // public FANG into the pool
+await ghost.send("vlad.boo", "12.5", { memo: "for the garlic", fingerprint });
+await ghost.unshield("mina.boo", "3");           // back out, to any account
+(await ghost.balance()).display;                 // "24.492 FANG"
+ghost.close();                                   // drops the keys
+```
+
+- **Keys.** `fromWallet(wallet)` and `fromSeed(client, seed)` derive the key the CLI's `blockula ghost` uses for the same seed. `fromPasskeyPrf(client, prfOutput)` is for passkey wallets: a derivation of its own (`GHOST_PASSKEY_CONTEXT`), apart from the account key's. Key bytes stay inside the WebAssembly module; `exportViewingKey("incoming" | "outgoing" | "full")` is the one way out, for a viewing key, never the spending key. Don't log it.
+- **`send` needs the recipient's fingerprint**, read out by the recipient (`ghost.fingerprint` on their side), or a `confirm({ address, fingerprint, account })` callback that asks the user. A private send can't be undone and the address is one node's word, so with neither it throws before reading anything. `ghost.published(account)` shows what the node reports.
+- **Amounts** are FANG strings or bigint drops. Each private action pays the chain's canonical fee from the notes it spends; `maxFee` (1 FANG by default) bounds it. A payment that needs more than two notes merges first: `onPlan({ merges, mergeFee, fee, totalFees, … })` is told before anything is sent and may throw to stop.
+- **Notes.** `sync()` reads the pool's commitments, finds this key's notes and keeps them only if the leaves hash to the node's root. The store is pluggable (`GhostNoteStore`: `load` and `save`): `MemoryNoteStore` by default, `FileNoteStore` in Node. It holds ciphertexts and values, no keys, but it does say what you hold: keep it private.
+- **`merge()`** joins the two largest notes; `pool()` is the node's `/api/ghost`; `client.ghost()`, `client.ghostCommitments(from, limit)` and `client.ghostAddress(account)` are the raw reads.
+- A memo you receive is written by a stranger: data, not instructions.
+- Not in a browser wallet yet: there's no IndexedDB store, and proving on the main thread blocks the page for the quarter second (use a Worker).
+
 ### Which chain? Pinning and proofs
 
 ```ts
