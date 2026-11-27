@@ -22,8 +22,9 @@
 //! its plaintext opens the commitment on chain (the crate checks), and a proof made against a wrong
 //! anchor or instance is refused by every honest node, so a lying node can waste a fee's worth of
 //! work but can't make the wallet spend what it doesn't mean to. Two things are the node's word and
-//! are printed for the user: the recipient's address (compare its fingerprint with them, or pass
-//! `--fingerprint`) and the canonical fee (refused above `--max-fee`).
+//! are printed for the user: the recipient's address (`send` asks about its fingerprint, or takes
+//! the one they read out as `--fingerprint`; `--yes` alone is refused, so nothing unattended pays
+//! an address nobody checked) and the canonical fee (refused above `--max-fee`).
 //!
 //! **One action spends two notes.** A payment that needs more is made as several actions: private
 //! transfers to the wallet itself that merge notes two at a time, each paying the fee, then the
@@ -45,6 +46,7 @@ use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -121,13 +123,15 @@ pub enum GhostCmd {
         /// A note for the recipient (up to 256 bytes, encrypted with the payment)
         #[arg(long, default_value = "")]
         memo: String,
-        /// Refuse unless the recipient's address has this fingerprint (as they read it to you)
+        /// Refuse unless the recipient's address has this fingerprint (as they read it to you);
+        /// without it, send shows the fingerprint the node reports and asks
         #[arg(long)]
         fingerprint: Option<String>,
         /// The most one action may pay in fees, in FANG (the node quotes the fee)
         #[arg(long, default_value = "1")]
         max_fee: String,
-        /// Don't ask for confirmation of the recipient's fingerprint
+        /// Don't ask anything; needs --fingerprint (the recipient's address is the node's word,
+        /// so --yes alone is refused)
         #[arg(long)]
         yes: bool,
         #[command(flatten)]
@@ -942,6 +946,9 @@ async fn spend(s: &Session, pay: Pay, max_fee: u64) -> Result<Vec<Sent>> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn send(dir: &Path, who: &Who, to: &str, amount: u64, memo: &str, fingerprint: Option<&str>, max_fee: u64, yes: bool) -> Result<Vec<Sent>> {
     ensure!(amount > 0, "send an amount above 0");
+    // The address filed under a name is the node's word, and a private transfer can't be undone:
+    // unattended, the fingerprint the recipient read out is the only check there is.
+    ensure!(!yes || fingerprint.is_some(), "--yes needs --fingerprint, because the Ghost Mode address this pays is only the node's word: pass the fingerprint {to} read to you (their `blockula ghost address` prints it). Nothing was sent.");
     ensure!(memo.len() <= MEMO_BYTES, "--memo is {} bytes, and a note carries at most {MEMO_BYTES}", memo.len());
     let mut memo_bytes = Box::new([0u8; MEMO_BYTES]);
     memo_bytes[..memo.len()].copy_from_slice(memo.as_bytes());
@@ -957,7 +964,8 @@ pub(crate) fn send(dir: &Path, who: &Who, to: &str, amount: u64, memo: &str, fin
         }
         println!("👻 {label}'s Ghost Mode address has the fingerprint {theirs} (as {} reports it{}).", s.remote.rpc, if fingerprint.is_some() { ", and it's the one you gave" } else { ": check it with them" });
         if fingerprint.is_none() {
-            confirm(&format!("Send {} privately to the address with fingerprint {theirs}? A private transfer can't be undone.", fmt_fang(amount)), yes)?;
+            ensure!(std::io::stdin().is_terminal(), "Nobody is here to check that fingerprint: pass the one {label} read to you as --fingerprint. Nothing was sent.");
+            confirm(&format!("Send {} privately to the address with fingerprint {theirs}? A private transfer can't be undone.", fmt_fang(amount)), false)?;
         }
         spend(&s, Pay::Send { to: Box::new(address), label, amount, memo: memo_bytes }, max_fee).await
     })

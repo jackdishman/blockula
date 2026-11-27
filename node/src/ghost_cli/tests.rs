@@ -40,7 +40,7 @@ fn shield_scan_send_and_unshield_end_to_end() {
     // Nothing shielded yet, and nobody to send to.
     let s = scan(&alice, &who(&url)).unwrap();
     assert_eq!((s.balance, s.leaves, s.unspent.len()), (0, 0, 0));
-    let e = send(&alice, &who(&url), &bob_account, FANG, "", None, FANG, true).unwrap_err().to_string();
+    let e = send(&alice, &who(&url), &bob_account, FANG, "", Some("0000-0000-0000-0000-0000"), FANG, true).unwrap_err().to_string();
     assert!(e.contains("hasn't published a Ghost Mode address"), "{e}");
 
     // Bob publishes his address (tag 53); the chain files it under his account.
@@ -63,13 +63,22 @@ fn shield_scan_send_and_unshield_end_to_end() {
     assert_eq!((s.balance, s.unspent.len(), s.leaves, s.new_leaves), (90 * FANG, 3, 6, 0), "the shields scanned as they went");
 
     // More than she has, in a sentence; nothing is sent.
-    let e = send(&alice, &who(&url), &bob_account, 90 * FANG, "", None, FANG, true).unwrap_err().to_string();
+    let e = send(&alice, &who(&url), &bob_account, 90 * FANG, "", Some(&bobs.fingerprint()), FANG, true).unwrap_err().to_string();
     assert!(e.contains("This wallet has 90 FANG shielded in 3 notes") && e.contains("Nothing was sent"), "{e}");
     // A wrong fingerprint, and a fee above --max-fee, are refused before anything is proved.
     let e = send(&alice, &who(&url), &bob_account, FANG, "", Some("0000-0000-0000-0000-0000"), FANG, true).unwrap_err().to_string();
     assert!(e.contains(&bobs.fingerprint()) && e.contains("Nothing was sent"), "{e}");
-    let e = send(&alice, &who(&url), &bob_account, FANG, "", None, 1, true).unwrap_err().to_string();
+    let e = send(&alice, &who(&url), &bob_account, FANG, "", Some(&bobs.fingerprint()), 1, true).unwrap_err().to_string();
     assert!(e.contains("--max-fee"), "{e}");
+    // --yes with no fingerprint would pay whatever address the node reports, unchecked: refused.
+    let e = send(&alice, &who(&url), &bob_account, FANG, "", None, FANG, true).unwrap_err().to_string();
+    assert!(e.contains("--yes needs --fingerprint") && e.contains("Nothing was sent"), "{e}");
+    // And with nobody at a terminal to ask (a test's stdin), it's the fingerprint or nothing.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let e = send(&alice, &who(&url), &bob_account, FANG, "", None, FANG, false).unwrap_err().to_string();
+        assert!(e.contains("--fingerprint") && e.contains("Nothing was sent"), "{e}");
+    }
+    assert_eq!(scan(&alice, &who(&url)).unwrap().balance, 90 * FANG, "none of those spent a note");
     assert_eq!(pool_now(), 90 * FANG);
 
     // 80 FANG to bob takes all three notes: one merge (40 + 30), then the payment.
@@ -136,7 +145,7 @@ fn a_chain_without_ghost_mode_says_so() {
     let off = |e: anyhow::Error| assert!(e.to_string().contains("Ghost Mode is off") && e.to_string().contains("blockula dev --ghost"), "{e}");
     off(scan(&dir, &who(&url)).err().unwrap());
     off(shield(&dir, &who(&url), FANG, None).err().unwrap());
-    off(send(&dir, &who(&url), "vlad.boo", FANG, "", None, FANG, true).err().unwrap());
+    off(send(&dir, &who(&url), "vlad.boo", FANG, "", Some("0000-0000-0000-0000-0000"), FANG, true).err().unwrap());
     off(unshield(&dir, &who(&url), "vlad.boo", FANG, FANG).err().unwrap());
     off(address(&dir, &who(&url), true, None).err().unwrap());
     // The fingerprint needs no chain.
@@ -178,8 +187,11 @@ fn merges_are_counted_before_anything_is_sent() {
 fn arguments_are_checked_offline() {
     let dir = std::env::temp_dir().join(format!("blockula-ghostargs-{}-{}", crate::chain::now_ms(), std::process::id()));
     let nowhere = who("http://127.0.0.1:9");
-    assert!(send(&dir, &nowhere, "vlad.boo", FANG, &"x".repeat(257), None, FANG, true).unwrap_err().to_string().contains("at most 256"));
-    assert!(send(&dir, &nowhere, "vlad.boo", 0, "", None, FANG, true).unwrap_err().to_string().contains("above 0"));
+    assert!(send(&dir, &nowhere, "vlad.boo", FANG, &"x".repeat(257), None, FANG, false).unwrap_err().to_string().contains("at most 256"));
+    assert!(send(&dir, &nowhere, "vlad.boo", 0, "", None, FANG, false).unwrap_err().to_string().contains("above 0"));
+    // --yes without --fingerprint is refused before any node is asked for an address.
+    let e = send(&dir, &nowhere, "vlad.boo", FANG, "", None, FANG, true).unwrap_err().to_string();
+    assert!(e.contains("--yes needs --fingerprint") && e.contains("vlad.boo") && e.contains("Nothing was sent"), "{e}");
     assert!(shield(&dir, &nowhere, 0, None).unwrap_err().to_string().contains("above 0"));
     assert!(unshield(&dir, &nowhere, "vlad.boo", 0, FANG).unwrap_err().to_string().contains("above 0"));
 }

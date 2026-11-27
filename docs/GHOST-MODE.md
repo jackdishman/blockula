@@ -559,7 +559,9 @@ the rest of the CLI, and `--key <file>` for a wallet other than `~/.blockula/wal
   before it. (A bundle of several actions in one tx is still not built.)
 - **What's the node's word.** The recipient's address comes from
   `/api/ghost/address/{name or address}`, unproven: `send` prints its fingerprint and asks, or
-  takes `--fingerprint` (as the recipient read it out) and refuses another. The fee is the node's
+  takes `--fingerprint` (as the recipient read it out) and refuses another. `--yes` needs
+  `--fingerprint`: alone it would pay whatever address the node reported with nothing checked,
+  so it's refused, as is a `send` with neither when nobody is at a terminal to ask. The fee is the node's
   quote too: more than `--max-fee` (1 FANG by default) is refused. A wrong anchor or instance
   can't cost more than a refused tx.
 - **Secrets.** No command prints a seed, a spending key or a note's secrets, and the types that
