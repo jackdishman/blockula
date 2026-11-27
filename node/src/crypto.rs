@@ -165,6 +165,12 @@ impl Keys {
         self.seed
     }
 
+    /// Runs `f` on the seed where it lies, for deriving another key from it (Ghost Mode's): no
+    /// copy of the seed is made, as bytes or as hex, so there's none to wipe afterwards.
+    pub(crate) fn with_seed<R>(&self, f: impl FnOnce(&[u8; 32]) -> R) -> R {
+        f(&self.seed)
+    }
+
     pub fn seed_hex(&self) -> String {
         hex::encode(self.seed)
     }

@@ -192,7 +192,7 @@ pub fn ghost(cmd: GhostCmd, dir: &Path) -> Result<()> {
             Ok(())
         }
         GhostCmd::ExportViewingKey { which, key } => {
-            let fvk = ghost_key(&keys_of(dir, key.as_deref())?)?.full_viewing_key();
+            let fvk = ghost_key(&keys_of(dir, key.as_deref())?).full_viewing_key();
             let (name, sees, hex) = if which.full {
                 ("full", "every note this wallet received and sent, and which are spent (it can't spend them)", hex::encode(fvk.to_bytes()))
             } else if which.incoming {
@@ -250,11 +250,11 @@ fn keys_of(dir: &Path, key: Option<&Path>) -> Result<Keys> {
 ///
 /// Account 0 is the only one the CLI uses. ML-KEM keys can't be diversified, so a second,
 /// unlinkable address would be account 1 of the same seed, not another address of this one.
-pub(crate) fn ghost_key(keys: &Keys) -> Result<SpendingKey> {
-    let mut seed: [u8; 32] = hex::decode(keys.seed_hex())?.try_into().map_err(|_| anyhow!("the wallet's seed isn't 32 bytes"))?;
-    let key = SpendingKey::from_master(&seed, 0);
-    seed.fill(0);
-    Ok(key)
+///
+/// The seed is read where `Keys` holds it (`Keys::with_seed`): no copy of it, as bytes or as a hex
+/// string, is left on the stack or the heap for this.
+pub(crate) fn ghost_key(keys: &Keys) -> SpendingKey {
+    keys.with_seed(|seed| SpendingKey::from_master(seed, 0))
 }
 
 /// OS randomness for note seeds, encapsulation and dummies (the prover draws its own masks).
@@ -495,7 +495,7 @@ struct Session {
 impl Session {
     async fn connect(dir: &Path, who: &Who) -> Result<Session> {
         let keys = keys_of(dir, who.key.as_deref())?;
-        let key = ghost_key(&keys)?;
+        let key = ghost_key(&keys);
         let remote = Remote::connect(dir, &who.rpc, &who.pin).await?;
         Ok(Session { remote, keys, key, dir: dir.to_path_buf(), own_wallet: who.key.is_none() })
     }
@@ -614,7 +614,7 @@ pub(crate) fn scan(dir: &Path, who: &Who) -> Result<Scanned> {
 
 fn address(dir: &Path, who: &Who, publish: bool, from: Option<&str>) -> Result<()> {
     let keys = keys_of(dir, who.key.as_deref())?;
-    let mine = ghost_key(&keys)?.address();
+    let mine = ghost_key(&keys).address();
     println!("👻 Ghost Mode address fingerprint: {}", mine.fingerprint());
     println!("   Read it to whoever pays you, so they can check the address their wallet found is yours ({} bytes; nobody types it).", mine.to_bytes().len());
     rt()?.block_on(async {

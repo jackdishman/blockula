@@ -45,7 +45,7 @@ fn shield_scan_send_and_unshield_end_to_end() {
 
     // Bob publishes his address (tag 53); the chain files it under his account.
     address(&bob, &who(&url), true, None).unwrap();
-    let bobs = ghost_key(&wallet_keys(&bob).unwrap()).unwrap().address();
+    let bobs = ghost_key(&wallet_keys(&bob).unwrap()).address();
     assert_eq!(chain.lock().state.ghost.addresses.get(&bob_account).map(|a| a.to_vec()), Some(bobs.to_bytes().to_vec()));
 
     // Alice shields 40, 30 and 20 FANG: three notes.
@@ -149,12 +149,12 @@ fn a_chain_without_ghost_mode_says_so() {
 #[test]
 fn the_ghost_key_is_account_0_of_the_wallet_seed() {
     let keys = Keys::from_seed([9; 32]);
-    let key = ghost_key(&keys).unwrap();
+    let key = ghost_key(&keys);
     assert_eq!(key.address(), SpendingKey::from_master(&[9; 32], 0).address());
-    assert_eq!(key.address(), ghost_key(&Keys::from_seed([9; 32])).unwrap().address());
+    assert_eq!(key.address(), ghost_key(&Keys::from_seed([9; 32])).address());
     assert_ne!(key.address(), SpendingKey::from_master(&[9; 32], 1).address());
     assert_ne!(key.address(), SpendingKey::from_seed([9; 32]).address(), "derived, never the seed itself");
-    assert_ne!(key.address(), ghost_key(&Keys::from_seed([8; 32])).unwrap().address());
+    assert_ne!(key.address(), ghost_key(&Keys::from_seed([8; 32])).address());
     // Nothing that holds it prints it.
     assert_eq!(format!("{key:?}"), "SpendingKey(..)");
 }
