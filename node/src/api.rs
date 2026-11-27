@@ -712,6 +712,7 @@ pub fn router(node: Node) -> Router {
         .route("/api/multisig/{account}", get(multisig))
         .route("/api/proof/{namespace}/{key}", get(proof))
         .route("/api/ghost", get(ghost))
+        .route("/api/ghost/commitments", get(ghost_commitments))
         .route("/api/ghost/address/{id}", get(ghost_address))
         .route("/api/health", get(health))
         .route("/api/upgrade", get(upgrade))
@@ -1830,6 +1831,69 @@ async fn proof(State(n): State<Node>, Path((namespace, key_hex)): Path<(u8, Stri
 async fn ghost(State(n): State<Node>) -> ApiResult {
     let v = n.live.view();
     Ok(Json(crate::ghost::status_json(&v.state, v.height)))
+}
+
+#[derive(Deserialize)]
+struct GhostCommitmentsQuery {
+    from: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// Most commitments one `/api/ghost/commitments` page holds (each is ~3 KB of JSON).
+pub const GHOST_COMMITMENTS_PAGE: usize = 256;
+
+/// 👻 Wallet sync: the commitment tree's leaves from position `from` on, at most `limit` (256) a
+/// page, each with what a wallet needs to find its notes: the commitment `cm`, the output's note
+/// ciphertext `enc` and outgoing ciphertext `out`, the block `height` and the `tx` that appended
+/// it (`index`: which of the tx's two outputs it is), and `nullifier`, the same action's spend of
+/// that index (unrelated to the output beside it: listed so a wallet that pages every leaf has
+/// seen every spend, and can mark its own notes spent). `next` is the cursor for the page after
+/// (`null` at the end), `frontier_size` the tree's size and `root` the anchor, as of block
+/// `height`: a wallet that appended every leaf through `frontier_size` holds that root.
+///
+/// Read-only, from the block's view: the state holds the commitments (namespace 48), and which
+/// block appended each follows from the nullifier records (`ghost::commitment_blocks`); the
+/// ciphertexts are read from those blocks, so a node that pruned one answers `410` `pruned`, as
+/// `/api/block` does (ask an archive node).
+async fn ghost_commitments(State(n): State<Node>, Query(q): Query<GhostCommitmentsQuery>) -> ApiResult {
+    let v = n.live.view();
+    let from = q.from.unwrap_or(0);
+    let limit = q.limit.unwrap_or(GHOST_COMMITMENTS_PAGE).clamp(1, GHOST_COMMITMENTS_PAGE);
+    let size = blockula_ghost::Frontier::from_bytes(&v.state.ghost.meta.frontier).map_or(0, |f| f.size());
+    let blocks = v.ghost_blocks();
+    let broken = |what: String| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("this node's ghost records don't line up ({what})"));
+    let mut out = Vec::new();
+    let mut pos = from;
+    while pos < size && out.len() < limit {
+        // The block whose leaves include `pos`: the last one starting at or before it.
+        let i = blocks.partition_point(|(first, _)| *first <= pos).checked_sub(1).ok_or_else(|| broken(format!("no block appended leaf {pos}")))?;
+        let (first, height) = blocks[i];
+        let Some(block) = v.block(height) else {
+            return Err(if v.is_pruned(height) { pruned(&v, height) } else { broken(format!("block #{height} is missing")) });
+        };
+        // Its applied ghost txs, in order, appended two leaves each (a shield that failed is in
+        // the block, charged, and appended nothing).
+        let (mut p, before) = (first, out.len());
+        for (idx, tx) in block.txs.iter().enumerate().filter(|(idx, _)| !block.failed.contains_key(idx)) {
+            let Some(b) = tx.action.ghost_bundle() else { continue };
+            for k in 0..2 {
+                if p >= pos && out.len() < limit {
+                    let cm = v.state.ghost.commitments.get(&p).ok_or_else(|| broken(format!("leaf {p} isn't stored")))?;
+                    if b.commitments[k].0 != cm[..] {
+                        return Err(broken(format!("leaf {p} isn't output {k} of tx {idx} in block #{height}")));
+                    }
+                    out.push(json!({ "position": p, "cm": hex::encode(cm), "enc": b.enc[k], "out": b.out[k], "nullifier": b.nullifiers[k], "height": height, "tx": tx.id(), "index": k }));
+                }
+                p += 1;
+            }
+        }
+        if out.len() == before {
+            return Err(broken(format!("block #{height} doesn't hold leaf {pos}")));
+        }
+        pos += (out.len() - before) as u64;
+    }
+    let next = (pos < size).then_some(pos);
+    Ok(Json(json!({ "from": from, "commitments": out, "next": next, "frontier_size": size, "root": hex::encode(v.state.ghost.meta.root), "height": v.height })))
 }
 
 /// The Ghost Mode address an account published (`SetGhostAddress`), by address or `.boo` name.
@@ -3820,6 +3884,97 @@ mod http_tests {
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!((v["account"]["address"].as_str(), v["fingerprint"].as_str()), (Some(alice.address().as_str()), Some(addr.fingerprint().as_str())));
         assert_eq!(v["address"].as_str().map(str::len), Some(2 * GHOST_ADDRESS_BYTES));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `/api/ghost/commitments`: every leaf of the commitment tree with its ciphertexts, block and
+    /// tx, a page at a time, so a wallet syncs from the API alone: it rebuilds the tree to the
+    /// node's anchor, finds its notes by trial decryption and sees every nullifier. A shield that
+    /// failed in a block (charged, nothing appended) isn't mistaken for the one after it.
+    #[tokio::test]
+    async fn ghost_commitments_page_for_wallet_sync() {
+        use crate::ghost::tests::{Wallet, FEE};
+        use blockula_ghost::field::{digest_from_bytes, digest_to_bytes};
+        use blockula_ghost::{FullTree, SpendingKey, TrialDecryptor};
+        const FANG: u64 = DROPS_PER_FANG;
+        let root = std::env::temp_dir().join(format!("blockula-api-ghostsync-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let homes = Chain::summon(&root, &SummonOpts::new("ghostsync", 1).with_ghost(1_000 * FANG)).unwrap();
+        let n = Node::new(Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap())), None, vec![], ClientIpPolicy::default());
+        let get = |uri: &'static str| {
+            let n = n.clone();
+            async move { call(&n, "GET", uri, None, "127.0.0.1:1").await }
+        };
+        let (s, v, _) = get("/api/ghost/commitments").await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!((v["commitments"].as_array().map(Vec::len), v["next"].is_null(), v["frontier_size"].as_u64()), (Some(0), true, Some(0)), "an empty tree");
+
+        let (alice, bob) = (crate::crypto::Keys::from_seed([6; 32]), crate::crypto::Keys::from_seed([7; 32]));
+        let (ka, kb) = (SpendingKey::from_seed([1; 32]), SpendingKey::from_seed([2; 32]));
+        let mut w = Wallet::new("ghostsync");
+        {
+            let mut c = n.chain.lock();
+            c.faucet(&alice.address(), 5_000 * FANG).unwrap();
+            c.faucet(&bob.address(), 100 * FANG).unwrap();
+            c.produce_block().unwrap();
+        }
+        // Block A: alice shields 50. Block B: she sends 20 of it to bob's ghost key.
+        let (shield, note) = w.shield(&n.chain.lock(), &alice, 50 * FANG, &ka);
+        n.chain.lock().produce_block_with(vec![shield.clone()]).unwrap();
+        let outputs = [w.output(20 * FANG, &kb, &ka), w.output(30 * FANG - FEE, &ka, &ka)];
+        let transfer = w.transfer(&n.chain.lock(), &ka, note, outputs);
+        n.chain.lock().produce_block_with(vec![transfer.clone()]).unwrap();
+        // Block C: a shield over the pool cap (in the block, charged, appends nothing), then bob's.
+        let (over_cap, _) = w.shield(&n.chain.lock(), &alice, 2_000 * FANG, &ka);
+        let (bobs, _) = w.shield(&n.chain.lock(), &bob, 5 * FANG, &kb);
+        n.chain.lock().produce_block_with(vec![over_cap.clone(), bobs.clone()]).unwrap();
+        let top = n.chain.lock().height();
+        assert!(n.chain.lock().last_block().unwrap().failed.contains_key(&0), "the shield over the cap failed in the block");
+
+        let (s, v, _) = get("/api/ghost/commitments").await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (_, status, _) = get("/api/ghost").await;
+        assert_eq!((v["frontier_size"].as_u64(), v["next"].is_null(), v["height"].as_u64()), (Some(6), true, Some(top)), "{v}");
+        assert_eq!(v["root"], status["root"]);
+        let list = v["commitments"].as_array().unwrap();
+        let expect = [(shield.id(), top - 2), (transfer.id(), top - 1), (bobs.id(), top)];
+        let mut tree = FullTree::new();
+        let (mut mine_a, mut mine_b) = (vec![], vec![]);
+        let (da, db) = (TrialDecryptor::new(&ka.full_viewing_key().incoming()), TrialDecryptor::new(&kb.full_viewing_key().incoming()));
+        for (i, e) in list.iter().enumerate() {
+            let (tx, height) = &expect[i / 2];
+            assert_eq!((e["position"].as_u64(), e["tx"].as_str(), e["height"].as_u64(), e["index"].as_u64()), (Some(i as u64), Some(tx.as_str()), Some(*height), Some(i as u64 % 2)), "{e}");
+            let cm = digest_from_bytes(&hex::decode(e["cm"].as_str().unwrap()).unwrap().try_into().unwrap()).unwrap();
+            assert_eq!(tree.append(cm).unwrap() as usize, i);
+            let enc = hex::decode(e["enc"].as_str().unwrap()).unwrap();
+            assert_eq!((enc.len(), e["out"].as_str().unwrap().len(), e["nullifier"].as_str().unwrap().len()), (GHOST_ENC_BYTES, 2 * GHOST_OUT_BYTES, 64));
+            if let Some(d) = da.try_decrypt(&cm, &enc) {
+                mine_a.push((i, d.note.value));
+            }
+            if let Some(d) = db.try_decrypt(&cm, &enc) {
+                mine_b.push((i, d.note.value));
+            }
+        }
+        assert_eq!(list.len(), 6);
+        assert_eq!(hex::encode(digest_to_bytes(&tree.root())), v["root"].as_str().unwrap(), "the leaves hash to the anchor");
+        assert_eq!(mine_a, [(0, 50 * FANG), (3, 30 * FANG - FEE)]);
+        assert_eq!(mine_b, [(2, 20 * FANG), (4, 5 * FANG)]);
+        // Every spend is listed: the transfer's first nullifier is the spend of alice's note 0.
+        let spent = hex::encode(digest_to_bytes(&blockula_ghost::nullifier(&ka.full_viewing_key().nk(), &tree.leaf(0).unwrap(), 0)));
+        assert_eq!(list[2]["nullifier"].as_str(), Some(spent.as_str()));
+
+        // Pages: `from` and `limit`, a cursor until the end, nothing past it, at most 256 a page.
+        let (_, p, _) = get("/api/ghost/commitments?from=1&limit=2").await;
+        assert_eq!((p["commitments"].as_array().unwrap().iter().map(|e| e["position"].as_u64().unwrap()).collect::<Vec<_>>(), p["next"].as_u64(), p["from"].as_u64()), (vec![1, 2], Some(3), Some(1)), "{p}");
+        assert_eq!(p["commitments"][1], list[2], "a page that starts and ends inside blocks");
+        let (_, p, _) = get("/api/ghost/commitments?from=3&limit=100000").await;
+        assert_eq!((p["commitments"].as_array().unwrap().len(), p["next"].is_null()), (3, true), "{p}");
+        assert_eq!(p["commitments"][2], list[5]);
+        let (_, p, _) = get("/api/ghost/commitments?from=6").await;
+        assert_eq!((p["commitments"].as_array().unwrap().len(), p["next"].is_null(), p["frontier_size"].as_u64()), (0, true, Some(6)), "{p}");
+        let (_, p, _) = get("/api/ghost/commitments?from=0&limit=0").await;
+        assert_eq!((p["commitments"].as_array().unwrap().len(), p["next"].as_u64()), (1, Some(1)), "a page holds at least one");
+        let (s, _, _) = get("/api/ghost/commitments?from=minus").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
         std::fs::remove_dir_all(root).ok();
     }
 

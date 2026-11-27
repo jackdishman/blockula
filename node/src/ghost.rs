@@ -785,6 +785,28 @@ pub fn status_json(state: &State, height: u64) -> Value {
     })
 }
 
+/// Where the commitment tree's leaves came from, for wallet sync (`/api/ghost/commitments`):
+/// `(first position, height)` for every block that appended leaves, in order. Derived from the
+/// nullifier records alone: every applied ghost action spends exactly two nullifiers (dummies
+/// included) at its block's height and appends exactly two commitments, so a block with `n`
+/// nullifiers holds the next `n` leaves. One pass over the nullifiers; the read view computes it
+/// at most once per block (`ReadView::ghost_blocks`). Nothing here is consensus state.
+pub fn commitment_blocks(state: &State) -> Vec<(u64, u64)> {
+    let mut per_height: BTreeMap<u64, u64> = BTreeMap::new();
+    for height in state.ghost.nullifiers.values() {
+        *per_height.entry(*height).or_default() += 1;
+    }
+    let mut first = 0u64;
+    per_height
+        .into_iter()
+        .map(|(height, n)| {
+            let at = first;
+            first += n;
+            (at, height)
+        })
+        .collect()
+}
+
 /// The least tip that displaces queued txs tipping `tip` together (see [`BUMP_DIVISOR`]): `tip`
 /// plus the larger of a tenth of it and `relay` (the base fee of the newcomer's bytes), on the
 /// fee grid.
