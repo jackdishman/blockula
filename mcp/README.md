@@ -44,6 +44,7 @@ The network is chosen by the user, once, in the MCP's configuration, and nothing
 | Shared accounts (multisig) | `multisig_show`; `multisig_propose_send`, `multisig_approve` (payments only, with an owner key) |
 | Hunts and contributions | `list_hunts`, `link_github`, `fund_hunt`, `contribution_pool`, `submit_contribution`, `my_contributions` |
 | Programs | `program_show`, `program_view`, `program_code` (and `lookup` of a program address or code hash); `call_program` (the agent's own account only) |
+| Ghost Mode (test chains, unaudited) | `ghost_status`, `ghost_address`, `ghost_scan`, `ghost_balance`; `ghost_shield`, `ghost_send`, `ghost_unshield` (the agent's own account only) |
 | Running chains | `install_node`, `start_dev_node`, `summon_chain` |
 
 Tools carry a title and annotations: the reads are `readOnlyHint`, and everything that signs is `destructiveHint` and `openWorldHint`. To skip the prompt for reads only, allow them by name in Claude Code's `.claude/settings.json`, and leave the tools that move FANG to ask every time:
@@ -56,7 +57,8 @@ Tools carry a title and annotations: the reads are `readOnlyHint`, and everythin
       "mcp__blockula__check_name", "mcp__blockula__lookup", "mcp__blockula__latest_blocks",
       "mcp__blockula__my_stake", "mcp__blockula__list_proposals", "mcp__blockula__list_hunts",
       "mcp__blockula__contribution_pool", "mcp__blockula__my_contributions",
-      "mcp__blockula__program_show", "mcp__blockula__program_view", "mcp__blockula__program_code"
+      "mcp__blockula__program_show", "mcp__blockula__program_view", "mcp__blockula__program_code",
+      "mcp__blockula__ghost_status", "mcp__blockula__ghost_scan", "mcp__blockula__ghost_balance"
     ]
   }
 }
@@ -109,6 +111,15 @@ Session keys can only send transfers: staking, voting and name renewals need an 
 
 There's no tool that uploads code or creates a program: deploying stays with people (`blockula program upload` / `create`, or the SDK).
 
+**Ghost Mode** (private transfers, [docs/GHOST-MODE.md](../docs/GHOST-MODE.md)) is off unless a chain's governance activated it, and it isn't audited: these tools are for test chains (`blockula dev --ghost`), and are refused on `blockula-1`. The agent's ghost key comes from its own wallet key, and proofs are made locally in WebAssembly (about a quarter of a second each).
+- **Reads:** `ghost_status` (is it on, paused, the pool and its cap, the fee), `ghost_scan` and `ghost_balance` (the agent's notes; a memo comes back as `untrusted_memo`: a stranger wrote it), `ghost_address` (the fingerprint of the agent's private address, and whether it's published).
+- **`ghost_address` publishes only when asked twice:** `publish: true` and `confirm: true`, after the user agreed. It's a public record tying the account to that address.
+- **`ghost_send` needs the recipient's fingerprint.** Without `fingerprint` it sends nothing and answers `"status": "needs_confirmation"` with the fingerprint of the address the node reported. That one is the node's word: show it to the user, who compares it with what the recipient reads out, and only then call again with it. A private send can't be undone.
+- **The agent's own account and notes only.** While `use_account` acts for a user's account, `ghost_shield`, `ghost_send`, `ghost_unshield` and publishing are refused, nothing signed: session keys can't shield or spend private funds.
+- **Capped like `send`.** The amount counts toward `BLOCKULA_MAX_SEND`, and the amount and every fee (a merge's too) toward `BLOCKULA_MAX_DAILY`. FANG that is shielded and then sent on counts both times.
+- **No secrets.** No tool returns a seed, a spending key or a viewing key, and none exports one. Notes are kept in `BLOCKULA_HOME/ghost-notes/` (mode 600): ciphertexts and values, no keys.
+- A result that says `pending` was submitted: check `tx_status`, never send it again.
+
 ## Your own node
 
 Point the MCP at a node of a chain you made (`blockula summon`, docs/CREATE.md) or joined (`blockula join`):
@@ -137,7 +148,7 @@ The checks add up: each refuses a release it fails. The result lists what was ve
 | `BLOCKULA_NETWORK` | `local` | `local`, `demo`, `testnet` or `custom` (same as `--network`) |
 | `BLOCKULA_RPC` | `http://localhost:7070` for `local`, `https://demo.blockula.app` for `demo`; required for `testnet` and `custom` | node URL (no query or fragment) |
 | `BLOCKULA_CHAIN_ID` / `BLOCKULA_GENESIS_HASH` | the network's pins | the chain the node must be on. A node that says it's on `blockula-1` is used only with `BLOCKULA_CHAIN_ID=blockula-1` |
-| `BLOCKULA_HOME` | `~/.blockula` | what the MCP keeps, each file mode 600 but the log: `agent-wallet.json` (the agent key and the account it acts for on each chain), `agent-spend.json` (the spending ledger), `agent-txs.json` (the txs it signed, for `tx_status`), `known-chains.json`, `nonces/` (per account: the last nonce signed, and a `.lock` file while a tx is built and sent, which the session holding it keeps touching; one left by a dead session, or untouched for two minutes, is taken over, or delete it), `grant-<chain id>-<address>.txt` (the grant code `use_account` hands out, one per account that hasn't authorized the key yet), and `dev-node.log` (`start_dev_node`'s log) |
+| `BLOCKULA_HOME` | `~/.blockula` | what the MCP keeps, each file mode 600 but the log: `agent-wallet.json` (the agent key and the account it acts for on each chain), `agent-spend.json` (the spending ledger), `agent-txs.json` (the txs it signed, for `tx_status`), `known-chains.json`, `nonces/` (per account: the last nonce signed, and a `.lock` file while a tx is built and sent, which the session holding it keeps touching; one left by a dead session, or untouched for two minutes, is taken over, or delete it), `grant-<chain id>-<address>.txt` (the grant code `use_account` hands out, one per account that hasn't authorized the key yet), `ghost-notes/` (the agent's Ghost Mode notes per chain: no keys), and `dev-node.log` (`start_dev_node`'s log) |
 | `BLOCKULA_MAX_SEND` | `100` | max FANG one call moves: sent, staked, escrowed, paid for a name, bonded (and per vote) |
 | `BLOCKULA_MAX_DAILY` | `BLOCKULA_MAX_SEND` + 1 | max FANG leaving the account per UTC day on this chain across all calls, fees and pending, dropped or refused txs included (persisted in `BLOCKULA_HOME`) |
 | `BLOCKULA_WITNESSES` | none (for your own node of the demo chain: its public node) | other nodes of the same chain (comma-separated https URLs): names that get signed are proven against them. `none` opts out |

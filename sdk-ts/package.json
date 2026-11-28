@@ -7,7 +7,9 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": "./dist/index.js",
-    "./passkey": "./dist/passkey.js"
+    "./passkey": "./dist/passkey.js",
+    "./ghost": "./dist/ghost.js",
+    "./ghost/node": "./dist/ghost-node.js"
   },
   "files": [
     "dist",
@@ -15,11 +17,13 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node -e \"require('node:fs').cpSync('src/ghost-wasm','dist/ghost-wasm',{recursive:true})\"",
     "test": "tsx test/e2e.ts && tsx test/e2e-integrators.ts && tsx test/e2e-xlink.ts",
     "test:programs": "tsx test/e2e-programs.ts",
     "test:kat": "tsx test/kat.ts",
-    "test:vectors": "tsx test/passkey-vectors.ts && tsx test/proof-vectors.ts && tsx test/tx-vectors.ts && tsx test/program-vectors.ts && tsx test/program-abi.ts && tsx test/programs.ts && tsx test/unit.ts && tsx test/integrators.ts && tsx test/examples.ts && tsx test/shared-tab.ts && tsx test/club-vote.ts && tsx test/bounty-board.ts && tsx test/xlink.ts"
+    "test:vectors": "tsx test/passkey-vectors.ts && tsx test/proof-vectors.ts && tsx test/tx-vectors.ts && tsx test/program-vectors.ts && tsx test/program-abi.ts && tsx test/programs.ts && tsx test/unit.ts && tsx test/integrators.ts && tsx test/examples.ts && tsx test/shared-tab.ts && tsx test/club-vote.ts && tsx test/bounty-board.ts && tsx test/xlink.ts",
+    "test:ghost": "tsx test/e2e-ghost.ts",
+    "bench:ghost": "tsx test/ghost-bench.ts"
   },
   "license": "MIT",
   "dependencies": {

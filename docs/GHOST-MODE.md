@@ -13,8 +13,9 @@ pairings, no elliptic curves.
 This document is the design contract for MAINNET-DESIGN.md §6 (DEC-2). Its library is the
 `blockula-ghost` crate in `node/ghost/` (P-GHOST-CORE). The node integrates it in
 `node/src/ghost.rs` (P-GHOST-INT: tags 50–54, state, turnstile, fees, pause), switched off until
-governance activates it; section 8 describes what was built, and its first client, the CLI
-(`blockula ghost`, on a local `blockula dev --ghost` chain). Background, prior art and the
+governance activates it; section 8 describes what was built, and its clients on a local
+`blockula dev --ghost` chain: the CLI (`blockula ghost`), `@blockula/sdk/ghost` on a WebAssembly
+build of the crate (`node/ghost-wasm`), and the MCP's `ghost_*` tools. Background, prior art and the
 choice of stack: `.context/research/ghost-mode.md`.
 
 | | |
@@ -23,7 +24,7 @@ choice of stack: `.context/research/ghost-mode.md`.
 | Hash | Poseidon2, width 16, Plonky3's KoalaBear parameters (8 full + 20 partial rounds, x³) |
 | Circuit | One Action: 2 spends + 2 outputs, dummies allowed, 128 rows × 261 columns, 453 constraints, degree 3 |
 | Security | 100 bits proven (list-decoding regime), 110 conjectured, from Plonky3's calculator |
-| Proof | 126–132 KiB; prove ~60 ms, verify ~6.3 ms (one core, Apple M4 Max) |
+| Proof | 126–132 KiB; prove ~60 ms, verify ~6.3 ms (one core, Apple M4 Max); ~250 ms to prove in WebAssembly (section 7) |
 | Note encryption | ML-KEM-768 (`ml-kem =0.3.4`) + XChaCha20-Poly1305; 1,481 bytes per output |
 
 ## 1. Keys and addresses
@@ -68,8 +69,18 @@ publishes it under the account's `.boo` name and UIs show names. People compare 
 80 bits of `BLAKE3-KDF("blockula ghost v1 address fingerprint", address)` as `xxxx-xxxx-xxxx-xxxx-xxxx`.
 ML-KEM keys can't be diversified, so each unlinkable address is its own account.
 
+**Wallets.** A wallet's ghost key is `SpendingKey::from_master(seed, 0)` of the seed its account
+key comes from: the CLI and `@blockula/sdk/ghost` (`GhostWallet.fromWallet`) derive the same key
+from the same seed. A passkey wallet's comes from the passkey's PRF output under a context of its
+own, `master = BLAKE3-KDF("blockula ghost passkey v1", prf output)`, then `from_master(master, 0)`
+(`GhostWallet.fromPasskeyPrf`): apart from the account key's context ("blockula passkey wallet
+v1"), so the two are independent derivations of the PRF output, and versioned. The two paths give
+different keys for one passkey, so a passkey wallet always uses the second.
+
 **Session keys and Familiars can't spend shielded funds.** Spending needs `sk` and the circuit
-has no spend limit; agents get viewing keys at most.
+has no spend limit; agents get viewing keys at most. (An agent with a wallet of its own has its
+own ghost key and notes, like anyone: the MCP's `ghost_*` tools use those, and refuse to shield or
+spend while the agent acts for a user's account.)
 
 ## 2. Hashing
 
@@ -349,6 +360,55 @@ correctness doesn't depend on the profile: its arithmetic on untrusted input (tr
 positions, value balances, proof and ciphertext lengths) is explicit (`try_from`, `i128` sums,
 length checks before slicing), so nothing in it can wrap in either profile.
 
+### 7.1 WebAssembly (`node/ghost-wasm`)
+
+`blockula-ghost-wasm` is the crate behind `wasm-bindgen` for wallets in a browser or in Node, in
+a workspace of its own (exact pins, its own lockfile: the crate's and the node's are unchanged,
+and so is every line of `node/ghost`, which builds for `wasm32-unknown-unknown` as it is). It
+adds no cryptography: a proof it makes is `blockula_ghost::prove`'s, in the same encoding, and the
+node's verifier accepts it (the SDK and MCP end-to-end tests post such proofs to a real node).
+
+| Handle | Holds | JavaScript gets |
+|---|---|---|
+| `GhostKey.fromMaster(seed, account)` | the spending key | the address and its fingerprint; a viewing key only from `exportViewingKey(which)` |
+| `GhostScanner` | the expanded ML-KEM key and `nk` | `tryDecrypt(cm, enc, position)`: for the wallet's own output, its value, memo and nullifier |
+| `GhostTree` | a `FullTree` | `append`, `size`, `root`, `leaf` |
+| `GhostAction` | the witness: `sk`, notes, paths | `spend(key, tree, position, enc)`, `output(from, to, value, memo)`, `seal()` (pads with dummies), the bundle's public parts, `valueBalance()`, `check(sighash)`, `prove(sighash)` |
+
+Also `addressFingerprint`, `verifyAction` (the node's verifier, for tests), `circuitId` and
+`maxProofBytes`.
+
+- **Secrets stay inside.** JavaScript holds handles, never key bytes, and a note's `rseed` never
+  crosses: a spend names its note by tree position and ciphertext (both public, from the chain),
+  and the note is decrypted again inside. So a wallet's note store holds no note secret. `free()`
+  drops a handle and the crate wipes what it can (section 12); the master seed's copy is wiped
+  once the key is derived. A WebAssembly memory is still one buffer the page's own script can read:
+  this keeps secrets out of logs and stores, not away from code running in the page.
+- **Randomness** is the platform's `crypto.getRandomValues` (`getrandom`'s `wasm_js` backend) for
+  note seeds, encapsulation, dummies and the proof's masks.
+- **Build.** `scripts/build-ghost-wasm.sh` (the repo's Rust toolchain with the
+  `wasm32-unknown-unknown` target, `wasm-bindgen-cli` at the pinned version, no `wasm-opt`) writes
+  the `.wasm` and its glue to `sdk-ts/src/ghost-wasm/`, which is committed so the SDK builds
+  without a Rust toolchain; `--check` rebuilds and compares (two builds give the same bytes, with
+  no path of the machine in them). Overflow checks are on, as in every build the crate was tested
+  with; a panic aborts (WebAssembly's default), which is right for a wallet.
+- **Size** (2026-11-28): 740,845 bytes, 256,639 gzipped; the JavaScript glue 35,278 bytes, 5,868
+  gzipped.
+- **Speed** (Apple M4 Max; `npm run bench:ghost -w @blockula/sdk` and
+  `test/ghost-bench-browser.ts`, three runs of 20 full Actions with two real spends, each proof
+  checked by the same build's verifier; the native column is `cargo run --release --example measure`):
+
+| | Native | WebAssembly in Node 26 | WebAssembly in headless Chromium 158 |
+|---|---|---|---|
+| Prove, median | 62 ms | 236–264 ms | 258–271 ms |
+| Prove, range | | 178–429 ms | 168–599 ms |
+| Verify, median | 6.1 ms | 7.4–7.5 ms | 7.3–7.4 ms |
+| Trial decryption | 45 µs | 88 µs | 88–89 µs |
+
+  Proving is about four times slower than native: one thread, and none of Plonky3's packed
+  (NEON, AVX) field arithmetic, which it doesn't have for WebAssembly (a build with `simd128` on
+  was no faster). The spread is the proof-of-work grinding (three 16-bit searches a proof).
+
 ## 8. Node integration (built, disabled)
 
 `node/src/ghost.rs`, with hooks in `types.rs` (encodings), `chain.rs` (admission, execution,
@@ -601,18 +661,93 @@ proof-checked by every verifier and executed to the same root), consensus `verif
 and bound tests and shared Rust/TypeScript vectors in `types.rs`, and the `ghost_tx` fuzz target
 with real-proof seeds (`node/fuzz`).
 
-**Not built yet.** The other clients: `@blockula/sdk/ghost` on a WASM build of the crate (the SDK
-encodes ghost txs and their sighash but can't prove), the MCP tools (`ghost_balance`,
-`ghost_send`, capped by `BLOCKULA_MAX_SEND`), the web wallet, and the explorer's ghost view. No
+**The SDK** (`sdk-ts/src/ghost.ts`, `@blockula/sdk/ghost`): the CLI's wallet in TypeScript, on
+the WebAssembly prover (section 7.1).
+
+```ts
+import { GhostWallet } from "@blockula/sdk/ghost";
+import { FileNoteStore } from "@blockula/sdk/ghost/node";      // Node: a file per chain and key, mode 600
+
+const ghost = await GhostWallet.fromWallet(wallet, { store: new FileNoteStore(dir) });  // the CLI's key for the same seed
+await ghost.publishAddress();                                   // tag 53
+await ghost.shield("40");                                       // tag 50
+await ghost.send("vlad.boo", "12.5", { memo: "for the garlic", fingerprint });  // tag 51
+await ghost.unshield("mina.boo", "3");                          // tag 52
+(await ghost.balance()).display;                                // syncs first
+```
+
+- **The same wallet as the CLI's.** The key (`fromWallet`: `from_master(seed, 0)`;
+  `fromPasskeyPrf`: section 1), the sync (every leaf appended, trial decryption, spends marked by
+  nullifier, nothing kept unless the leaves hash to the node's anchor), coin selection
+  (`pickNotes`: the smallest single note that covers it, else the two largest), merges
+  (`mergesNeeded`; `onPlan` is told how many actions a payment takes before the first, and may
+  throw to stop it), the canonical fee and fee grid, tip 0, `valid_until` = the height +
+  `max_tx_validity_blocks`, and `maxFee` (1 FANG an action by default). Amounts are FANG strings
+  or bigint drops.
+- **`send` needs the recipient's fingerprint**, or a `confirm` callback that is shown the address
+  and fingerprint the node reported and answers `true`: the CLI's `--fingerprint` rule. With
+  neither it's refused before anything is read. `published(account)` reads an address and computes
+  its fingerprint from the bytes (the node's own `fingerprint` field isn't used).
+- **A shield is a signed tx whose proof is bound to its own nonce, fee and validity**, so the
+  account wallet builds it in two steps (`Wallet.submitFinished`, `BuildOptions.finish`): the fee
+  is priced on a draft with a proof of the largest size, then the proof is made for the tx as it
+  will be signed. `prepareShield` hands both halves to a caller with a submit path of its own.
+- **The note store** is pluggable (`GhostNoteStore`: `load`, `save`): `MemoryNoteStore` by
+  default, `FileNoteStore` in Node, and a browser store (IndexedDB) can implement the same two
+  methods. It holds the tree's leaves and, for each note, its position, value, memo, nullifier and
+  ciphertext, and no key or `rseed`; a store that doesn't open the leaves it names is scanned
+  again. It isn't the CLI's store (another format, which holds `rseed`).
+- **Reads and posting.** `Client.ghost()`, `ghostCommitments(from, limit)` and `ghostAddress(account)`
+  read the three endpoints; `Client.post` sends ghost txs in their wire form.
+- `sdk-ts/test/e2e-ghost.ts` (`npm run test:ghost -w @blockula/sdk`) starts `blockula dev --ghost`
+  and runs the flow of `scripts/ghost-e2e.sh` with the SDK: the fingerprint `blockula ghost
+  address` prints for the same seed, three shields, a private send that takes a merge, the
+  recipient's sync, an unshield that opens an account, the balances and the pool adding up, the
+  store's mode and contents, and a node whose leaves don't hash to its anchor.
+
+**The MCP** (`mcp/src/ghost.ts` and `index.ts`): `ghost_status`, `ghost_address`, `ghost_scan`,
+`ghost_balance`, `ghost_shield`, `ghost_send` and `ghost_unshield`, on the SDK, with the agent's
+ghost key derived from its own wallet key.
+
+- **`ghost_send` without a `fingerprint` sends nothing**: it answers `needs_confirmation` with the
+  fingerprint of the address the node reported, for the user to compare with the one the
+  recipient reads out. `ghost_address` publishes only with `publish: true` and `confirm: true`.
+- **Capped like `send`.** The amount is held to `BLOCKULA_MAX_SEND`, and the amount and every fee
+  (a merge's too) to `BLOCKULA_MAX_DAILY`, reserved before each tx is posted. An unsigned tx has no
+  nonce, so its slot in the ledger is the first nullifier it spends: at most one tx spending a
+  note ever runs. A shield counts when it's shielded and again when it's sent on or unshielded:
+  the caps err high.
+- **The agent's own account and notes only.** While it acts for another account (`use_account`)
+  shield, send, unshield and publishing are refused in a sentence: session keys can't shield or
+  spend private funds. Never on `blockula-1`.
+- **No secrets out.** No tool returns or logs a seed, a spending key, a viewing key or a note's
+  `rseed`, and there's no tool that exports a viewing key. A note's memo comes back as
+  `untrusted_memo`.
+- `mcp/test/ghost.ts` (`npm run test:ghost -w @blockula/mcp`) runs the tools over stdio against
+  `blockula dev --ghost`, the session-key refusals and the caps included, and searches every
+  result and log line for the seed and each viewing key.
+
+Measured with the SDK's e2e (Apple M4 Max, Node 26, 2026-11-28; 9 actions): prove 186–496 ms,
+median 238 ms; shields 137,777–140,018 bytes on the wire, private transfers and unshields
+133,045–137,526; the whole test, with its dev chain, about 30 s.
+
+**Not built yet.** The web wallet (a browser note store over IndexedDB, proving in a Worker so the
+page stays responsive, and `passkey.ts` handing the PRF output to `GhostWallet.fromPasskeyPrf`),
+and the explorer's ghost view. No
 delegated proving by default (the prover sees the witness). Also open: a withdraw-only mode and
-the migration path, and 2-in/2-out only (no multi-action bundles: the CLI chains actions). In the
-CLI: witnesses for the recipient's address and the pool's status (it trusts one RPC, and prints
-what it took on trust); sync from a pruning node past its window (a node-side index of the
+the migration path, and 2-in/2-out only (no multi-action bundles: the clients chain actions). In
+every client: witnesses for the recipient's address and the pool's status (they trust one RPC, and
+show what they took on trust; an unshield's recipient is proven with the SDK client's witnesses);
+sync from a pruning node past its window (a node-side index of the
 ciphertexts would lift that, and the per-block pass over the nullifier records with it); recovery
-of sent notes with the outgoing viewing key (the crate has `try_decrypt_outgoing`; the CLI doesn't
-scan with it); scanning with an exported viewing key; ghost accounts other than 0; a tip when the
-mempool's ghost share is full (the CLI always tips 0, and reports the node's refusal); and a note
-store that scales (it holds every leaf as hex in one JSON file, rewritten each scan).
+of sent notes with the outgoing viewing key (the crate has `try_decrypt_outgoing`; nothing
+scans with it); scanning with an exported viewing key; ghost accounts other than 0 in the CLI and
+the MCP (the SDK takes `account`); a tip when the
+mempool's ghost share is full (the clients always tip 0, and report the node's refusal); and a note
+store that scales (each holds every leaf as hex in one JSON file, rewritten each scan). In
+WebAssembly: threads and SIMD for the prover (it's single-threaded and about four times slower
+than native), and CI that rebuilds the committed `.wasm` and compares
+(`scripts/build-ghost-wasm.sh --check`).
 
 ## 9. Activation gates
 
@@ -719,8 +854,11 @@ of a more complex AIR.
   `OutgoingViewingKey.0`), field-element secrets (`sk`, `ak`, `nk`, witness values: KoalaBear
   elements can't be reliably wiped without `unsafe` volatile writes), the prover's trace and
   Plonky3's buffers, and the shared secrets and plaintexts inside encryption and ML-KEM.
-- **No WASM yet**, so no prover in TypeScript: the SDK encodes ghost txs and their sighash
-  (vectors shared with the node) but can't prove. The KATs are the contract for a port.
+- **WebAssembly** (section 7.1): the prover runs in browsers and Node as the crate itself, not
+  a port, so it shares the crate's proofs and its limits. Memory hygiene is weaker there: a
+  WebAssembly memory can't be locked or kept from the page's own script, `free()` must be called
+  (or left to the garbage collector's finalizer, with no promise of when), and the JavaScript
+  copy of a seed handed in is the caller's to wipe.
 - **Timing side channels** in proving and trial decryption haven't been analyzed.
 - **Network-level privacy** isn't provided. The node a wallet submits to sees its IP. A full node
   forwards an unsigned ghost tx to a validator without the client's IP (it does for signed txs, so
