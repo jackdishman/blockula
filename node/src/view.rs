@@ -246,6 +246,7 @@ struct Memo {
     claims: OnceLock<ClaimsMemo>,
     people: OnceLock<PeopleMemo>,
     programs: OnceLock<Vec<String>>,
+    ghost_blocks: OnceLock<Vec<(u64, u64)>>,
 }
 
 /// Above this many accounts, `/api/accounts?sort=recent` isn't offered: it reads each account's
@@ -526,6 +527,12 @@ impl ReadView {
     /// The tx's plain-English summary (names from the index, not a scan).
     pub fn describe(&self, tx: &Tx, height: Option<u64>) -> String {
         self.state.describe_with(tx, height, &|a| self.primary_name(a))
+    }
+
+    /// Which block appended which leaves of Ghost Mode's commitment tree: `(first position,
+    /// height)`, in order (`ghost::commitment_blocks`), computed once per block view.
+    pub fn ghost_blocks(&self) -> &[(u64, u64)] {
+        self.memo.ghost_blocks.get_or_init(|| crate::ghost::commitment_blocks(&self.state))
     }
 
     pub fn hunts(&self) -> &HuntsMemo {

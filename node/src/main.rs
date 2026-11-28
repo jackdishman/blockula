@@ -14,6 +14,7 @@ mod econ;
 mod epochs;
 mod genesis_builder;
 mod ghost;
+mod ghost_cli;
 mod github;
 mod gov_cli;
 mod governance;
@@ -173,6 +174,13 @@ enum Cmd {
         /// recreated after an update
         #[arg(long)]
         programs: bool,
+        /// Start a new dev chain with Ghost Mode (shielded transfers) on from block 1: the `ghost`
+        /// feature in its genesis and a pool cap of 1,000,000 FANG, to shield, send privately and
+        /// unshield with `blockula ghost`. A chain already made without it keeps its genesis: add
+        /// --reset. Ghost Mode is NOT AUDITED and for local testing only: a chain made with it now
+        /// may need to be recreated after an update
+        #[arg(long)]
+        ghost: bool,
         #[command(flatten)]
         net: Net,
     },
@@ -342,6 +350,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: program_cli::ProgramCmd,
     },
+    /// 👻 Ghost Mode: shield, send privately, unshield and scan (on a chain that has it on; not audited)
+    Ghost {
+        #[command(subcommand)]
+        cmd: ghost_cli::GhostCmd,
+    },
     /// 🥩 Stake: delegate to validator pools, unbond, withdraw
     Stake {
         #[command(subcommand)]
@@ -391,6 +404,10 @@ enum Cmd {
     },
 }
 
+/// `blockula dev --ghost`'s `ghost_pool_cap`: 1,000,000 FANG (the parameter's default is 0, so an
+/// activated pool takes no deposits until the cap is raised; a dev chain raises it in its genesis).
+const DEV_GHOST_POOL_CAP: u64 = 1_000_000 * types::DROPS_PER_FANG;
+
 /// A block time as people read it: "5 s", or "250 ms" when it isn't whole seconds.
 fn fmt_block_time(ms: u64) -> String {
     if ms % 1000 == 0 { format!("{} s", ms / 1000) } else { format!("{ms} ms") }
@@ -432,7 +449,7 @@ fn main() -> Result<()> {
             net.bind = created.plan.bind().into();
             node::run_validator(created.home, net_opts(net, None, None, false))
         }
-        Cmd::Dev { port, reset, programs, open, net } => {
+        Cmd::Dev { port, reset, programs, ghost, open, net } => {
             let home = blockula_dir().join("dev");
             let stale = home.join("genesis.json").exists() && (chain::Genesis::load(&home.join("genesis.json")).is_err() || node::dev_is_stale(&home));
             if reset || stale {
@@ -446,12 +463,23 @@ fn main() -> Result<()> {
                 let dev = SummonOpts { epoch_blocks: 60, ..SummonOpts::new("blockula-dev", 1) };
                 let dev = if programs { dev.with_programs() } else { dev };
                 let params = params::ChainParams::dev_overrides(dev.block_time_ms, dev.epoch_blocks);
-                Chain::summon(&home, &SummonOpts { http_port: Some(port), contribution: Some(poc::PocTimes::dev(dev.block_time_ms)), params, ..dev })?;
+                let dev = SummonOpts { http_port: Some(port), contribution: Some(poc::PocTimes::dev(dev.block_time_ms)), params, ..dev };
+                // After the dev parameters, which it adds the pool cap to.
+                let dev = if ghost { dev.with_ghost(DEV_GHOST_POOL_CAP) } else { dev };
+                Chain::summon(&home, &dev)?;
             }
-            let programs_on = chain::Genesis::load(&home.join("genesis.json"))?.features.iter().any(|f| f == upgrade::PROGRAMS_FEATURE);
+            let features = chain::Genesis::load(&home.join("genesis.json"))?.features;
+            let programs_on = features.iter().any(|f| f == upgrade::PROGRAMS_FEATURE);
             if programs && !programs_on {
                 // A genesis is the chain's: asking for programs can't change one that's running.
                 anyhow::bail!("the dev chain at {} was made without programs, and a chain's genesis can't change; start a new one with `blockula dev --programs --reset`", home.display());
+            }
+            let ghost_on = features.iter().any(|f| f == crate::ghost::FEATURE);
+            if ghost && !ghost_on {
+                anyhow::bail!("the dev chain at {} was made without Ghost Mode, and a chain's genesis can't change; start a new one with `blockula dev --ghost --reset`", home.display());
+            }
+            if ghost_on {
+                println!("👻 Ghost Mode is on from block 1: `blockula ghost --help` shields, sends privately, unshields and scans. Ghost Mode is NOT AUDITED: use it on local test chains only, and a chain made with it now may need to be recreated after an update");
             }
             if programs_on {
                 println!("🧩 Programs are on from block 1: `blockula program --help` uploads, creates, calls and views them. Programs are experimental and not yet audited: a chain made with them now may need to be recreated after an update");
@@ -586,6 +614,7 @@ fn main() -> Result<()> {
         Cmd::Multisig { cmd } => gov_cli::multisig(cmd, &blockula_dir()),
         Cmd::Name { cmd } => contrib_cli::name(cmd, &blockula_dir()),
         Cmd::Program { cmd } => program_cli::program(cmd, &blockula_dir()),
+        Cmd::Ghost { cmd } => ghost_cli::ghost(cmd, &blockula_dir()),
         Cmd::Stake { cmd } => contrib_cli::stake(cmd, &blockula_dir()),
         Cmd::Keygen { prefix } => {
             anyhow::ensure!(crypto::is_prefix(&prefix), "prefix must be one of {:?}", crypto::KNOWN_PREFIXES);
@@ -721,6 +750,35 @@ mod cli_tests {
         for bad in ["0", "20000001", "-1", "lots"] {
             assert!(parse(&["run", "--home", "h", "--view-max-fuel", bad]).is_err(), "--view-max-fuel {bad}");
         }
+    }
+
+    /// `dev --ghost` asks for a dev chain with Ghost Mode on from block 1 (off unless asked), and the
+    /// options it summons with pass the genesis checks with the feature on and the dev pool cap,
+    /// beside programs when both are asked for.
+    #[test]
+    fn the_ghost_flag_parses_and_summons_a_ghost_chain() {
+        use clap::Parser;
+        let parse = |args: &[&str]| super::Cli::try_parse_from(["blockula"].iter().chain(args));
+        match parse(&["dev", "--ghost"]).unwrap().cmd {
+            super::Cmd::Dev { ghost, programs, reset, .. } => assert!(ghost && !programs && !reset),
+            _ => unreachable!(),
+        }
+        match parse(&["dev"]).unwrap().cmd {
+            super::Cmd::Dev { ghost, .. } => assert!(!ghost, "off unless asked"),
+            _ => unreachable!(),
+        }
+        assert!(parse(&["ghost", "balance", "--rpc", "http://localhost:7171"]).is_ok());
+        let root = std::env::temp_dir().join(format!("blockula-devghost-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let opts = crate::chain::SummonOpts::new("devghost", 1).with_programs().with_ghost(super::DEV_GHOST_POOL_CAP);
+        let homes = crate::chain::Chain::summon(&root, &opts).unwrap();
+        let g = crate::chain::Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        assert_eq!(g.features, ["programs".to_string(), "ghost".to_string()]);
+        let c = crate::chain::Chain::open(&homes[0]).unwrap();
+        assert!(crate::upgrade::is_active(&c.state, crate::ghost::FEATURE));
+        assert_eq!(c.state.chain_params.ghost_pool_cap, 1_000_000 * crate::types::DROPS_PER_FANG);
+        assert!(crate::ghost::check_enabled(&c.state, 1).is_ok());
+        drop(c);
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// `--pulse-exclude`: repeatable or comma-separated, addresses or names (stored with .boo), and

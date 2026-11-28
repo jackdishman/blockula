@@ -2052,7 +2052,19 @@ impl SummonOpts {
     /// `programs` feature in the genesis, so META `programs` exists from block 0.
     pub fn with_programs(mut self) -> Self {
         self.upgrades = vec![crate::upgrade::ScheduledUpgrade { version: crate::upgrade::PROGRAMS_VERSION, activation_height: 1 }];
-        self.features = vec![crate::upgrade::PROGRAMS_FEATURE.to_string()];
+        self.features.retain(|f| f != crate::upgrade::PROGRAMS_FEATURE);
+        self.features.push(crate::upgrade::PROGRAMS_FEATURE.to_string());
+        self
+    }
+
+    /// These options with Ghost Mode on from block 1 (`blockula dev --ghost`; docs/GHOST-MODE.md
+    /// section 8): the `ghost` feature in the genesis and `ghost_pool_cap` raised from its default
+    /// of 0 to `pool_cap` drops, so the pool takes deposits. For dev and test chains only: Ghost
+    /// Mode isn't audited, and `Genesis::check` refuses it in a `blockula-1` genesis.
+    pub fn with_ghost(mut self, pool_cap: u64) -> Self {
+        self.features.retain(|f| f != crate::ghost::FEATURE);
+        self.features.push(crate::ghost::FEATURE.to_string());
+        self.params.insert("ghost_pool_cap".into(), pool_cap);
         self
     }
 }
